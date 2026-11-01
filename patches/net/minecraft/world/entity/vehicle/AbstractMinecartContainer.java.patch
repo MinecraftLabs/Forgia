@@ -1,5 +1,14 @@
 --- a/net/minecraft/world/entity/vehicle/AbstractMinecartContainer.java
 +++ b/net/minecraft/world/entity/vehicle/AbstractMinecartContainer.java
+@@ -74,6 +_,8 @@
+ 
+     @Override
+     public void remove(Entity.RemovalReason p_150255_) {
++        // Neo: the container drop below runs before super.remove.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "AbstractMinecartContainer.remove");
+         if (!this.level().isClientSide && p_150255_.shouldDestroy()) {
+             Containers.dropContents(this.level(), this, this);
+         }
 @@ -95,6 +_,8 @@
  
      @Override

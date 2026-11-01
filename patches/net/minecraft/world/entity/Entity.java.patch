@@ -39,6 +39,26 @@
      }
  
      public boolean isColliding(BlockPos p_20040_, BlockState p_20041_) {
+@@ -330,6 +_,9 @@
+     }
+ 
+     public final void discard() {
++        // Neo: the guard has to run before the virtual remove(), because a living entity override runs
++        // removal effect callbacks before it reaches the guarded removal entry point.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.discard");
+         this.remove(Entity.RemovalReason.DISCARDED);
+     }
+ 
+@@ -350,6 +_,9 @@
+     }
+ 
+     public void remove(Entity.RemovalReason p_146834_) {
++        // Neo: removal is the named mutation seam. Every vanilla override that runs work before super.remove
++        // carries the same guard, so no removal side effect can precede the rejection.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.remove");
+         this.setRemoved(p_146834_);
+     }
+ 
 @@ -467,7 +_,7 @@
  
          if (this.isInLava()) {
@@ -48,6 +68,14 @@
          }
  
          this.checkBelowWorld();
+@@ -599,6 +_,7 @@
+     }
+ 
+     public void move(MoverType p_19973_, Vec3 p_19974_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.move");
+         if (this.noPhysics) {
+             this.setPos(this.getX() + p_19974_.x, this.getY() + p_19974_.y, this.getZ() + p_19974_.z);
+         } else {
 @@ -673,7 +_,7 @@
                      double d1 = vec3.x;
                      double d2 = vec3.y;
@@ -197,6 +225,22 @@
      }
  
      public void moveRelative(float p_19921_, Vec3 p_19922_) {
+@@ -1401,6 +_,7 @@
+     }
+ 
+     public void absMoveTo(double p_20249_, double p_20250_, double p_20251_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.absMoveTo");
+         double d0 = Mth.clamp(p_20249_, -3.0E7, 3.0E7);
+         double d1 = Mth.clamp(p_20251_, -3.0E7, 3.0E7);
+         this.xo = d0;
+@@ -1426,6 +_,7 @@
+     }
+ 
+     public void moveTo(double p_20108_, double p_20109_, double p_20110_, float p_20111_, float p_20112_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.moveTo");
+         this.setPosRaw(p_20108_, p_20109_, p_20110_);
+         this.setYRot(p_20111_);
+         this.setXRot(p_20112_);
 @@ -1704,6 +_,10 @@
                  p_20241_.put("Tags", listtag);
              }
@@ -320,6 +364,14 @@
      public boolean isPushedByFluid() {
          return true;
      }
+@@ -2711,6 +_,7 @@
+     public boolean teleportTo(
+         ServerLevel p_265257_, double p_265407_, double p_265727_, double p_265410_, Set<RelativeMovement> p_265083_, float p_265573_, float p_265094_
+     ) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.teleportTo");
+         float f = Mth.clamp(p_265094_, -90.0F, 90.0F);
+         if (p_265257_ == this.level()) {
+             this.moveTo(p_265407_, p_265727_, p_265410_, p_265573_, f);
 @@ -2783,6 +_,8 @@
          EntityDimensions entitydimensions = this.dimensions;
          Pose pose = this.getPose();
@@ -444,6 +496,14 @@
          return this.fluidHeight.getDouble(p_204037_);
      }
  
+@@ -3308,6 +_,7 @@
+     }
+ 
+     public final void setPosRaw(double p_20344_, double p_20345_, double p_20346_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setPosRaw");
+         if (this.position.x != p_20344_ || this.position.y != p_20345_ || this.position.z != p_20346_) {
+             this.position = new Vec3(p_20344_, p_20345_, p_20346_);
+             int i = Mth.floor(p_20344_);
 @@ -3323,6 +_,7 @@
  
              this.levelCallback.onMove();
@@ -452,6 +512,14 @@
      }
  
      public void checkDespawn() {
+@@ -3412,6 +_,7 @@
+ 
+     @Override
+     public final void setRemoved(Entity.RemovalReason p_146876_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setRemoved");
+         if (this.removalReason == null) {
+             this.removalReason = p_146876_;
+         }
 @@ -3449,6 +_,133 @@
  
      public boolean mayInteract(Level p_146843_, BlockPos p_146844_) {

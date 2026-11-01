@@ -1,5 +1,13 @@
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
+@@ -182,6 +_,7 @@
+     private int lastSpawnChunkRadius;
+     final EntityTickList entityTickList = new EntityTickList();
+     private final PersistentEntitySectionManager<Entity> entityManager;
++    private final LevelEntityGetter<Entity> regionAwareEntityGetter;
+     private final GameEventDispatcher gameEventDispatcher;
+     public boolean noSave;
+     private final SleepStatus sleepStatus;
 @@ -199,7 +_,7 @@
      private final List<CustomSpawner> customSpawners;
      @Nullable
@@ -17,6 +25,28 @@
          this.serverLevelData = p_215002_;
          ChunkGenerator chunkgenerator = p_215004_.generator();
          boolean flag = p_214999_.forceSynchronousWrites();
+@@ -248,7 +_,20 @@
+             this,
+             p_214999_
+         );
+-        this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage);
++        // Neo: the persistent entity storage is server-owned. The owner check rejects native region workers
++        // before events, UUID registration or section mutation, and on the manager's public reads (isLoaded,
++        // status, diagnostics) and on every operation of the getter returned by getEntityGetter(). It does
++        // not require an installed engine, so a level constructed before the bridge is installed, and a
++        // worker still unwinding after the manager was removed, are both still guarded.
++        this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage,
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks::assertServerEntityStorageAccess,
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.entitySectionStoragePolicy());
++        // Neo: the vanilla section/index storage stays owned by the server thread. In production this view
++        // rejects every legacy entity query issued from a native region worker before its predicate,
++        // consumer or result escapes. Non-worker callers, the client level and the ordinary server thread
++        // run inline and keep vanilla semantics. Only the internal mechanics seam re-enables a whole-query
++        // handoff to the server thread, and production never enables it.
++        this.regionAwareEntityGetter = net.neoforged.neoforge.server.threading.RegionThreadingHooks.wrapEntityGetter(this, this.entityManager.getEntityGetter());
+         this.chunkSource = new ServerChunkCache(
+             this,
+             p_215001_,
 @@ -298,6 +_,11 @@
          this.randomSequences = Objects.requireNonNullElseGet(
              p_288977_, () -> this.getDataStorage().computeIfAbsent(RandomSequences.factory(i), "random_sequences")
@@ -27,7 +57,7 @@
 +        // Providing a fully initialized ServerLevel instance for the ServerLevelEvent.CustomSpawners
 +        this.customSpawners = net.neoforged.neoforge.event.EventHooks.getCustomSpawners(this, p_215008_);
      }
-
+ 
      @Deprecated
 @@ -342,7 +_,7 @@
          if (this.sleepStatus.areEnoughSleeping(i) && this.sleepStatus.areEnoughDeepSleeping(i, this.players)) {
@@ -36,22 +66,26 @@
 -                this.setDayTime(j - j % 24000L);
 +                this.setDayTime(net.neoforged.neoforge.event.EventHooks.onSleepFinished(this, j - j % 24000L, this.getDayTime()));
              }
-
+ 
              this.wakeUpAllPlayers();
-@@ -360,9 +_,9 @@
+@@ -360,9 +_,13 @@
          if (!this.isDebug() && flag) {
              long k = this.getGameTime();
              profilerfiller.push("blockTicks");
 -            this.blockTicks.tick(k, 65536, this::tickBlock);
-+            this.blockTicks.tick(k, 65536, (pos, block) -> net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, pos, () -> this.tickBlock(pos, block)));
++            this.blockTicks.tick(k, 65536, (pos, block) -> net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, pos, () -> this.tickBlock(pos, block)),
++                    this::tickBlock,
++                    net.neoforged.neoforge.server.threading.RegionThreadingHooks.scheduledTickDispatcher(this, net.neoforged.neoforge.server.threading.region.ScheduledTickPhase.BLOCK, this.chunkSource::managedBlockOnMainThread));
              profilerfiller.popPush("fluidTicks");
 -            this.fluidTicks.tick(k, 65536, this::tickFluid);
-+            this.fluidTicks.tick(k, 65536, (pos, fluid) -> net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, pos, () -> this.tickFluid(pos, fluid)));
++            this.fluidTicks.tick(k, 65536, (pos, fluid) -> net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, pos, () -> this.tickFluid(pos, fluid)),
++                    this::tickFluid,
++                    net.neoforged.neoforge.server.threading.RegionThreadingHooks.scheduledTickDispatcher(this, net.neoforged.neoforge.server.threading.region.ScheduledTickPhase.FLUID, this.chunkSource::managedBlockOnMainThread));
              profilerfiller.pop();
          }
-
+ 
 @@ -380,7 +_,7 @@
-
+ 
          this.handlingTick = false;
          profilerfiller.pop();
 -        boolean flag1 = !this.players.isEmpty() || !this.getForcedChunks().isEmpty();
@@ -59,9 +93,29 @@
          if (flag1) {
              this.resetEmptyTime();
          }
-@@ -412,7 +_,9 @@
+@@ -393,11 +_,19 @@
+                 profilerfiller.pop();
+             }
+ 
++            // Neo: experimental region entity tick bridge. Entities the plan accepts are ticked
++            // (checkDespawn + tickNonPassenger) on their owning region worker after this pass; everything
++            // else is ticked inline by the unchanged vanilla body below.
++            final net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan entityTickPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
++                .beginEntityTickPlan(this, p_308566_ -> this.chunkSource.chunkMap.getDistanceManager().inEntityTickingRange(p_308566_.chunkPosition().toLong()), this.chunkSource::managedBlockOnMainThread);
+             this.entityTickList.forEach(p_308566_ -> {
+                 if (!p_308566_.isRemoved()) {
+                     if (this.shouldDiscardEntity(p_308566_)) {
+                         p_308566_.discard();
+                     } else if (!tickratemanager.isEntityFrozen(p_308566_)) {
++                        if (entityTickPlan != null && entityTickPlan.accept(p_308566_)) {
++                            return;
++                        }
+                         profilerfiller.push("checkDespawn");
+                         p_308566_.checkDespawn();
+                         profilerfiller.pop();
+@@ -412,12 +_,15 @@
                              }
-
+ 
                              profilerfiller.push("tick");
 -                            this.guardEntityTick(this::tickNonPassenger, p_308566_);
 +                            if (!p_308566_.isRemoved() && !(p_308566_ instanceof net.neoforged.neoforge.entity.PartEntity)) {
@@ -70,6 +124,12 @@
                              profilerfiller.pop();
                          }
                      }
+                 }
+             });
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runEntityTickPlan(entityTickPlan);
+             profilerfiller.pop();
+             this.tickBlockEntities();
+         }
 @@ -438,7 +_,7 @@
              this.serverLevelData.setGameTime(i);
              this.serverLevelData.getScheduledEvents().tick(this.server, i);
@@ -79,6 +139,20 @@
              }
          }
      }
+@@ -465,6 +_,13 @@
+     }
+ 
+     public void tickChunk(LevelChunk p_8715_, int p_8716_) {
++        this.tickChunk(p_8715_, p_8716_, null);
++    }
++
++    // Neo: overload that lets the level tick collect the selected random ticks for the region worker
++    // slice. Chunk selection, thunder, precipitation, natural spawning and section traversal stay in this
++    // server-thread body; only the selected block/fluid callbacks are handed to the plan.
++    public void tickChunk(LevelChunk p_8715_, int p_8716_, @Nullable net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan randomTickPlan) {
+         ChunkPos chunkpos = p_8715_.getPos();
+         boolean flag = this.isRaining();
+         int i = chunkpos.getMinBlockX();
 @@ -477,7 +_,7 @@
                  DifficultyInstance difficultyinstance = this.getCurrentDifficultyAt(blockpos);
                  boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING)
@@ -88,20 +162,28 @@
                  if (flag1) {
                      SkeletonHorse skeletonhorse = EntityType.SKELETON_HORSE.create(this);
                      if (skeletonhorse != null) {
-@@ -520,12 +_,12 @@
+@@ -520,12 +_,20 @@
                          profilerfiller.push("randomTick");
                          BlockState blockstate = levelchunksection.getBlockState(blockpos1.getX() - i, blockpos1.getY() - k, blockpos1.getZ() - j);
                          if (blockstate.isRandomlyTicking()) {
 -                            blockstate.randomTick(this, blockpos1, this.random);
-+                            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, blockpos1, () -> blockstate.randomTick(this, blockpos1, this.random));
++                            if (randomTickPlan != null) {
++                                randomTickPlan.accept(chunkpos, blockpos1, blockstate::randomTick);
++                            } else {
++                                blockstate.randomTick(this, blockpos1, this.random);
++                            }
                          }
-
+ 
                          FluidState fluidstate = blockstate.getFluidState();
                          if (fluidstate.isRandomlyTicking()) {
 -                            fluidstate.randomTick(this, blockpos1, this.random);
-+                            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, blockpos1, () -> fluidstate.randomTick(this, blockpos1, this.random));
++                            if (randomTickPlan != null) {
++                                randomTickPlan.accept(chunkpos, blockpos1, (randomTickLevel, randomTickPos, randomTickRandom) -> fluidstate.randomTick(randomTickLevel, randomTickPos, randomTickRandom));
++                            } else {
++                                fluidstate.randomTick(this, blockpos1, this.random);
++                            }
                          }
-
+ 
                          profilerfiller.pop();
 @@ -542,6 +_,7 @@
          BlockPos blockpos = this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, p_295060_);
@@ -114,7 +196,7 @@
 @@ -714,15 +_,19 @@
                  .broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE, this.thunderLevel), this.dimension());
          }
-
+ 
 +        /* The function in use here has been replaced in order to only send the weather info to players in the correct dimension,
 +         * rather than to all players on the server. This is what causes the client-side rain, as the
 +         * client believes that it has started raining locally, rather than in another dimension.
@@ -127,14 +209,24 @@
 -                this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.START_RAINING, 0.0F));
 +                this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.START_RAINING, 0.0F), this.dimension());
              }
-
+ 
 -            this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.RAIN_LEVEL_CHANGE, this.rainLevel));
 -            this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE, this.thunderLevel));
 +            this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.RAIN_LEVEL_CHANGE, this.rainLevel), this.dimension());
 +            this.server.getPlayerList().broadcastAll(new ClientboundGameEventPacket(ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE, this.thunderLevel), this.dimension());
          }
      }
-
+ 
+@@ -748,7 +_,8 @@
+     private void tickBlock(BlockPos p_184113_, Block p_184114_) {
+         BlockState blockstate = this.getBlockState(p_184113_);
+         if (blockstate.is(p_184114_)) {
+-            blockstate.tick(this, p_184113_, this.random);
++            net.minecraft.util.RandomSource randomsource = net.neoforged.neoforge.server.threading.RegionThreadingHooks.scheduledTickRandom();
++            blockstate.tick(this, p_184113_, randomsource == null ? this.random : randomsource);
+         }
+     }
+ 
 @@ -758,7 +_,11 @@
          p_8648_.tickCount++;
          this.getProfiler().push(() -> BuiltInRegistries.ENTITY_TYPE.getKey(p_8648_.getType()).toString());
@@ -146,7 +238,7 @@
 +            net.neoforged.neoforge.event.EventHooks.fireEntityTickPost(p_8648_);
 +        }
          this.getProfiler().pop();
-
+ 
          for (Entity entity : p_8648_.getPassengers()) {
 @@ -775,7 +_,7 @@
              ProfilerFiller profilerfiller = this.getProfiler();
@@ -155,7 +247,7 @@
 -            p_8664_.rideTick();
 +            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runEntityTickTask(p_8664_, p_8664_::rideTick);
              profilerfiller.pop();
-
+ 
              for (Entity entity : p_8664_.getPassengers()) {
 @@ -807,6 +_,10 @@
              } else {
@@ -167,26 +259,28 @@
 +            }
          }
      }
-
-@@ -896,6 +_,7 @@
+ 
+@@ -896,6 +_,8 @@
      }
-
+ 
      private void addPlayer(ServerPlayer p_8854_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerLevel.addPlayer");
 +        if (net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.entity.EntityJoinLevelEvent(p_8854_, this)).isCanceled()) return;
          Entity entity = this.getEntities().get(p_8854_.getUUID());
          if (entity != null) {
              LOGGER.warn("Force-added player with duplicate UUID {}", p_8854_.getUUID());
-@@ -903,7 +_,8 @@
+@@ -903,19 +_,29 @@
              this.removePlayerImmediately((ServerPlayer)entity, Entity.RemovalReason.DISCARDED);
          }
-
+ 
 -        this.entityManager.addNewEntity(p_8854_);
 +        this.entityManager.addNewEntityWithoutEvent(p_8854_);
 +        p_8854_.onAddedToLevel();
      }
-
+ 
      private boolean addEntity(Entity p_8873_) {
-@@ -911,7 +_,12 @@
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerLevel.addEntity");
+         if (p_8873_.isRemoved()) {
              LOGGER.warn("Tried to add entity {} but it was marked as removed already", EntityType.getKey(p_8873_.getType()));
              return false;
          } else {
@@ -199,10 +293,17 @@
 +            }
          }
      }
-
+ 
+     public boolean tryAddFreshEntityWithPassengers(Entity p_8861_) {
++        // Neo: the duplicate precheck reads the manager's UUID admission set, so the guard has to run
++        // before it and before any passenger is added.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerLevel.tryAddFreshEntityWithPassengers");
+         if (p_8861_.getSelfAndPassengers().map(Entity::getUUID).anyMatch(this.entityManager::isLoaded)) {
+             return false;
+         } else {
 @@ -925,6 +_,7 @@
      }
-
+ 
      public void unload(LevelChunk p_8713_) {
 +        net.neoforged.neoforge.server.threading.RegionThreadingHooks.removeRegionSection(this, p_8713_.getPos().x, p_8713_.getPos().z);
          p_8713_.clearAllBlockEntities();
@@ -235,21 +336,21 @@
              .getPlayerList()
              .broadcast(
 @@ -1019,6 +_,7 @@
-
+ 
      @Override
      public void gameEvent(Holder<GameEvent> p_316597_, Vec3 p_215042_, GameEvent.Context p_215043_) {
 +        if (!net.neoforged.neoforge.common.CommonHooks.onVanillaGameEvent(this, p_316597_, p_215042_, p_215043_)) return;
          this.gameEventDispatcher.post(p_316597_, p_215042_, p_215043_);
      }
-
+ 
 @@ -1057,11 +_,16 @@
-
+ 
      @Override
      public void updateNeighborsAt(BlockPos p_215045_, Block p_215046_) {
 +        net.neoforged.neoforge.event.EventHooks.onNeighborNotify(this, p_215045_, this.getBlockState(p_215045_), java.util.EnumSet.allOf(Direction.class), false).isCanceled();
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215045_, p_215046_, null);
      }
-
+ 
      @Override
      public void updateNeighborsAtExceptFromFacing(BlockPos p_215052_, Block p_215053_, Direction p_215054_) {
 +        java.util.EnumSet<Direction> directions = java.util.EnumSet.allOf(Direction.class);
@@ -258,7 +359,7 @@
 +            return;
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215052_, p_215053_, p_215054_);
      }
-
+ 
 @@ -1145,19 +_,21 @@
          while (!this.blockEvents.isEmpty()) {
              BlockEventData blockeventdata = this.blockEvents.removeFirst();
@@ -294,18 +395,27 @@
              } else {
                  this.blockEventsToReschedule.add(blockeventdata);
              }
+@@ -1600,7 +_,7 @@
+ 
+     @Override
+     public LevelEntityGetter<Entity> getEntities() {
+-        return this.entityManager.getEntityGetter();
++        return this.regionAwareEntityGetter;
+     }
+ 
+     public void addLegacyChunkEntities(Stream<Entity> p_143312_) {
 @@ -1612,6 +_,7 @@
      }
-
+ 
      public void startTickingChunk(LevelChunk p_184103_) {
 +        net.neoforged.neoforge.server.threading.RegionThreadingHooks.addRegionSection(this, p_184103_.getPos().x, p_184103_.getPos().z);
          p_184103_.unpackTicks(this.getLevelData().getGameTime());
      }
-
+ 
 @@ -1713,8 +_,8 @@
                  ServerLevel.this.navigatingMobs.add(mob);
              }
-
+ 
 -            if (p_143371_ instanceof EnderDragon enderdragon) {
 -                for (EnderDragonPart enderdragonpart : enderdragon.getSubEntities()) {
 +            if (p_143371_.isMultipartEntity()) {
@@ -321,10 +431,10 @@
 +                              "onTrackingStart called during navigation iteration", new IllegalStateException("onTrackingStart called during navigation iteration")
                      );
                  }
-
+ 
                  ServerLevel.this.navigatingMobs.remove(mob);
              }
-
+ 
 -            if (p_143375_ instanceof EnderDragon enderdragon) {
 -                for (EnderDragonPart enderdragonpart : enderdragon.getSubEntities()) {
 +            if (p_143375_.isMultipartEntity()) {
@@ -332,13 +442,13 @@
                      ServerLevel.this.dragonParts.remove(enderdragonpart.getId());
                  }
              }
-
+ 
              p_143375_.updateDynamicGameEventListener(DynamicGameEventListener::remove);
 +
 +            p_143375_.onRemovedFromLevel();
 +            net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.entity.EntityLeaveLevelEvent(p_143375_, ServerLevel.this));
          }
-
+ 
          public void onSectionChange(Entity p_215086_) {
              p_215086_.updateDynamicGameEventListener(DynamicGameEventListener::move);
          }

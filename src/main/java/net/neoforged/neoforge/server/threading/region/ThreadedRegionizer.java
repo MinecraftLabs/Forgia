@@ -8,17 +8,20 @@ package net.neoforged.neoforge.server.threading.region;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Minimal native regionizer facade while Folia's split/merge algorithm is ported.
@@ -26,31 +29,172 @@ import net.minecraft.world.entity.Entity;
 final class ThreadedRegionizer {
     private static final int REGION_SECTION_MERGE_RADIUS = 1;
 
+    private final RegionLayout layout;
     private final Map<RegionCoordinate, RegionState> regions = new ConcurrentHashMap<>();
     private final Map<RegionSectionCoordinate, RegionSectionState> sections = new ConcurrentHashMap<>();
     private final Map<RegionSectionCoordinate, RegionState> sectionRegions = new ConcurrentHashMap<>();
     private final Map<Entity, RegionState> entities = new ConcurrentHashMap<>();
     private final Map<Entity, ServerLevel> entityLevels = new ConcurrentHashMap<>();
+    /**
+     * Level identities that finished a level clear. All accesses happen under the regionizer write lock,
+     * the same lock that serializes region creation, so a creation either publishes before the clear (and
+     * is cleared with it) or observes the closed identity and is rejected. The set is weak: an unloaded
+     * {@link ServerLevel} is not kept alive, and a legitimate reload constructs a new identity that is not
+     * closed.
+     */
+    private final Set<Object> closedLevels = Collections.newSetFromMap(new WeakHashMap<>());
     private final AtomicLong structuralChangeCount = new AtomicLong();
     private final AtomicLong splitCheckRequestCount = new AtomicLong();
     private final AtomicLong mergeCheckRequestCount = new AtomicLong();
     private final StampedLock regionLock = new StampedLock();
+    private volatile boolean closed;
     private Thread writeLockOwner;
 
-    RegionState getOrCreate(RegionCoordinate coordinate) {
-        if (this.writeLockOwner == Thread.currentThread()) {
-            return this.getOrCreateLocked(coordinate);
-        }
+    ThreadedRegionizer(RegionLayout layout) {
+        this.layout = layout;
+    }
 
+    /**
+     * Resolves and inserts one immediate task while holding the same lock used by retirement and
+     * merge/split publication. This closes the lookup-to-insertion race without taking a region lease, and
+     * it replaces a retired mapping with a fresh live region so a handoff to a region that just died is
+     * queued for its successor instead of being dropped.
+     *
+     * @return {@code false} when the regionizer was already cleared, in which case no region may be created
+     */
+    boolean enqueue(RegionCoordinate coordinate, Runnable task) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return false;
+            }
+            return this.getOrCreateLiveLocked(coordinate).enqueueTask(task);
+        }
         final long stamp = this.acquireWriteLock();
         try {
-            return this.getOrCreateLocked(coordinate);
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return false;
+            }
+            return this.getOrCreateLiveLocked(coordinate).enqueueTask(task);
         } finally {
             this.releaseWriteLock(stamp);
         }
     }
 
+    /**
+     * Resolves a live region and schedules a delayed task while holding the same lock used by retirement
+     * and merge/split publication.
+     * <p>
+     * Scheduling through a previously resolved {@link RegionState} would release the lock between lookup
+     * and insertion, so a concurrent merge or retirement could cancel a request that the caller already
+     * accepted. Resolving and inserting under one write lock makes the delayed and fixed-rate paths behave
+     * exactly like {@link #enqueue(RegionCoordinate, Runnable)}.
+     */
+    RegionScheduledTask schedule(RegionCoordinate coordinate, Runnable task, long delayTicks) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return RegionScheduledTask.cancelled(task);
+            }
+            return this.getOrCreateLiveLocked(coordinate).scheduleTask(task, delayTicks);
+        }
+        final long stamp = this.acquireWriteLock();
+        try {
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return RegionScheduledTask.cancelled(task);
+            }
+            return this.getOrCreateLiveLocked(coordinate).scheduleTask(task, delayTicks);
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    RegionScheduledTask scheduleAtFixedRate(RegionCoordinate coordinate, Runnable task, long initialDelayTicks, long periodTicks) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return RegionScheduledTask.cancelled(task);
+            }
+            return this.getOrCreateLiveLocked(coordinate).scheduleTaskAtFixedRate(task, initialDelayTicks, periodTicks);
+        }
+        final long stamp = this.acquireWriteLock();
+        try {
+            if (this.closed || this.isLevelClosedLocked(coordinate.level())) {
+                return RegionScheduledTask.cancelled(task);
+            }
+            return this.getOrCreateLiveLocked(coordinate).scheduleTaskAtFixedRate(task, initialDelayTicks, periodTicks);
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * {@return a live region for {@code coordinate}, replacing a retired mapping}
+     * <p>
+     * A retired region has no sections and no tracked entities, so replacing it cannot lose region state.
+     * Callers must hold the write lock.
+     */
+    private RegionState getOrCreateLiveLocked(RegionCoordinate coordinate) {
+        final RegionState region = this.getOrCreateLocked(coordinate);
+        if (!region.isDead()) {
+            return region;
+        }
+        final RegionState replacement = new RegionState(coordinate);
+        this.regions.put(coordinate, replacement);
+        return replacement;
+    }
+
+    @Nullable
+    RegionState getOrCreate(RegionCoordinate coordinate) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            return this.getOrCreateForLevelLocked(coordinate);
+        }
+
+        final long stamp = this.acquireWriteLock();
+        try {
+            return this.getOrCreateForLevelLocked(coordinate);
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * {@return a live region for {@code coordinate}, or {@code null} when its level identity is closed}
+     * <p>
+     * Callers must hold the write lock.
+     */
+    @Nullable
+    private RegionState getOrCreateForLevelLocked(RegionCoordinate coordinate) {
+        if (this.isLevelClosedLocked(coordinate.level())) {
+            return null;
+        }
+        return this.getOrCreateLocked(coordinate);
+    }
+
+    /**
+     * {@return true when {@code level} finished a level clear}
+     * <p>
+     * A closed level identity never receives new region state, so callers that already resolved work
+     * for it have to drop that work instead of publishing it into a retired level.
+     */
+    boolean isLevelClosed(Object level) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            return this.isLevelClosedLocked(level);
+        }
+
+        final long stamp = this.regionLock.readLock();
+        try {
+            return this.isLevelClosedLocked(level);
+        } finally {
+            this.regionLock.unlockRead(stamp);
+        }
+    }
+
+    private boolean isLevelClosedLocked(Object level) {
+        return this.closedLevels.contains(level);
+    }
+
     private RegionState getOrCreateLocked(RegionCoordinate coordinate) {
+        if (this.closed) {
+            throw new IllegalStateException("Regionizer is closed");
+        }
         final RegionState existing = this.regions.get(coordinate);
         if (existing != null) {
             return existing;
@@ -81,10 +225,14 @@ final class ThreadedRegionizer {
         return region == null ? this.sectionRegions.get(sectionCoordinate(coordinate)) : region;
     }
 
+    @Nullable
     RegionState addChunk(ServerLevel level, int chunkX, int chunkZ) {
         final long stamp = this.acquireWriteLock();
         try {
-            final RegionSectionCoordinate coordinate = RegionSectionCoordinate.fromChunk(level, chunkX, chunkZ);
+            if (this.isLevelClosedLocked(level)) {
+                return null;
+            }
+            final RegionSectionCoordinate coordinate = RegionSectionCoordinate.fromChunk(level, chunkX, chunkZ, this.layout);
             final RegionState region = this.getOrCreateLocked(coordinate.regionCoordinate());
             final RegionSectionState section = this.sections.computeIfAbsent(coordinate, RegionSectionState::new);
             this.sectionRegions.putIfAbsent(coordinate, region);
@@ -103,7 +251,10 @@ final class ThreadedRegionizer {
     void removeChunk(ServerLevel level, int chunkX, int chunkZ) {
         final long stamp = this.acquireWriteLock();
         try {
-            final RegionSectionCoordinate coordinate = RegionSectionCoordinate.fromChunk(level, chunkX, chunkZ);
+            if (this.isLevelClosedLocked(level)) {
+                return;
+            }
+            final RegionSectionCoordinate coordinate = RegionSectionCoordinate.fromChunk(level, chunkX, chunkZ, this.layout);
             final RegionSectionState section = this.sections.get(coordinate);
             if (section != null && section.removeChunk(chunkX, chunkZ) && section.isEmpty()) {
                 final RegionState region = this.sectionRegions.remove(coordinate);
@@ -120,9 +271,13 @@ final class ThreadedRegionizer {
         }
     }
 
+    @Nullable
     RegionState addEntity(Entity entity, RegionCoordinate coordinate) {
         final long stamp = this.acquireWriteLock();
         try {
+            if (this.isLevelClosedLocked(coordinate.level())) {
+                return null;
+            }
             final RegionState region = this.getOrCreateLocked(coordinate);
             final RegionState previous = this.entities.put(entity, region);
             this.entityLevels.put(entity, coordinate.level());
@@ -140,8 +295,30 @@ final class ThreadedRegionizer {
         }
     }
 
+    @Nullable
     RegionState moveEntity(Entity entity, RegionCoordinate coordinate) {
         return this.addEntity(entity, coordinate);
+    }
+
+    /**
+     * {@return the region that currently owns {@code entity}, or {@code null} when it is not tracked}
+     * <p>
+     * Unlike {@link #moveEntity(Entity, RegionCoordinate)} this never publishes a new ownership. It is used
+     * to group a batch by the authoritative region after merges or splits changed the tracked region
+     * between the tick snapshot and the batch.
+     */
+    @Nullable
+    RegionState regionFor(Entity entity) {
+        if (this.writeLockOwner == Thread.currentThread()) {
+            return this.entities.get(entity);
+        }
+
+        final long stamp = this.regionLock.readLock();
+        try {
+            return this.entities.get(entity);
+        } finally {
+            this.regionLock.unlockRead(stamp);
+        }
     }
 
     void removeEntity(Entity entity) {
@@ -179,8 +356,8 @@ final class ThreadedRegionizer {
     private void removeIfEmptyLocked(RegionState region) {
         this.recalculateIfPending(region);
         if (region.isEmpty() && !this.hasTrackedEntities(region)) {
-            if (this.regions.values().removeIf(value -> value == region)) {
-                region.tryMarkDead();
+            if (region.retireIfEmpty()) {
+                this.regions.values().removeIf(value -> value == region);
             }
         }
     }
@@ -188,6 +365,9 @@ final class ThreadedRegionizer {
     void clearLevel(Object level) {
         final long stamp = this.acquireWriteLock();
         try {
+            // Close the identity before dropping state: every creation path checks this under the same
+            // write lock, so no admission can publish a fresh region after the clear below.
+            this.closedLevels.add(level);
             final int previousSize = this.regions.size() + this.sections.size() + this.entities.size();
             this.regions.values().forEach(region -> {
                 if (region.coordinate().level() == level) {
@@ -217,6 +397,7 @@ final class ThreadedRegionizer {
     void clear() {
         final long stamp = this.acquireWriteLock();
         try {
+            this.closed = true;
             final boolean changed = !this.regions.isEmpty() || !this.sections.isEmpty() || !this.entities.isEmpty();
             this.regions.values().forEach(region -> {
                 region.clearTasks();
@@ -227,6 +408,7 @@ final class ThreadedRegionizer {
             this.sectionRegions.clear();
             this.sections.clear();
             this.regions.clear();
+            this.closedLevels.clear();
             if (changed) {
                 this.structuralChangeCount.incrementAndGet();
             }
@@ -275,6 +457,9 @@ final class ThreadedRegionizer {
     }
 
     void requestSplitCheck(RegionState region) {
+        if (this.layout.isFixed()) {
+            return;
+        }
         this.splitCheckRequestCount.incrementAndGet();
         this.splitRegionIfNeeded(region);
     }
@@ -284,6 +469,9 @@ final class ThreadedRegionizer {
     }
 
     private void requestMergeCheckIfNeeded(RegionSectionCoordinate coordinate, RegionState region) {
+        if (this.layout.isFixed()) {
+            return;
+        }
         final Set<RegionState> neighbourRegions = new HashSet<>();
         for (int dz = -REGION_SECTION_MERGE_RADIUS; dz <= REGION_SECTION_MERGE_RADIUS; ++dz) {
             for (int dx = -REGION_SECTION_MERGE_RADIUS; dx <= REGION_SECTION_MERGE_RADIUS; ++dx) {
@@ -327,6 +515,9 @@ final class ThreadedRegionizer {
     }
 
     private void splitRegionIfNeeded(RegionState region) {
+        if (this.layout.isFixed()) {
+            return;
+        }
         if (region.isRunning() || region.isWorkerSubmitted() || region.hasQueuedTasks()) {
             region.markPendingRecalculation();
             return;
@@ -356,7 +547,7 @@ final class ThreadedRegionizer {
             if (currentRegion != region || !(entity.level() instanceof ServerLevel level)) {
                 return currentRegion;
             }
-            return this.getOrCreateLocked(RegionCoordinate.fromBlock(level, entity.blockPosition()));
+            return this.getOrCreateLocked(this.layout.regionAt(level, entity.blockPosition()));
         });
         this.structuralChangeCount.incrementAndGet();
     }

@@ -54,3 +54,12 @@
              return i;
          } else {
              return 0;
+@@ -510,6 +_,8 @@
+ 
+     @Override
+     public void remove(Entity.RemovalReason p_150146_) {
++        // Neo: the owner info update below runs before super.remove.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "FishingHook.remove");
+         this.updateOwnerInfo(null);
+         super.remove(p_150146_);
+     }

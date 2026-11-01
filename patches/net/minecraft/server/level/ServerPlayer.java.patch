@@ -119,6 +119,15 @@
          return this.isReachableBedBlock(p_9117_) || this.isReachableBedBlock(p_9117_.relative(p_9118_.getOpposite()));
      }
  
+@@ -1011,6 +_,8 @@
+ 
+     @Override
+     public void dismountTo(double p_143389_, double p_143390_, double p_143391_) {
++        // Neo: the vehicle relationship is dropped before the guarded setPos runs.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "ServerPlayer.dismountTo");
+         this.removeVehicle();
+         this.setPos(p_143389_, p_143390_, p_143391_);
+     }
 @@ -1074,11 +_,19 @@
  
      @Override
@@ -204,6 +213,32 @@
      }
  
      @Override
+@@ -1409,11 +_,15 @@
+ 
+     @Override
+     public void teleportTo(double p_8969_, double p_8970_, double p_8971_) {
++        // Neo: the connection records the pending teleport before the guarded absMoveTo runs.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "ServerPlayer.teleportTo");
+         this.connection.teleport(p_8969_, p_8970_, p_8971_, this.getYRot(), this.getXRot(), RelativeMovement.ROTATION);
+     }
+ 
+     @Override
+     public void teleportRelative(double p_251611_, double p_248861_, double p_252266_) {
++        // Neo: the connection records the pending teleport before the guarded absMoveTo runs.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "ServerPlayer.teleportRelative");
+         this.connection
+             .teleport(this.getX() + p_251611_, this.getY() + p_248861_, this.getZ() + p_252266_, this.getYRot(), this.getXRot(), RelativeMovement.ALL);
+     }
+@@ -1422,6 +_,9 @@
+     public boolean teleportTo(
+         ServerLevel p_265564_, double p_265424_, double p_265680_, double p_265312_, Set<RelativeMovement> p_265192_, float p_265059_, float p_265266_
+     ) {
++        // Neo: the destination ticket, the riding stop and the sleep wake below all change server state
++        // before the guarded position write is reached.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "ServerPlayer.teleportTo");
+         ChunkPos chunkpos = new ChunkPos(BlockPos.containing(p_265424_, p_265680_, p_265312_));
+         p_265564_.getChunkSource().addRegionTicket(TicketType.POST_TELEPORT, chunkpos, 1, this.getId());
+         this.stopRiding();
 @@ -1469,6 +_,8 @@
  
      public boolean setGameMode(GameType p_143404_) {
@@ -234,6 +269,16 @@
      }
  
      @Override
+@@ -1675,6 +_,9 @@
+     }
+ 
+     public void teleportTo(ServerLevel p_9000_, double p_9001_, double p_9002_, double p_9003_, float p_9004_, float p_9005_) {
++        // Neo: the camera switch and the riding stop below change server state before the guarded
++        // position write is reached.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "ServerPlayer.teleportTo");
+         this.setCamera(this);
+         this.stopRiding();
+         if (p_9000_ == this.level()) {
 @@ -1710,6 +_,7 @@
      }
  

@@ -30,6 +30,7 @@ dependencies {
     junitRuntimeOnly "org.junit.jupiter:junit-jupiter-engine"
 
     junitImplementation("org.assertj:assertj-core:${project.assertj_core}")
+    junitImplementation("org.mockito:mockito-core:${project.mockito_core}")
     junitImplementation "net.neoforged.fancymodloader:junit-fml:${project.fancy_mod_loader_version}"
     junitImplementation(neoforgeProject)
     junitImplementation(testframeworkProject)

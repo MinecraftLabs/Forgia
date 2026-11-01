@@ -14,6 +14,7 @@ import net.neoforged.neoforge.common.ModConfigSpec.ConfigValue;
 import net.neoforged.neoforge.common.ModConfigSpec.IntValue;
 import net.neoforged.neoforge.common.ModConfigSpec.LongValue;
 import net.neoforged.neoforge.server.threading.RegionThreadingSupport;
+import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 
@@ -38,7 +39,17 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableGlobalRegionThreadingWorker;
 
+        public final BooleanValue enableRegionThreadingEntityTicks;
+
+        public final BooleanValue enableRegionThreadingBlockEntityTicks;
+
+        public final BooleanValue enableRegionThreadingScheduledTicks;
+
+        public final BooleanValue enableRegionThreadingRandomTicks;
+
         public final IntValue regionThreadingWorkerThreads;
+
+        public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
 
         public final ModConfigSpec.EnumValue<RegionThreadingOwnershipViolationMode> regionThreadingOwnershipViolationMode;
 
@@ -97,11 +108,41 @@ public class NeoForgeConfig {
                     .worldRestart()
                     .define("enableGlobalRegionThreadingWorker", false);
 
+            enableRegionThreadingEntityTicks = builder
+                    .comment("EXPERIMENTAL: Ticks the real ServerLevel entities of a tick on their owning region worker thread while the server thread waits for the batch. Requires enableRegionThreadingBridge. Entity storage is single-threaded and owned by the server thread, so entity ticks currently fall back to the server thread. This is a bounded entity tick slice, not regionized world ticking.")
+                    .translation("neoforge.configgui.enableRegionThreadingEntityTicks")
+                    .worldRestart()
+                    .define("enableRegionThreadingEntityTicks", false);
+
+            enableRegionThreadingBlockEntityTicks = builder
+                    .comment("EXPERIMENTAL: Ticks the real ServerLevel block entities of a tick on their owning region worker thread while the server thread waits for the batch. Requires enableRegionThreadingBridge. Only block entity types whose compatibility declaration proves that their server tick never queries or mutates entity storage, never spawns/removes an entity and writes only inside its region run on workers; every other type stays on the server thread. This is a bounded block-entity tick slice, not regionized world ticking.")
+                    .translation("neoforge.configgui.enableRegionThreadingBlockEntityTicks")
+                    .worldRestart()
+                    .define("enableRegionThreadingBlockEntityTicks", false);
+
+            enableRegionThreadingScheduledTicks = builder
+                    .comment("EXPERIMENTAL: Requests the bounded scheduled block and fluid tick slice. Requires enableRegionThreadingBridge. In production the effective dispatch stays gated because no scheduled callback class is admitted as entity-storage safe, so the vanilla inline loop runs; diagnostics report the request separately from the effective dispatch.")
+                    .translation("neoforge.configgui.enableRegionThreadingScheduledTicks")
+                    .worldRestart()
+                    .define("enableRegionThreadingScheduledTicks", false);
+
+            enableRegionThreadingRandomTicks = builder
+                    .comment("EXPERIMENTAL: Requests the bounded random block and fluid tick slice. Requires enableRegionThreadingBridge. In production the effective dispatch stays gated because no random callback class is admitted as entity-storage safe, so the vanilla inline loop runs; diagnostics report the request separately from the effective dispatch.")
+                    .translation("neoforge.configgui.enableRegionThreadingRandomTicks")
+                    .worldRestart()
+                    .define("enableRegionThreadingRandomTicks", false);
+
             regionThreadingWorkerThreads = builder
                     .comment("EXPERIMENTAL: Number of native region worker threads reserved for the future region scheduler. A value of 0 uses max(1, available processors - 1).")
                     .translation("neoforge.configgui.regionThreadingWorkerThreads")
                     .worldRestart()
                     .defineInRange("regionThreadingWorkerThreads", 0, 0, 512);
+
+            regionThreadingMode = builder
+                    .comment("EXPERIMENTAL: Region coordinate policy. FIXED_3X3 uses a non-overlapping global 3x3-chunk grid; regions never merge, split, or change coordinates. DYNAMIC keeps the legacy 16x16-chunk grid with merge and split recalculation for compatibility.")
+                    .translation("neoforge.configgui.regionThreadingMode")
+                    .worldRestart()
+                    .defineEnum("regionThreadingMode", RegionPolicy.FIXED_3X3);
 
             regionThreadingOwnershipViolationMode = builder
                     .comment("EXPERIMENTAL: Controls how region threading ownership assertion failures are handled.")
@@ -223,6 +264,13 @@ public class NeoForgeConfig {
         final Pair<Server, ModConfigSpec> specPair = new ModConfigSpec.Builder().configure(Server::new);
         serverSpec = specPair.getRight();
         SERVER = specPair.getLeft();
+    }
+
+    /**
+     * {@return true if the server configuration has been loaded}
+     */
+    public static boolean isServerConfigLoaded() {
+        return serverSpec.isLoaded();
     }
 
     @SubscribeEvent

@@ -6,68 +6,104 @@
 package net.neoforged.neoforge.server.threading.region;
 
 import net.neoforged.neoforge.server.threading.ScheduledRegionTask;
+import org.jetbrains.annotations.Nullable;
 
 final class RegionScheduledTask implements ScheduledRegionTask {
+    @Nullable
+    private final RegionTaskQueue queue;
     private final Runnable task;
     private final long periodTicks;
-    private volatile boolean cancelled;
-    private volatile boolean completed;
+    private boolean cancelled;
+    private boolean completed;
+    private boolean running;
     private long deadlineTick;
 
     RegionScheduledTask(Runnable task, long deadlineTick, long periodTicks) {
+        this(null, task, deadlineTick, periodTicks);
+    }
+
+    RegionScheduledTask(@Nullable RegionTaskQueue queue, Runnable task, long deadlineTick, long periodTicks) {
+        this.queue = queue;
         this.task = task;
         this.deadlineTick = deadlineTick;
         this.periodTicks = periodTicks;
     }
 
     static RegionScheduledTask cancelled(Runnable task) {
-        final RegionScheduledTask scheduledTask = new RegionScheduledTask(task, 0L, 0L);
+        final RegionScheduledTask scheduledTask = new RegionScheduledTask(null, task, 0L, 0L);
         scheduledTask.cancel();
         return scheduledTask;
     }
 
     @Override
-    public boolean cancel() {
-        if (this.completed) {
+    public synchronized boolean cancel() {
+        if (this.cancelled || this.completed) {
             return false;
         }
-        final boolean wasCancelled = this.cancelled;
         this.cancelled = true;
-        return !wasCancelled;
+        return true;
     }
 
     @Override
-    public boolean isCancelled() {
+    public synchronized boolean isCancelled() {
         return this.cancelled;
     }
 
     @Override
-    public boolean isDone() {
+    public synchronized boolean isDone() {
         return this.cancelled || this.completed;
     }
 
-    boolean isDue(long currentTick) {
-        return !this.cancelled && !this.completed && this.deadlineTick <= currentTick;
+    synchronized boolean isDue(long currentTick) {
+        return !this.cancelled && !this.completed && !this.running && this.deadlineTick <= currentTick;
+    }
+
+    synchronized long remainingDelay() {
+        if (this.queue == null) {
+            return 0L;
+        }
+        return Math.max(0L, this.deadlineTick - this.queue.currentTick());
+    }
+
+    synchronized boolean markRunning() {
+        if (this.cancelled || this.completed || this.running) {
+            return false;
+        }
+        this.running = true;
+        return true;
     }
 
     boolean runAndReschedule(long currentTick) {
-        if (this.cancelled || this.completed) {
-            return false;
+        synchronized (this) {
+            if (this.cancelled || this.completed) {
+                this.running = false;
+                return false;
+            }
         }
 
         try {
             this.task.run();
         } catch (RuntimeException | Error exception) {
-            this.completed = true;
+            synchronized (this) {
+                this.completed = true;
+                this.running = false;
+            }
             throw exception;
         }
 
-        if (this.cancelled || this.periodTicks <= 0L) {
-            this.completed = true;
-            return false;
-        }
+        synchronized (this) {
+            this.running = false;
+            if (this.cancelled || this.periodTicks <= 0L) {
+                this.completed = true;
+                return false;
+            }
 
-        this.deadlineTick = currentTick + this.periodTicks;
-        return true;
+            try {
+                this.deadlineTick = Math.addExact(currentTick, this.periodTicks);
+            } catch (ArithmeticException exception) {
+                this.deadlineTick = Long.MAX_VALUE;
+            }
+            return true;
+        }
     }
 }

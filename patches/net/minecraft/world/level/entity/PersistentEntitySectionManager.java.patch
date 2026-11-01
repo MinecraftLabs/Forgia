@@ -1,14 +1,76 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -71,7 +_,16 @@
+@@ -37,19 +_,58 @@
+     private final EntityLookup<T> visibleEntityStorage;
+     final EntitySectionStorage<T> sectionStorage;
+     private final LevelEntityGetter<T> entityGetter;
++    private final LevelEntityGetter<T> guardedEntityGetter;
+     private final Long2ObjectMap<Visibility> chunkVisibility = new Long2ObjectOpenHashMap<>();
+     private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = new Long2ObjectOpenHashMap<>();
+     private final LongSet chunksToUnload = new LongOpenHashSet();
+     private final Queue<ChunkEntities<T>> loadingInbox = Queues.newConcurrentLinkedQueue();
++    private final EntityStorageAccessCheck storageAccessCheck;
+ 
+     public PersistentEntitySectionManager(Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_) {
++        this(p_157503_, p_157504_, p_157505_, operation -> {});
++    }
++
++    public PersistentEntitySectionManager(
++        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_
++    ) {
++        this(p_157503_, p_157504_, p_157505_, p_157506_, net.neoforged.neoforge.server.threading.region.RegionPolicy.DYNAMIC);
++    }
++
++    public PersistentEntitySectionManager(
++        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_,
++        net.neoforged.neoforge.server.threading.region.RegionPolicy policy
++    ) {
+         this.visibleEntityStorage = new EntityLookup<>();
+-        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility);
++        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility, policy);
+         this.chunkVisibility.defaultReturnValue(Visibility.HIDDEN);
+         this.chunkLoadStatuses.defaultReturnValue(PersistentEntitySectionManager.ChunkLoadStatus.FRESH);
+         this.callbacks = p_157504_;
+         this.permanentStorage = p_157505_;
++        this.storageAccessCheck = p_157506_;
+         this.entityGetter = new LevelEntityGetterAdapter<>(this.visibleEntityStorage, this.sectionStorage);
++        this.guardedEntityGetter = new net.neoforged.neoforge.server.threading.region.EntityStorageGuardedGetter<>(this.entityGetter, p_157506_);
++    }
++
++    /**
++     * Neo: owner check for the server-owned section/index storage. A level supplies a check that rejects
++     * native region workers before the operation reads or changes shared state; the generic constructor
++     * keeps a no-op check for tests and other users.
++     * <p>
++     * The check covers both halves of the storage surface. The mutating entry points (add, status, load,
++     * unload, save, move, remove) are rejected before they change state, and the public read surface
++     * ({@link #isLoaded}, {@link #areEntitiesLoaded}, {@link #canPositionTick}, {@link #gatherStats},
++     * {@link #count}, {@link #dumpSections}) and every operation of the getter returned by
++     * {@link #getEntityGetter()} are rejected before they touch the section map, the section id tree or
++     * the by-id/by-uuid lookup. The getter is guarded per operation, not only when it is obtained, so a
++     * getter captured on the server thread before a native worker started still rejects the worker.
++     */
++    @FunctionalInterface
++    public interface EntityStorageAccessCheck {
++        void checkAccess(String operation);
++    }
++
++    private void checkStorageAccess(String operation) {
++        this.storageAccessCheck.checkAccess(operation);
+     }
+ 
+     void removeSectionIfEmpty(long p_157510_, EntitySection<T> p_157511_) {
+@@ -71,7 +_,18 @@
          return this.addEntity(p_157534_, false);
      }
  
 +    public boolean addNewEntityWithoutEvent(T entity) {
++        this.checkStorageAccess("PersistentEntitySectionManager.addNewEntityWithoutEvent");
 +        return this.addEntityWithoutEvent(entity, false);
 +    }
 +
      private boolean addEntity(T p_157539_, boolean p_157540_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.addEntity");
 +        if (p_157539_ instanceof Entity entity && net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.entity.EntityJoinLevelEvent(entity, entity.level(), p_157540_)).isCanceled()) return false;
 +        return addEntityWithoutEvent(p_157539_, p_157540_);
 +    }
@@ -17,11 +79,12 @@
          if (!this.addEntityUuid(p_157539_)) {
              return false;
          } else {
-@@ -101,11 +_,17 @@
+@@ -101,11 +_,19 @@
      }
  
      public void addLegacyChunkEntities(Stream<T> p_157553_) {
 -        p_157553_.forEach(p_157607_ -> this.addEntity((T)p_157607_, true));
++        this.checkStorageAccess("PersistentEntitySectionManager.addLegacyChunkEntities");
 +        p_157553_.forEach(p_157607_ -> {
 +            this.addEntity(p_157607_, true);
 +            if (p_157607_ instanceof Entity entity) entity.onAddedToLevel();
@@ -30,6 +93,7 @@
  
      public void addWorldGenChunkEntities(Stream<T> p_157560_) {
 -        p_157560_.forEach(p_157605_ -> this.addEntity((T)p_157605_, false));
++        this.checkStorageAccess("PersistentEntitySectionManager.addWorldGenChunkEntities");
 +        p_157560_.forEach(p_157605_ -> {
 +            this.addEntity(p_157605_, false);
 +            if (p_157605_ instanceof Entity entity) entity.onAddedToLevel();
@@ -37,8 +101,24 @@
      }
  
      void startTicking(T p_157565_) {
-@@ -228,7 +_,10 @@
+@@ -132,6 +_,7 @@
+     }
+ 
+     public void updateChunkStatus(ChunkPos p_157528_, Visibility p_157529_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.updateChunkStatus");
+         long i = p_157528_.toLong();
+         if (p_157529_ == Visibility.HIDDEN) {
+             this.chunkVisibility.remove(i);
+@@ -222,13 +_,18 @@
+     }
+ 
+     private void processUnloads() {
++        this.checkStorageAccess("PersistentEntitySectionManager.processUnloads");
+         this.chunksToUnload.removeIf(p_157584_ -> this.chunkVisibility.get(p_157584_) != Visibility.HIDDEN ? true : this.processChunkUnload(p_157584_));
+     }
+ 
      private void processPendingLoads() {
++        this.checkStorageAccess("PersistentEntitySectionManager.processPendingLoads");
          ChunkEntities<T> chunkentities;
          while ((chunkentities = this.loadingInbox.poll()) != null) {
 -            chunkentities.getEntities().forEach(p_157593_ -> this.addEntity((T)p_157593_, true));
@@ -49,7 +129,77 @@
              this.chunkLoadStatuses.put(chunkentities.getPos().toLong(), PersistentEntitySectionManager.ChunkLoadStatus.LOADED);
          }
      }
-@@ -367,11 +_,13 @@
+@@ -251,6 +_,7 @@
+     }
+ 
+     public void autoSave() {
++        this.checkStorageAccess("PersistentEntitySectionManager.autoSave");
+         this.getAllChunksToSave().forEach(p_157579_ -> {
+             boolean flag = this.chunkVisibility.get(p_157579_) == Visibility.HIDDEN;
+             if (flag) {
+@@ -263,6 +_,7 @@
+     }
+ 
+     public void saveAll() {
++        this.checkStorageAccess("PersistentEntitySectionManager.saveAll");
+         LongSet longset = this.getAllChunksToSave();
+ 
+         while (!longset.isEmpty()) {
+@@ -280,31 +_,38 @@
+ 
+     @Override
+     public void close() throws IOException {
++        this.checkStorageAccess("PersistentEntitySectionManager.close");
+         this.saveAll();
+         this.permanentStorage.close();
+     }
+ 
+     public boolean isLoaded(UUID p_157551_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.isLoaded");
+         return this.knownUuids.contains(p_157551_);
+     }
+ 
+     public LevelEntityGetter<T> getEntityGetter() {
+-        return this.entityGetter;
++        this.checkStorageAccess("PersistentEntitySectionManager.getEntityGetter");
++        return this.guardedEntityGetter;
+     }
+ 
+     public boolean canPositionTick(BlockPos p_202168_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.canPositionTick");
+         return this.chunkVisibility.get(ChunkPos.asLong(p_202168_)).isTicking();
+     }
+ 
+     public boolean canPositionTick(ChunkPos p_202166_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.canPositionTick");
+         return this.chunkVisibility.get(p_202166_.toLong()).isTicking();
+     }
+ 
+     public boolean areEntitiesLoaded(long p_157508_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.areEntitiesLoaded");
+         return this.chunkLoadStatuses.get(p_157508_) == PersistentEntitySectionManager.ChunkLoadStatus.LOADED;
+     }
+ 
+     public void dumpSections(Writer p_157549_) throws IOException {
++        this.checkStorageAccess("PersistentEntitySectionManager.dumpSections");
+         CsvOutput csvoutput = CsvOutput.builder()
+             .addColumn("x")
+             .addColumn("y")
+@@ -345,6 +_,7 @@
+ 
+     @VisibleForDebug
+     public String gatherStats() {
++        this.checkStorageAccess("PersistentEntitySectionManager.gatherStats");
+         return this.knownUuids.size()
+             + ","
+             + this.visibleEntityStorage.count()
+@@ -362,22 +_,26 @@
+ 
+     @VisibleForDebug
+     public int count() {
++        this.checkStorageAccess("PersistentEntitySectionManager.count");
+         return this.visibleEntityStorage.count();
+     }
  
      class Callback implements EntityInLevelCallback {
          private final T entity;
@@ -63,6 +213,13 @@
              this.currentSectionKey = p_157615_;
              this.currentSection = p_157616_;
          }
+ 
+         @Override
+         public void onMove() {
++            PersistentEntitySectionManager.this.checkStorageAccess("PersistentEntitySectionManager.Callback.onMove");
+             BlockPos blockpos = this.entity.blockPosition();
+             long i = SectionPos.asLong(blockpos);
+             if (i != this.currentSectionKey) {
 @@ -390,9 +_,11 @@
                  PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
                  EntitySection<T> entitysection = PersistentEntitySectionManager.this.sectionStorage.getOrCreateSection(i);
@@ -75,3 +232,11 @@
              }
          }
  
+@@ -428,6 +_,7 @@
+ 
+         @Override
+         public void onRemove(Entity.RemovalReason p_157619_) {
++            PersistentEntitySectionManager.this.checkStorageAccess("PersistentEntitySectionManager.Callback.onRemove");
+             if (!this.currentSection.remove(this.entity)) {
+                 PersistentEntitySectionManager.LOGGER
+                     .warn("Entity {} wasn't found in section {} (destroying due to {})", this.entity, SectionPos.of(this.currentSectionKey), p_157619_);

@@ -6,12 +6,28 @@
 package net.neoforged.neoforge.server.threading;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.minecraft.world.level.entity.LevelEntityGetter;
+import net.minecraft.world.ticks.LevelTicks;
+import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
+import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
+import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
+import net.neoforged.neoforge.server.threading.region.RegionPolicy;
+import net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
+import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
+import net.neoforged.neoforge.server.threading.region.RegionWorkerScope;
+import net.neoforged.neoforge.server.threading.region.ScheduledTickPhase;
 import org.jetbrains.annotations.ApiStatus;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Internal bridge points for the region threading runtime.
@@ -19,6 +35,18 @@ import org.jetbrains.annotations.ApiStatus;
 @ApiStatus.Internal
 public final class RegionThreadingHooks {
     private RegionThreadingHooks() {}
+
+    /**
+     * Captures the installed bridge's layout without reading a partially constructed level. Levels
+     * created before bridge installation retain legacy storage for their lifetime; storage is never
+     * migrated by installing or removing a bridge. The normal server lifecycle installs the bridge
+     * before creating levels. This choice grants no worker access to either backend.
+     */
+    public static RegionPolicy entitySectionStoragePolicy() {
+        return RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine
+                ? engine.regionPolicy()
+                : RegionPolicy.DYNAMIC;
+    }
 
     /**
      * Drains global-region work on the current server tick loop.
@@ -52,6 +80,307 @@ public final class RegionThreadingHooks {
                 engine.drainLevelRegionTasks(level);
             }
         });
+    }
+
+    /**
+     * {@return true when the current thread executes work of a native region worker pool}
+     * <p>
+     * The marker belongs to the pool and survives removal of the installed manager or engine, so it can
+     * be used by storage guards that must never depend on a successful engine lookup.
+     */
+    public static boolean isNativeRegionWorkerThread() {
+        return RegionWorkerScope.isNativeWorkerThread();
+    }
+
+    /**
+     * {@return true when the current thread may skip the server-owned entity-load read of {@code pos}}
+     * <p>
+     * The entity section status is server-owned storage: a native region worker read of it is rejected.
+     * The server thread therefore evaluates the vanilla entity-load eligibility of every block-entity
+     * ticker before it admits the ticker to a region worker batch, and this check is the replacement for
+     * that one read. It answers {@code true} only inside the invocation of the admitted
+     * ticker or its captured delegate, for the exact level and position while its group owns the region
+     * lease. Every other caller - the server thread, the watchdog thread, an unrelated native pool task,
+     * another level, another position, another region - keeps the guarded read.
+     */
+    public static boolean isAdmittedBlockEntityTick(ServerLevel level, @Nullable TickingBlockEntity ticker, BlockPos pos) {
+        return RegionBlockEntityTickScope.isAdmitted(level, ticker, pos);
+    }
+
+    /**
+     * Rejects server-owned entity storage access issued from a native region worker.
+     * <p>
+     * This is production behavior, not a debug switch. The rejection is unconditional and happens before
+     * the guarded operation reads or changes state. It is deliberately independent of
+     * {@code ownershipViolationMode}: a worker that reaches the shared vanilla section/index storage would
+     * race the server thread even when violations are only logged or disabled. It is also independent of
+     * the installed manager, so a worker that is still unwinding after the manager or engine was removed
+     * is still rejected.
+     * <p>
+     * Every non-worker caller - the server thread, the watchdog thread, the client level and any ordinary
+     * thread - passes through and keeps the vanilla behavior. The mechanics-only query handoff on
+     * {@link RegionThreadingEngine} is not a way past this check: it runs the query on the server thread,
+     * so the check is evaluated there.
+     */
+    public static void assertServerEntityStorageAccess(String operation) {
+        if (RegionWorkerScope.isNativeWorkerThread()) {
+            RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+        }
+    }
+
+    /**
+     * Rejects server-owned entity storage access of a server-level entity issued from a native region
+     * worker.
+     * <p>
+     * The entity's level, not {@code isAddedToLevel()}, decides whether its storage is server owned. An
+     * entity that has not been registered yet is still backed by the server level's storage.
+     */
+    public static void assertServerEntityStorageAccess(Entity entity, String operation) {
+        if (entity.level() instanceof ServerLevel) {
+            assertServerEntityStorageAccess(operation);
+        }
+    }
+
+    /**
+     * {@return true when a legacy entity query issued on the current thread has to be rejected}
+     * <p>
+     * Production region workers never receive live entity storage: the legacy getters return live entity
+     * references or run caller predicates/consumers, so a completed handoff is not a safety boundary for
+     * them. The check only depends on the worker scope, so it keeps rejecting while a worker unwinds after
+     * the manager was removed. The mechanics seam on {@link RegionThreadingEngine} re-enables the handoff
+     * for transport tests only; it is never enabled in production.
+     */
+    public static boolean shouldRejectLegacyEntityQuery() {
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return !(threading instanceof RegionThreadingEngine engine && engine.isLegacyEntityQueryHandoffEnabled());
+    }
+
+    /**
+     * Rejects a legacy entity query before it runs a predicate, a consumer or returns a live reference.
+     */
+    public static void rejectLegacyEntityQuery(String operation) {
+        RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
+     * {@return true when an entity range query on the current thread has to be handed to the server
+     * thread because the thread is a region tick worker}
+     * <p>
+     * The check is a thread-local lookup on the server thread and does not allocate, so the vanilla
+     * single-threaded path pays no lock or queue cost. This transport path is only reachable through the
+     * internal mechanics seam; production workers are rejected by
+     * {@link #shouldRejectLegacyEntityQuery()} first.
+     */
+    public static boolean shouldHandOffEntityQuery() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.isRegionTickBatchWorkerThread();
+    }
+
+    /**
+     * Runs a complete computation on the server thread while the current region tick worker waits for it.
+     * <p>
+     * The computation has to contain everything that touches unregionized shared state, including the
+     * consumer of any entity query. The worker receives the exact result or exception and never continues
+     * against the shared state itself. Outside a region tick batch the computation runs inline.
+     */
+    public static <T> T runOnServerThread(ServerLevel level, java.util.function.Supplier<T> computation) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.runOnServerThread(level, computation);
+        }
+        return computation.get();
+    }
+
+    /**
+     * Runs one complete entity range query on the server thread when the caller is a region tick worker.
+     * <p>
+     * The whole query, including its predicate and the consumer that fills the result list, executes on
+     * the server thread against the authoritative section storage. The worker only receives the finished
+     * snapshot list; it never iterates the live storage.
+     */
+    public static <T> T runEntityQueryOnServerThread(ServerLevel level, java.util.function.Supplier<T> query) {
+        return runOnServerThread(level, query);
+    }
+
+    /**
+     * Wraps the entity getter of {@code level} with the server-owned entity storage boundary.
+     * <p>
+     * The vanilla section/index storage stays single-threaded and is owned by the server thread, so the
+     * by-id, by-uuid, type, AABB and {@code getAll} lookups must not run on a worker. In production the
+     * wrapper rejects every legacy query issued from a native region worker before its predicate, consumer
+     * or result escapes; it never hands a live entity reference or a caller callback across threads.
+     * <p>
+     * Every non-worker caller runs inline with the vanilla semantics, including the whole server thread and
+     * the case where no region threading is installed at all. The only handoff left is the internal
+     * mechanics seam ({@code RegionThreadingEngine.enableLegacyEntityQueryHandoffForTesting()}), which runs
+     * the complete query on the server thread for transport tests; production never enables it.
+     */
+    public static LevelEntityGetter<Entity> wrapEntityGetter(ServerLevel level, LevelEntityGetter<Entity> delegate) {
+        return new RegionAwareEntityGetter(level, delegate);
+    }
+
+    /**
+     * Starts collecting the entities of the current level tick that should tick on region workers.
+     *
+     * @param inEntityTickingRange the vanilla entity ticking range predicate, evaluated on the server thread
+     * @param barrier              waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when entity ticks have to stay on the server thread
+     */
+    @Nullable
+    public static RegionEntityTickPlan beginEntityTickPlan(ServerLevel level, Predicate<Entity> inEntityTickingRange, RegionTickBarrier barrier) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.beginEntityTickPlan(level, inEntityTickingRange, barrier);
+        }
+        return null;
+    }
+
+    /**
+     * Ticks the entities collected by {@code plan} on region workers and waits for the batch.
+     */
+    public static void runEntityTickPlan(@Nullable RegionEntityTickPlan plan) {
+        if (plan != null) {
+            plan.executeAndAwait();
+        }
+    }
+
+    /**
+     * Starts collecting the block-entity tickers of the current level tick that should tick on region
+     * workers.
+     *
+     * @param barrier waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when block-entity ticks have to stay on the server thread
+     */
+    @Nullable
+    public static RegionBlockEntityTickPlan beginBlockEntityTickPlan(ServerLevel level, RegionTickBarrier barrier) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.beginBlockEntityTickPlan(level, barrier);
+        }
+        return null;
+    }
+
+    /**
+     * Ticks the block-entity tickers collected by {@code plan} on region workers and waits for the batch.
+     */
+    public static void runBlockEntityTickPlan(@Nullable RegionBlockEntityTickPlan plan) {
+        if (plan != null) {
+            plan.executeAndAwait();
+        }
+    }
+
+    /**
+     * Creates the dispatcher that executes the scheduled ticks of one phase on region workers.
+     *
+     * @return the dispatcher, or {@code null} when the scheduled ticks have to stay on the server thread
+     */
+    @Nullable
+    public static <T> LevelTicks.TickDispatcher<T> scheduledTickDispatcher(ServerLevel level, ScheduledTickPhase phase, RegionTickBarrier barrier) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.beginScheduledTickDispatcher(level, phase, barrier);
+        }
+        return null;
+    }
+
+    /**
+     * {@return the random source of the scheduled tick group executing on the current thread, or
+     * {@code null} outside a worker group}
+     */
+    @Nullable
+    public static RandomSource scheduledTickRandom() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.scheduledTickRandom();
+        }
+        return null;
+    }
+
+    /**
+     * Starts collecting the block and fluid random ticks of the current level tick that should run on
+     * region workers.
+     *
+     * @param barrier waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when random ticks have to stay on the server thread
+     */
+    @Nullable
+    public static RegionRandomTickPlan beginRandomTickPlan(ServerLevel level, RegionTickBarrier barrier) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.beginRandomTickPlan(level, barrier);
+        }
+        return null;
+    }
+
+    /**
+     * Ticks the random ticks collected by {@code plan} on region workers and waits for the batch.
+     */
+    public static void runRandomTickPlan(@Nullable RegionRandomTickPlan plan) {
+        if (plan != null) {
+            plan.executeAndAwait();
+        }
+    }
+
+    /**
+     * {@return the random source of the random tick group executing on the current thread, or
+     * {@code null} outside a random tick worker group}
+     */
+    @Nullable
+    public static RandomSource randomTickRandom() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.randomTickRandom();
+        }
+        return null;
+    }
+
+    /**
+     * {@return the server-owned queue a region tick worker has to use for mutations, or {@code null}
+     * when the current thread is not executing a region tick worker group}
+     * <p>
+     * Scheduled block/fluid ticks and random ticks share this queue. The engine drains it on the server
+     * thread after every batch, so a worker never mutates either {@code LevelTicks} instance concurrently.
+     */
+    @Nullable
+    public static java.util.Queue<Runnable> regionTickMutationQueue() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.regionTickMutationQueue();
+        }
+        return null;
+    }
+
+    /**
+     * Wraps the level random so region tick workers draw from their region random instead of the shared
+     * level random. When no region worker slice is enabled, the vanilla random is returned unchanged.
+     */
+    public static RandomSource wrapLevelRandom(RandomSource vanilla) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine
+                && (engine.isScheduledTickWorkerExecutionEnabled() || engine.isRandomTickWorkerExecutionEnabled())) {
+            return new RegionAwareRandomSource(vanilla, engine);
+        }
+        return vanilla;
+    }
+
+    /**
+     * {@return true when a region tick worker is executing and the current thread owns the region
+     * containing {@code pos}}
+     * <p>
+     * Used by the block-entity lookup so scheduled tick and random tick callbacks can read a block entity
+     * of their own region. Cross-region and other off-thread access still returns {@code null}.
+     */
+    public static boolean isRegionTickOwnedByCurrentThread(net.minecraft.world.level.Level level, BlockPos pos) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.currentRegionTickRandom() != null
+                && engine.isOwnedByCurrentRegion(serverLevel, pos);
     }
 
     /**

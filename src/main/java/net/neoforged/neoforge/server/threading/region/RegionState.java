@@ -65,16 +65,47 @@ final class RegionState {
         return this.taskQueue;
     }
 
+    /**
+     * Inserts work atomically with empty-region retirement. A task can therefore never be left in the
+     * queue of a region that has already been removed from the regionizer.
+     */
+    synchronized boolean enqueueTask(Runnable task) {
+        if (this.isDead()) {
+            return false;
+        }
+        this.taskQueue.enqueue(task);
+        return true;
+    }
+
+    synchronized RegionScheduledTask scheduleTask(Runnable task, long delayTicks) {
+        if (this.isDead()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.taskQueue.schedule(task, delayTicks);
+    }
+
+    synchronized RegionScheduledTask scheduleTaskAtFixedRate(Runnable task, long initialDelayTicks, long periodTicks) {
+        if (this.isDead()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.taskQueue.scheduleAtFixedRate(task, initialDelayTicks, periodTicks);
+    }
+
     boolean hasQueuedTasks() {
         return !this.taskQueue.isEmpty();
     }
 
-    void clearTasks() {
+    synchronized void clearTasks() {
         this.taskQueue.clearAndCancel();
+        this.notifyAll();
     }
 
     RegionTickTimer tickTimer() {
         return this.tickTimer;
+    }
+
+    void makeDueForTesting() {
+        this.tickTimer.advanceBy(1);
     }
 
     RegionTickMetrics tickMetrics() {
@@ -101,8 +132,9 @@ final class RegionState {
         return this.lifecycleState.compareAndSet(RegionLifecycleState.READY, RegionLifecycleState.TICKING);
     }
 
-    void clearRunning() {
+    synchronized void clearRunning() {
         this.lifecycleState.compareAndSet(RegionLifecycleState.TICKING, RegionLifecycleState.READY);
+        this.notifyAll();
     }
 
     boolean isRunning() {
@@ -113,8 +145,9 @@ final class RegionState {
         return this.workerSubmitted.compareAndSet(false, true);
     }
 
-    void clearWorkerSubmitted() {
+    synchronized void clearWorkerSubmitted() {
         this.workerSubmitted.set(false);
+        this.notifyAll();
     }
 
     boolean isWorkerSubmitted() {
@@ -147,5 +180,30 @@ final class RegionState {
 
     boolean isEmpty() {
         return !this.isDead() && !this.isRunning() && !this.isWorkerSubmitted() && !this.hasSections() && this.taskQueue.isEmpty();
+    }
+
+    /**
+     * Retires an empty region and closes its queue while excluding concurrent producers.
+     */
+    synchronized void awaitQuiescent() {
+        boolean interrupted = false;
+        while (this.isWorkerSubmitted() || this.isRunning()) {
+            try {
+                this.wait();
+            } catch (InterruptedException exception) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    synchronized boolean retireIfEmpty() {
+        if (!this.isEmpty() || !this.tryMarkDead()) {
+            return false;
+        }
+        this.clearTasks();
+        return true;
     }
 }

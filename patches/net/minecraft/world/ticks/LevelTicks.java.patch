@@ -1,0 +1,196 @@
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -51,6 +_,15 @@
+     }
+ 
+     public void addContainer(ChunkPos p_193232_, LevelChunkTicks<T> p_193233_) {
++        final Queue<Runnable> deferred = regionTickMutationQueue();
++        if (deferred != null) {
++            deferred.add(() -> this.addContainerNow(p_193232_, p_193233_));
++            return;
++        }
++        this.addContainerNow(p_193232_, p_193233_);
++    }
++
++    private void addContainerNow(ChunkPos p_193232_, LevelChunkTicks<T> p_193233_) {
+         long i = p_193232_.toLong();
+         this.allContainers.put(i, p_193233_);
+         ScheduledTick<T> scheduledtick = p_193233_.peek();
+@@ -62,6 +_,15 @@
+     }
+ 
+     public void removeContainer(ChunkPos p_193230_) {
++        final Queue<Runnable> deferred = regionTickMutationQueue();
++        if (deferred != null) {
++            deferred.add(() -> this.removeContainerNow(p_193230_));
++            return;
++        }
++        this.removeContainerNow(p_193230_);
++    }
++
++    private void removeContainerNow(ChunkPos p_193230_) {
+         long i = p_193230_.toLong();
+         LevelChunkTicks<T> levelchunkticks = this.allContainers.remove(i);
+         this.nextTickForContainer.remove(i);
+@@ -72,6 +_,15 @@
+ 
+     @Override
+     public void schedule(ScheduledTick<T> p_193252_) {
++        final Queue<Runnable> deferred = regionTickMutationQueue();
++        if (deferred != null) {
++            deferred.add(() -> this.scheduleNow(p_193252_));
++            return;
++        }
++        this.scheduleNow(p_193252_);
++    }
++
++    private void scheduleNow(ScheduledTick<T> p_193252_) {
+         long i = ChunkPos.asLong(p_193252_.pos());
+         LevelChunkTicks<T> levelchunkticks = this.allContainers.get(i);
+         if (levelchunkticks == null) {
+@@ -82,12 +_,37 @@
+     }
+ 
+     public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_) {
++        this.tick(p_193226_, p_193227_, p_193228_, p_193228_, null);
++    }
++
++    /**
++     * Runs one level tick, handing the collected ticks to {@code dispatcher} when one is supplied.
++     * <p>
++     * The collection, the budget, the de-duplication and the per-tick bookkeeping stay on the calling
++     * thread. A dispatcher only receives the ticks that were selected for this tick; it has to execute
++     * every callback before it returns. Passing {@code null} keeps the vanilla inline loop.
++     */
++    public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_, @org.jetbrains.annotations.Nullable TickDispatcher<T> dispatcher) {
++        this.tick(p_193226_, p_193227_, p_193228_, p_193228_, dispatcher);
++    }
++
++    /**
++     * Runs one level tick with a separate callback for the ticks a dispatcher could not execute on a
++     * region worker.
++     * <p>
++     * The fallback callback runs directly on the calling server thread, after every worker of the
++     * dispatcher finished and before this method returns. It must not hand the tick to another region
++     * queue: the tick was already removed from the scheduling structures, so a deferred handoff could run
++     * it in a later tick or drop it when the level closes.
++     */
++    public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_, BiConsumer<BlockPos, T> p_193229_,
++            @org.jetbrains.annotations.Nullable TickDispatcher<T> dispatcher) {
+         ProfilerFiller profilerfiller = this.profiler.get();
+         profilerfiller.push("collect");
+         this.collectTicks(p_193226_, p_193227_, profilerfiller);
+         profilerfiller.popPush("run");
+         profilerfiller.incrementCounter("ticksToRun", this.toRunThisTick.size());
+-        this.runCollectedTicks(p_193228_);
++        this.runCollectedTicks(p_193228_, p_193229_, dispatcher);
+         profilerfiller.popPush("cleanup");
+         this.cleanupAfterTick();
+         profilerfiller.pop();
+@@ -181,15 +_,48 @@
+     }
+ 
+     private void runCollectedTicks(BiConsumer<BlockPos, T> p_193273_) {
+-        while (!this.toRunThisTick.isEmpty()) {
+-            ScheduledTick<T> scheduledtick = this.toRunThisTick.poll();
++        this.runCollectedTicks(p_193273_, p_193273_, null);
++    }
++
++    private void runCollectedTicks(BiConsumer<BlockPos, T> callback, BiConsumer<BlockPos, T> fallbackCallback,
++            @org.jetbrains.annotations.Nullable TickDispatcher<T> dispatcher) {
++        if (dispatcher == null) {
++            while (!this.toRunThisTick.isEmpty()) {
++                this.runCollectedTick(callback);
++            }
++            return;
++        }
++
++        // Snapshot and update the vanilla per-tick bookkeeping before any callback runs. A worker must
++        // never observe or mutate a queue that is still being drained on the server thread.
++        final List<ScheduledTick<T>> collected = new ArrayList<>(this.toRunThisTick);
++        this.toRunThisTick.clear();
++        for (final ScheduledTick<T> scheduledtick : collected) {
+             if (!this.toRunThisTickSet.isEmpty()) {
+                 this.toRunThisTickSet.remove(scheduledtick);
+             }
+-
+             this.alreadyRunThisTick.add(scheduledtick);
+-            p_193273_.accept(scheduledtick.pos(), scheduledtick.type());
+-        }
++        }
++
++        dispatcher.runCollected(collected, callback, fallbackCallback);
++    }
++
++    private void runCollectedTick(BiConsumer<BlockPos, T> callback) {
++        ScheduledTick<T> scheduledtick = this.toRunThisTick.poll();
++        if (!this.toRunThisTickSet.isEmpty()) {
++            this.toRunThisTickSet.remove(scheduledtick);
++        }
++
++        this.alreadyRunThisTick.add(scheduledtick);
++        callback.accept(scheduledtick.pos(), scheduledtick.type());
++    }
++
++    /**
++     * {@return the server-owned queue a region tick worker has to use for mutations, or {@code null}
++     * when the current thread is not executing a region tick worker group}
++     */
++    private static Queue<Runnable> regionTickMutationQueue() {
++        return net.neoforged.neoforge.server.threading.RegionThreadingHooks.regionTickMutationQueue();
+     }
+ 
+     private void cleanupAfterTick() {
+@@ -235,6 +_,15 @@
+     }
+ 
+     public void clearArea(BoundingBox p_193235_) {
++        final Queue<Runnable> deferred = regionTickMutationQueue();
++        if (deferred != null) {
++            deferred.add(() -> this.clearAreaNow(p_193235_));
++            return;
++        }
++        this.clearAreaNow(p_193235_);
++    }
++
++    private void clearAreaNow(BoundingBox p_193235_) {
+         Predicate<ScheduledTick<T>> predicate = p_193241_ -> p_193235_.isInside(p_193241_.pos());
+         this.forContainersInArea(p_193235_, (p_193276_, p_193277_) -> {
+             ScheduledTick<T> scheduledtick = p_193277_.peek();
+@@ -257,6 +_,15 @@
+     }
+ 
+     public void copyAreaFrom(LevelTicks<T> p_265554_, BoundingBox p_265172_, Vec3i p_265318_) {
++        final Queue<Runnable> deferred = regionTickMutationQueue();
++        if (deferred != null) {
++            deferred.add(() -> this.copyAreaFromNow(p_265554_, p_265172_, p_265318_));
++            return;
++        }
++        this.copyAreaFromNow(p_265554_, p_265172_, p_265318_);
++    }
++
++    private void copyAreaFromNow(LevelTicks<T> p_265554_, BoundingBox p_265172_, Vec3i p_265318_) {
+         List<ScheduledTick<T>> list = new ArrayList<>();
+         Predicate<ScheduledTick<T>> predicate = p_200922_ -> p_265172_.isInside(p_200922_.pos());
+         p_265554_.alreadyRunThisTick.stream().filter(predicate).forEach(list::add);
+@@ -286,5 +_,20 @@
+     @FunctionalInterface
+     interface PosAndContainerConsumer<T> {
+         void accept(long p_193289_, LevelChunkTicks<T> p_193290_);
++    }
++
++    /**
++     * Executes the ticks that {@link LevelTicks} selected for the current tick.
++     * <p>
++     * The dispatcher is called on the thread that owns the tick, after the collection and the per-tick
++     * bookkeeping are complete, and it must execute every callback before returning. Ticks it cannot
++     * execute on a region worker are passed to {@code fallbackCallback} on the server thread before it
++     * returns. An implementation may execute the worker callbacks concurrently, but all mutations of the
++     * scheduling structures have to go through the server-owned queue exposed by
++     * {@code RegionThreadingHooks.regionTickMutationQueue()}.
++     */
++    @FunctionalInterface
++    public interface TickDispatcher<T> {
++        void runCollected(List<ScheduledTick<T>> collected, BiConsumer<BlockPos, T> callback, BiConsumer<BlockPos, T> fallbackCallback);
+     }
+ }

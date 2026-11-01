@@ -3,7 +3,7 @@
 @@ -150,6 +_,10 @@
                  }
              }
-
+ 
 +            ChunkHolder chunkholder = this.getVisibleChunkIfPresent(i);
 +            if (chunkholder != null && chunkholder.currentlyLoading != null)
 +                return chunkholder.currentlyLoading; // Neo: If the requested chunk is loading, bypass the future chain to prevent a deadlock.
@@ -19,35 +19,54 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -356,15 +_,17 @@
+@@ -270,6 +_,12 @@
+         return this.mainThreadProcessor.pollTask();
+     }
+ 
++    // Neo: lets the region entity tick barrier service chunk source tasks while region workers tick entities.
++    // Off thread chunk requests are dispatched to this queue, so the server thread has to keep draining it.
++    public void managedBlockOnMainThread(java.util.function.BooleanSupplier condition) {
++        this.mainThreadProcessor.managedBlock(condition);
++    }
++
+     boolean runDistanceManagerUpdates() {
+         boolean flag = this.distanceManager.runAllUpdates(this.chunkMap);
+         boolean flag1 = this.chunkMap.promoteChunkMap();
+@@ -353,20 +_,29 @@
+                 int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
+                 boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
+ 
++                // Neo: the random tick plan collects only the selected block/fluid random tick callbacks
++                // while the server thread traverses the chunks. Natural spawning and the rest of the chunk
++                // tick stay in this body; the plan is executed after the loop, before the level broadcast.
++                final net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan randomTickPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
++                    .beginRandomTickPlan(this.level, this::managedBlockOnMainThread);
++
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
                      ChunkPos chunkpos = levelchunk1.getPos();
 -                    if (this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) {
--                        levelchunk1.incrementInhabitedTime(j);
--                        if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
--                            NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
--                        }
 +                    if ((this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) || this.distanceManager.shouldForceTicks(chunkpos.toLong())) {
-+                        net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this.level, chunkpos.getMiddleBlockPosition(0), () -> {
-+                            levelchunk1.incrementInhabitedTime(j);
-+                            if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
-+                                NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
-+                            }
-
--                        if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
++                        // Neo: the per-chunk body stays on the server thread. Only the selected random
++                        // block/fluid callbacks are collected into the plan and dispatched after the loop.
+                         levelchunk1.incrementInhabitedTime(j);
+                         if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
+                             NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
+                         }
+ 
+                         if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
 -                            this.level.tickChunk(levelchunk1, k);
--                        }
-+                            if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
-+                                this.level.tickChunk(levelchunk1, k);
-+                            }
-+                        });
++                            this.level.tickChunk(levelchunk1, k, randomTickPlan);
+                         }
                      }
                  }
-
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runRandomTickPlan(randomTickPlan);
+ 
+                 profilerfiller.popPush("customSpawners");
+                 if (flag1) {
 @@ -435,11 +_,17 @@
      }
-
+ 
      public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_) {
 -        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_);
 +        addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, false);
@@ -55,7 +74,7 @@
 +    public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_, boolean forceTicks) {
 +        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, forceTicks);
      }
-
+ 
      public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_) {
 -        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_);
 +        removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, false);
@@ -63,5 +82,5 @@
 +    public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_, boolean forceTicks) {
 +        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, forceTicks);
      }
-
+ 
      @Override

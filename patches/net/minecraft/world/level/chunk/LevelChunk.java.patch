@@ -46,6 +46,30 @@
          }
      }
  
+@@ -368,12 +_,22 @@
+     }
+ 
+     boolean isTicking(BlockPos p_156411_) {
++        return this.isTicking(p_156411_, null);
++    }
++
++    private boolean isTicking(BlockPos p_156411_, @Nullable TickingBlockEntity ticker) {
+         if (!this.level.getWorldBorder().isWithinBounds(p_156411_)) {
+             return false;
+         } else {
+             return !(this.level instanceof ServerLevel serverlevel)
+                 ? true
+-                : this.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING) && serverlevel.areEntitiesLoaded(ChunkPos.asLong(p_156411_));
++                : this.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING)
++                    // Neo: the entity section status is server-owned storage and a native worker read of it
++                    // is rejected. The server thread evaluated the entity-load eligibility of this exact
++                    // ticker before it admitted the ticker to the worker batch, so only that admitted
++                    // ticker in its owned region skips the read; every other worker caller keeps it.
++                    && (net.neoforged.neoforge.server.threading.RegionThreadingHooks.isAdmittedBlockEntityTick(serverlevel, ticker, p_156411_)
++                        || serverlevel.areEntitiesLoaded(ChunkPos.asLong(p_156411_)));
+         }
+     }
+ 
 @@ -403,6 +_,7 @@
              BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
              if (blockentity != null && blockentity != p_156374_) {
@@ -102,7 +126,7 @@
          this.blockEntities.values().forEach(p_187988_ -> {
              if (this.level instanceof ServerLevel serverlevel) {
                  this.addGameEventListener(p_187988_, serverlevel);
-@@ -662,6 +_,19 @@
+@@ -662,6 +_,30 @@
          return new LevelChunk.BoundTickingBlockEntity<>(p_156376_, p_156377_);
      }
  
@@ -119,11 +143,35 @@
 +        net.neoforged.neoforge.attachment.AttachmentSync.syncChunkUpdate(this, getAttachmentHolder(), type);
 +    }
 +
++    // Capture the exact wrapper/delegate relationship on the server thread, including a rebind version.
++    public static net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBlockEntityTickBinding(TickingBlockEntity ticker, ServerLevel level) {
++        if (ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper wrapper) {
++            return wrapper.captureBinding(level);
++        }
++        if (ticker instanceof LevelChunk.BoundTickingBlockEntity<?> bound) {
++            return bound.captureBinding(level);
++        }
++        return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(ticker, () -> true);
++    }
++
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {
          private final T blockEntity;
          private final BlockEntityTicker<T> ticker;
-@@ -679,10 +_,15 @@
-                 if (LevelChunk.this.isTicking(blockpos)) {
+@@ -672,17 +_,27 @@
+             this.ticker = p_156434_;
+         }
+ 
++        private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBinding(ServerLevel level) {
++            return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(
++                this, () -> LevelChunk.this.level == level && this.blockEntity.getLevel() == level);
++        }
++
+         @Override
+         public void tick() {
+             if (!this.blockEntity.isRemoved() && this.blockEntity.hasLevel()) {
+                 BlockPos blockpos = this.blockEntity.getBlockPos();
+-                if (LevelChunk.this.isTicking(blockpos)) {
++                if (LevelChunk.this.isTicking(blockpos, this)) {
                      try {
                          ProfilerFiller profilerfiller = LevelChunk.this.level.getProfiler();
 +                        net.neoforged.neoforge.server.timings.TimeTracker.BLOCK_ENTITY_UPDATE.trackStart(blockEntity);
@@ -155,3 +203,26 @@
                      }
                  }
              }
+@@ -740,6 +_,7 @@
+ 
+     class RebindableTickingBlockEntityWrapper implements TickingBlockEntity {
+         private TickingBlockEntity ticker;
++        private long bindingVersion;
+ 
+         RebindableTickingBlockEntityWrapper(TickingBlockEntity p_156447_) {
+             this.ticker = p_156447_;
+@@ -747,6 +_,14 @@
+ 
+         void rebind(TickingBlockEntity p_156450_) {
+             this.ticker = p_156450_;
++            ++this.bindingVersion;
++        }
++
++        private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBinding(ServerLevel level) {
++            final long version = this.bindingVersion;
++            final var binding = captureBlockEntityTickBinding(this.ticker, level);
++            return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(
++                binding.delegate(), () -> LevelChunk.this.level == level && this.bindingVersion == version && binding.isCurrent().getAsBoolean());
+         }
+ 
+         @Override

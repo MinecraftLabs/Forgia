@@ -45,6 +45,25 @@ final class RegionThreadingCommand {
                 + ", workerThreads=" + diagnostics.workerThreadCount()
                 + ", workerExecution=" + diagnostics.workerExecutionEnabled()
                 + ", globalWorkerExecution=" + diagnostics.globalWorkerExecutionEnabled()
+                + ", entityTickWorkerExecution=" + diagnostics.entityTickWorkerExecutionEnabled()
+                + ", blockEntityTickWorkerExecution=" + diagnostics.blockEntityTickWorkerExecutionEnabled()
+                + ", scheduledTickWorkerExecutionRequested=" + diagnostics.scheduledTickWorkerExecutionEnabled()
+                + ", scheduledTickWorkerDispatchEffective=" + diagnostics.scheduledTickWorkerDispatchEffective()
+                + ", randomTickWorkerExecutionRequested=" + diagnostics.randomTickWorkerExecutionEnabled()
+                + ", randomTickWorkerDispatchEffective=" + diagnostics.randomTickWorkerDispatchEffective()
+                + ", entityTicksOnWorkers=" + diagnostics.entityTicksOnWorkers()
+                + ", skippedEntityTicks=" + diagnostics.skippedEntityTicks()
+                + ", fallbackEntityTicks=" + diagnostics.fallbackEntityTicks()
+                + ", deferredEntityTicks=" + diagnostics.deferredEntityTicks()
+                + ", blockEntityTicksOnWorkers=" + diagnostics.blockEntityTicksOnWorkers()
+                + ", skippedBlockEntityTicks=" + diagnostics.skippedBlockEntityTicks()
+                + ", fallbackBlockEntityTicks=" + diagnostics.fallbackBlockEntityTicks()
+                + ", scheduledTicksOnWorkers=" + diagnostics.scheduledTicksOnWorkers()
+                + ", skippedScheduledTicks=" + diagnostics.skippedScheduledTicks()
+                + ", fallbackScheduledTicks=" + diagnostics.fallbackScheduledTicks()
+                + ", randomTicksOnWorkers=" + diagnostics.randomTicksOnWorkers()
+                + ", skippedRandomTicks=" + diagnostics.skippedRandomTicks()
+                + ", fallbackRandomTicks=" + diagnostics.fallbackRandomTicks()
                 + ", globalRunning=" + diagnostics.globalRegionRunning()
                 + ", globalSubmitted=" + diagnostics.globalRegionSubmitted()
                 + ", rejectedWorkerTasks=" + diagnostics.rejectedWorkerTaskCount()
@@ -58,7 +77,9 @@ final class RegionThreadingCommand {
                 + ", globalLastTickNs=" + diagnostics.globalLastTickDurationNanos()
                 + ", regionTicks=" + diagnostics.totalRegionTickCount()
                 + ", maxRegionLastTickNs=" + diagnostics.maxRegionLastTickDurationNanos()
-                + ", cappedDrains=" + diagnostics.cappedDrainCount()), false);
+                + ", cappedDrains=" + diagnostics.cappedDrainCount()
+                + ", regionPolicy=" + diagnostics.regionPolicy()
+                + ", entityStorageMode=" + diagnostics.entityStorageMode()), false);
     }
 
     private static void sendNotInstalled(CommandSourceStack source) {
@@ -66,10 +87,15 @@ final class RegionThreadingCommand {
                 + NeoForgeConfig.SERVER.enableRegionThreadingBridge.get()
                 + ", workerExecution=" + NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get()
                 + ", globalWorkerExecution=" + NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get()
+                + ", entityTickWorkerExecution=" + NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get()
+                + ", blockEntityTickWorkerExecution=" + NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get()
+                + ", scheduledTickWorkerExecutionRequested=" + NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get()
+                + ", randomTickWorkerExecutionRequested=" + NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get()
                 + ", ownershipViolations=" + NeoForgeConfig.SERVER.regionThreadingOwnershipViolationMode.get()
                 + ", defaultModSupport=" + RegionThreadingCompatibility.defaultSupport()
                 + ", unsupportedMods=" + RegionThreadingCompatibility.unsupportedMods().size()
                 + ", requiredMods=" + RegionThreadingCompatibility.requiredMods().size()
-                + ", configuredWorkerThreads=" + NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get()), false);
+                + ", configuredWorkerThreads=" + NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get()
+                + ", configuredRegionPolicy=" + NeoForgeConfig.SERVER.regionThreadingMode.get()), false);
     }
 }
