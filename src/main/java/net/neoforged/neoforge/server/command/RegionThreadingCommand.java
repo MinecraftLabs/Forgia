@@ -78,6 +78,9 @@ final class RegionThreadingCommand {
                 + ", regionTicks=" + diagnostics.totalRegionTickCount()
                 + ", maxRegionLastTickNs=" + diagnostics.maxRegionLastTickDurationNanos()
                 + ", cappedDrains=" + diagnostics.cappedDrainCount()
+                + ", pendingEntityTransfers=" + diagnostics.pendingEntityTransferCount()
+                + ", rememberedEntityTransferResults=" + diagnostics.rememberedEntityTransferResultCount()
+                + ", rejectedEntityTransferRecords=" + diagnostics.rejectedEntityTransferRecordCount()
                 + ", regionPolicy=" + diagnostics.regionPolicy()
                 + ", entityStorageMode=" + diagnostics.entityStorageMode()), false);
     }

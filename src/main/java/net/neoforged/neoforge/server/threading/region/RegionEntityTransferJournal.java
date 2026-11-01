@@ -18,7 +18,8 @@ import org.jetbrains.annotations.Nullable;
  * can be claimed exactly once, and a terminal result makes a replay idempotent without a second write.
  * <p>
  * The journal is bounded in both directions. Recording is refused once {@link #MAX_PENDING_TOKENS} pending
- * decisions exist, so a full journal never silently drops an accepted decision. Terminal results are kept
+ * decisions exist, so a full journal never silently drops an accepted decision: every refusal is counted and
+ * reported to the caller as a {@code null} token plus a rate-limited warning. Terminal results are kept
  * in a bounded insertion-order map so a replay of a recent token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED}
  * (or the recorded abort reason); the terminal map stores the result enum only, never the token or the
  * entity, so clearing the journal leaves no strong reference to any entity behind.
@@ -35,6 +36,7 @@ final class RegionEntityTransferJournal {
 
     private final Map<Long, Entry> pending = new LinkedHashMap<>();
     private final Map<Long, RegionEntityTransferResult> remembered = new LinkedHashMap<>();
+    private long rejectedRecordCount;
 
     private static final class Entry {
         private final RegionEntityTransferToken token;
@@ -68,18 +70,25 @@ final class RegionEntityTransferJournal {
             return true;
         }
         if (this.pending.size() >= MAX_PENDING_TOKENS) {
+            ++this.rejectedRecordCount;
             return false;
         }
         this.pending.put(token.tokenId(), new Entry(token));
         return true;
     }
 
+    /** {@return the number of recordings the pending bound rejected} */
+    synchronized long rejectedRecordCount() {
+        return this.rejectedRecordCount;
+    }
+
     /**
      * Claims the token for its one allowed commit.
      * <p>
-     * A previously committed token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED}; a
-     * previously aborted token answers its recorded abort reason; a token the journal never recorded (or
-     * whose entry was already cleared) answers {@link RegionEntityTransferResult#UNKNOWN_TOKEN}.
+     * A token whose commit already completed answers {@link RegionEntityTransferResult#ALREADY_COMMITTED};
+     * a token another commit is still applying answers {@link RegionEntityTransferResult#IN_PROGRESS} and
+     * keeps its pending entry; an aborted token answers its recorded abort reason; a token the journal never
+     * recorded (or whose entry was already cleared) answers {@link RegionEntityTransferResult#UNKNOWN_TOKEN}.
      */
     synchronized Claim claim(RegionEntityTransferToken token) {
         final Entry entry = this.pending.get(token.tokenId());
@@ -88,7 +97,7 @@ final class RegionEntityTransferJournal {
                 return new Claim(RegionEntityTransferResult.UNKNOWN_TOKEN);
             }
             if (entry.claimed) {
-                return new Claim(RegionEntityTransferResult.ALREADY_COMMITTED);
+                return new Claim(RegionEntityTransferResult.IN_PROGRESS);
             }
             entry.claimed = true;
             return new Claim(null);
@@ -113,6 +122,38 @@ final class RegionEntityTransferJournal {
     synchronized void aborted(RegionEntityTransferToken token, RegionEntityTransferResult result) {
         this.pending.remove(token.tokenId());
         this.remember(token.tokenId(), result);
+    }
+
+    /**
+     * Releases an uncommitted entry on behalf of its caller and remembers the cancellation.
+     * <p>
+     * A terminal token answers its recorded result, so aborting twice, or aborting after a commit failed,
+     * changes nothing. A claimed entry belongs to the commit that is applying it; removing it would let that
+     * commit finish unseen, so the journal leaves it alone and answers
+     * {@link RegionEntityTransferResult#IN_PROGRESS} instead.
+     *
+     * @return {@link RegionEntityTransferResult#CANCELLED} when this call released the entry, the recorded
+     *         terminal result when the token was already terminal, or
+     *         {@link RegionEntityTransferResult#UNKNOWN_TOKEN} when the journal never recorded the token
+     */
+    synchronized RegionEntityTransferResult abort(RegionEntityTransferToken token) {
+        final Entry entry = this.pending.get(token.tokenId());
+        if (entry != null) {
+            if (entry.token != token) {
+                return RegionEntityTransferResult.UNKNOWN_TOKEN;
+            }
+            if (entry.claimed) {
+                return RegionEntityTransferResult.IN_PROGRESS;
+            }
+            this.pending.remove(token.tokenId());
+            this.remember(token.tokenId(), RegionEntityTransferResult.CANCELLED);
+            return RegionEntityTransferResult.CANCELLED;
+        }
+        final RegionEntityTransferResult rememberedResult = this.remembered.get(token.tokenId());
+        if (rememberedResult == RegionEntityTransferResult.COMMITTED) {
+            return RegionEntityTransferResult.ALREADY_COMMITTED;
+        }
+        return rememberedResult != null ? rememberedResult : RegionEntityTransferResult.UNKNOWN_TOKEN;
     }
 
     /** Cancels the pending decisions that belong to {@code level}, without retaining their entities. */

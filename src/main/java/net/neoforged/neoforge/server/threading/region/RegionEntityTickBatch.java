@@ -6,6 +6,7 @@
 package net.neoforged.neoforge.server.threading.region;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -105,6 +106,23 @@ final class RegionEntityTickBatch extends RegionTickBatch {
             if (!this.deferredUpdates.contains(entity)) {
                 this.deferredUpdates.add(entity);
             }
+        }
+    }
+
+    /**
+     * Drops the deferred ownership changes of {@code entities} that are still waiting for the end of the
+     * batch.
+     * <p>
+     * A recorded transfer commits the authoritative region mapping of the entity while the batch is still
+     * running its server-thread post-processing. Publishing the older, deferred update afterwards would
+     * overwrite that committed destination with the region of the live position, so the committed decision
+     * wins and the pending entry is dropped. A later {@link #deferEntityUpdate(Entity)} remains unaffected.
+     */
+    void discardDeferredUpdates(Collection<Entity> entities) {
+        final Set<Entity> discarded = Collections.newSetFromMap(new IdentityHashMap<>());
+        discarded.addAll(entities);
+        synchronized (this.deferredUpdates) {
+            this.deferredUpdates.removeIf(discarded::contains);
         }
     }
 

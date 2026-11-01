@@ -472,6 +472,9 @@ public final class RegionThreadingHooks {
      * token at a barrier with {@link #commitEntityRegionTransfer(RegionEntityTransferToken)}. The token
      * records the identity epoch and both regions at decision time; the commit never re-reads the live
      * position.
+     * <p>
+     * The bookmark never interrupts the vanilla path: a destination in another level, an untracked entity, a
+     * full journal or a native region worker all answer {@code null} instead of throwing.
      *
      * @return the recorded token, or {@code null} when region threading is not installed or no transfer
      *         can be recorded; in that case the caller keeps the vanilla path
@@ -496,6 +499,22 @@ public final class RegionThreadingHooks {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine) {
             return engine.commitEntityRegionTransfer(token);
+        }
+        return RegionEntityTransferResult.DISABLED;
+    }
+
+    /**
+     * Aborts a recorded cross-region entity transfer that will never be committed.
+     * <p>
+     * A caller that gave up on the vanilla side of a transfer releases its pending decision here instead of
+     * leaving it in the journal until the pending bound is exhausted. The abort never mutates a region
+     * mapping and is idempotent: a terminal token answers its recorded result. With region threading not
+     * installed this answers {@link RegionEntityTransferResult#DISABLED}.
+     */
+    public static RegionEntityTransferResult abortEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.abortEntityRegionTransfer(token);
         }
         return RegionEntityTransferResult.DISABLED;
     }

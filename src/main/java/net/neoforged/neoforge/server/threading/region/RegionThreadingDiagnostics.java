@@ -7,6 +7,11 @@ package net.neoforged.neoforge.server.threading.region;
 
 /**
  * Snapshot of the internal region threading runtime state.
+ * <p>
+ * The transfer counters report the recorded cross-region entity transfer transaction: the decisions that
+ * still wait for a commit, the terminal results kept for idempotent replays, and the recordings the journal
+ * bound refused. A refused recording leaves the caller on the vanilla path, so a growing rejection count is
+ * the only observable sign that the pending bound of the journal is exhausted.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -53,4 +58,7 @@ public record RegionThreadingDiagnostics(
         RegionPolicy regionPolicy,
         RegionEntityStorageMode entityStorageMode,
         boolean scheduledTickWorkerDispatchEffective,
-        boolean randomTickWorkerDispatchEffective) {}
+        boolean randomTickWorkerDispatchEffective,
+        int pendingEntityTransferCount,
+        int rememberedEntityTransferResultCount,
+        long rejectedEntityTransferRecordCount) {}

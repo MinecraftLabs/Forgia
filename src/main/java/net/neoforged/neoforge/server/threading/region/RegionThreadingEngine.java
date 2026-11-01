@@ -2206,12 +2206,14 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Recording is a server-owned storage read: it is rejected for a native region worker before it reads
      * the identity ledger. It answers {@code null} when no transfer can be recorded - no native engine
      * ledger, an untracked or removed entity, a graph member without a current identity, the same source
-     * and destination region, or a full journal - and the caller then keeps the vanilla path.
+     * and destination region, a destination in another level, or a full journal - and the caller then keeps
+     * the vanilla path. The vanilla cross-level transfer is therefore never interrupted by an exception from
+     * this bookmark; a destination recorded in another level is simply not part of the region transaction.
      */
     @ApiStatus.Internal
     @Nullable
     public RegionEntityTransferToken recordEntityRegionTransfer(Entity entity, RegionCoordinate destinationRegion) {
-        RegionThreadingHooks.assertServerEntityStorageAccess("RegionEntityTransferJournal.record");
+        RegionThreadingHooks.assertServerEntityStorageAccess("RegionThreadingEngine.recordEntityRegionTransfer");
         Objects.requireNonNull(destinationRegion, "destinationRegion");
         if (this.shutdown || entity.isRemoved()) {
             return null;
@@ -2220,7 +2222,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return null;
         }
         if (destinationRegion.level() != level) {
-            throw new IllegalArgumentException("Cross-level entity transfer is not supported: " + destinationRegion.level() + " != " + level);
+            return null;
         }
         final RegionState source = this.regionizer.regionFor(entity);
         if (source == null || source.isDead() || source.coordinate().equals(destinationRegion)) {
@@ -2250,7 +2252,28 @@ public final class RegionThreadingEngine implements RegionThreading {
                 source.coordinate(),
                 destinationRegion,
                 ridingGraph);
-        return this.entityTransferJournal.record(token) ? token : null;
+        if (this.entityTransferJournal.record(token)) {
+            return token;
+        }
+        final long rejected = this.entityTransferJournal.rejectedRecordCount();
+        if (Long.bitCount(rejected) == 1) {
+            // Rate-limited by the rejection count itself: a full journal must be observable without
+            // flooding the log once per refused transfer.
+            LOGGER.warn("Entity transfer journal is full ({} pending decisions), recording token {} for {} was refused; {} recordings were refused so far",
+                    RegionEntityTransferJournal.MAX_PENDING_TOKENS, token.tokenId(), uuid, rejected);
+        }
+        return null;
+    }
+
+    /**
+     * {@return the maximum number of recorded transfers that wait for a commit}
+     * <p>
+     * Recording a transfer beyond this bound is refused and counted, so the bound is shared with the
+     * mechanics tests instead of being duplicated there.
+     */
+    @ApiStatus.Internal
+    public static int maxPendingEntityTransfers() {
+        return RegionEntityTransferJournal.MAX_PENDING_TOKENS;
     }
 
     /**
@@ -2259,28 +2282,23 @@ public final class RegionThreadingEngine implements RegionThreading {
      * A native region worker is rejected with the named operation before the journal or the regionizer is
      * touched. The recorded values are validated in order and a mismatch aborts without a mutation. A
      * replay of a committed token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED} and writes
-     * nothing a second time.
+     * nothing a second time; a token another commit is still applying answers
+     * {@link RegionEntityTransferResult#IN_PROGRESS} and keeps its pending entry.
+     * <p>
+     * A commit never writes while the recorded source or destination region is ticking or submitted to a
+     * worker; that answers {@link RegionEntityTransferResult#REGION_BUSY}. A written mapping is never
+     * reported as a failure: post-commit bookkeeping failures are logged and the token stays
+     * {@link RegionEntityTransferResult#COMMITTED}.
      */
     @ApiStatus.Internal
     public RegionEntityTransferResult commitEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
-        RegionThreadingHooks.assertServerEntityStorageAccess("RegionEntityTransferJournal.commit");
+        RegionThreadingHooks.assertServerEntityStorageAccess("RegionThreadingEngine.commitEntityRegionTransfer");
         if (token == null) {
             return RegionEntityTransferResult.UNKNOWN_TOKEN;
         }
         final RegionEntityTransferJournal.Claim claim = this.entityTransferJournal.claim(token);
         if (!claim.claimed()) {
-            final RegionEntityTransferResult terminal = claim.terminal();
-            if (terminal == RegionEntityTransferResult.UNKNOWN_TOKEN) {
-                // The journal clears pending entries when a level closes or the engine shuts down. Keep
-                // reporting the lifecycle reason instead of collapsing it into an unknown token.
-                if (this.shutdown) {
-                    return RegionEntityTransferResult.ENGINE_SHUT_DOWN;
-                }
-                if (this.regionizer.isLevelClosed(token.level())) {
-                    return RegionEntityTransferResult.LEVEL_CLOSED;
-                }
-            }
-            return terminal != null ? terminal : RegionEntityTransferResult.UNKNOWN_TOKEN;
+            return this.lifecycleTransferResult(token, claim.terminal());
         }
         final RegionEntityTransferResult result;
         try {
@@ -2296,6 +2314,41 @@ public final class RegionThreadingEngine implements RegionThreading {
             this.entityTransferJournal.aborted(token, result);
         }
         return result;
+    }
+
+    /**
+     * Releases a recorded transfer decision that will never be committed.
+     * <p>
+     * The pending entry is released without touching any index, so a caller that gave up on the vanilla
+     * side of a transfer does not leave a decision behind that would keep rejecting recordings once the
+     * journal bound is reached. A replay of an already terminal token answers its recorded result, so an
+     * abort is idempotent.
+     */
+    @ApiStatus.Internal
+    public RegionEntityTransferResult abortEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
+        RegionThreadingHooks.assertServerEntityStorageAccess("RegionThreadingEngine.abortEntityRegionTransfer");
+        if (token == null) {
+            return RegionEntityTransferResult.UNKNOWN_TOKEN;
+        }
+        return this.lifecycleTransferResult(token, this.entityTransferJournal.abort(token));
+    }
+
+    /**
+     * {@return the terminal result to report for a journal answer that lost its entry to a lifecycle step}
+     * <p>
+     * The journal clears pending entries when a level closes or the engine shuts down, so an entry that is
+     * gone has to report that lifecycle reason instead of collapsing it into an unknown token.
+     */
+    private RegionEntityTransferResult lifecycleTransferResult(RegionEntityTransferToken token, @Nullable RegionEntityTransferResult terminal) {
+        if (terminal == RegionEntityTransferResult.UNKNOWN_TOKEN) {
+            if (this.shutdown) {
+                return RegionEntityTransferResult.ENGINE_SHUT_DOWN;
+            }
+            if (this.regionizer.isLevelClosed(token.level())) {
+                return RegionEntityTransferResult.LEVEL_CLOSED;
+            }
+        }
+        return terminal != null ? terminal : RegionEntityTransferResult.UNKNOWN_TOKEN;
     }
 
     /** {@return the number of recorded transfers that still wait for a commit} */
@@ -2321,9 +2374,18 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (this.regionizer.isLevelClosed(level)) {
             return RegionEntityTransferResult.LEVEL_CLOSED;
         }
+        if (token.destinationRegion().level() != level) {
+            // Recording never accepts a destination in another level, so such a token cannot name a region
+            // of this level's index: it is as unresolved as a retired destination.
+            return RegionEntityTransferResult.DESTINATION_INACTIVE;
+        }
         final RegionEntityTransferEpochSource epochs = RegionEntityTransferEpochSource.of(level.entityIdentityLedger());
         if (epochs.epoch(token.uuid()) != token.identityEpoch()) {
             return RegionEntityTransferResult.STALE_IDENTITY_EPOCH;
+        }
+        final RegionState source = this.regionizer.get(token.sourceRegion());
+        if (source == null || source.isDead()) {
+            return RegionEntityTransferResult.SOURCE_MAPPING_CHANGED;
         }
         final RegionState destination = this.regionizer.get(token.destinationRegion());
         if (destination == null || destination.isDead()) {
@@ -2337,20 +2399,68 @@ public final class RegionThreadingEngine implements RegionThreading {
         for (final RegionEntityTransferToken.Member member : token.ridingGraph()) {
             entities.add(member.entity());
         }
-        if (this.regionizer.commitTransfer(token.sourceRegion(), token.destinationRegion(), entities, level) == null) {
-            return RegionEntityTransferResult.SOURCE_MAPPING_CHANGED;
+        final RegionEntityTransferResult outcome = transferResult(this.regionizer.commitTransfer(token.sourceRegion(), token.destinationRegion(), entities, level));
+        if (outcome != RegionEntityTransferResult.COMMITTED) {
+            return outcome;
         }
-        for (final Entity entity : entities) {
-            this.notifyEntityMoved(entity);
+        // The recorded mapping is written. Nothing below may downgrade the terminal answer: the deferred
+        // handoff and the scheduled-task notifications are bookkeeping of an already committed transfer.
+        try {
+            this.discardPendingDeferredEntityUpdates(level, entities);
+        } catch (Throwable throwable) {
+            LOGGER.warn("Entity transfer token {} could not discard the deferred region updates of its entities", token.tokenId(), throwable);
+        }
+        for (final Entity moved : entities) {
+            try {
+                this.notifyEntityMoved(moved);
+            } catch (Throwable throwable) {
+                LOGGER.warn("Entity transfer token {} could not notify the scheduled tasks of a moved entity", token.tokenId(), throwable);
+            }
         }
         return RegionEntityTransferResult.COMMITTED;
     }
 
     /**
+     * Maps the outcome of the regionizer write to the transfer result.
+     * <p>
+     * The regionizer resolves the outcome under its write lock, so every reason a recorded transfer was not
+     * applied keeps its own name here instead of collapsing into a missing mapping.
+     */
+    private static RegionEntityTransferResult transferResult(ThreadedRegionizer.TransferOutcome outcome) {
+        return switch (outcome) {
+            case COMMITTED -> RegionEntityTransferResult.COMMITTED;
+            case SOURCE_MAPPING_CHANGED -> RegionEntityTransferResult.SOURCE_MAPPING_CHANGED;
+            case DESTINATION_INACTIVE -> RegionEntityTransferResult.DESTINATION_INACTIVE;
+            case REGION_BUSY -> RegionEntityTransferResult.REGION_BUSY;
+            case LEVEL_CLOSED -> RegionEntityTransferResult.LEVEL_CLOSED;
+        };
+    }
+
+    /**
+     * Drops the deferred ownership handoffs of {@code entities} that are still pending in an entity batch of
+     * {@code level}.
+     * <p>
+     * A commit runs on the server thread while the entity tick batch is finishing its server-thread work, so
+     * publishing an older deferred update afterwards would move the entity away from the region that was
+     * just committed. The committed decision wins.
+     */
+    private void discardPendingDeferredEntityUpdates(ServerLevel level, List<Entity> entities) {
+        for (final RegionTickBatch batch : this.activeTickBatches) {
+            if (batch.level() == level && batch instanceof RegionEntityTickBatch entityBatch) {
+                entityBatch.discardDeferredUpdates(entities);
+            }
+        }
+    }
+
+    /**
      * Validates that the recorded riding graph is unchanged and still belongs to the recorded source.
      * <p>
-     * An added or removed member, a member in another region or level, or a member whose identity epoch
-     * advanced rejects the whole token. A graph is never transferred partially.
+     * An added or removed member, or a member in another level, rejects the whole token as
+     * {@link RegionEntityTransferResult#RIDING_GRAPH_SPLIT}. A member whose region moved away from the
+     * recorded source keeps the graph intact but makes this a different transfer, so it is reported as
+     * {@link RegionEntityTransferResult#SOURCE_MAPPING_CHANGED} - that covers a normal merge of the source
+     * region and a second token for an entity an earlier commit already moved. A graph is never transferred
+     * partially.
      */
     @Nullable
     private RegionEntityTransferResult validateRidingGraph(RegionEntityTransferToken token, RegionEntityTransferEpochSource epochs) {
@@ -2375,7 +2485,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             final RegionState region = this.regionizer.regionFor(entity);
             if (region == null || !region.coordinate().equals(token.sourceRegion())) {
-                return RegionEntityTransferResult.RIDING_GRAPH_SPLIT;
+                return RegionEntityTransferResult.SOURCE_MAPPING_CHANGED;
             }
             if (!member.uuid().equals(entity.getUUID()) || epochs.epoch(member.uuid()) != member.identityEpoch()) {
                 return RegionEntityTransferResult.STALE_IDENTITY_EPOCH;
@@ -2520,7 +2630,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.layout.policy(),
                 this.entityStorageMode,
                 this.isScheduledTickWorkerDispatchEffective(),
-                this.isRandomTickWorkerDispatchEffective());
+                this.isRandomTickWorkerDispatchEffective(),
+                this.entityTransferJournal.pendingCount(),
+                this.entityTransferJournal.rememberedCount(),
+                this.entityTransferJournal.rejectedRecordCount());
     }
 
     /**

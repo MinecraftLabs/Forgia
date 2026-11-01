@@ -21,6 +21,8 @@ import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -28,6 +30,7 @@ import org.jetbrains.annotations.Nullable;
  */
 final class ThreadedRegionizer {
     private static final int REGION_SECTION_MERGE_RADIUS = 1;
+    private static final Logger LOGGER = LogManager.getLogger();
 
     private final RegionLayout layout;
     private final Map<RegionCoordinate, RegionState> regions = new ConcurrentHashMap<>();
@@ -305,41 +308,55 @@ final class ThreadedRegionizer {
      * <p>
      * The recorded source mapping is validated before anything is written: every entity must still map to
      * {@code sourceCoordinate} and its recorded level must still be {@code level}. A mismatch returns
-     * {@code null} and leaves every mapping untouched, so the caller reports a failed commit instead of
-     * repairing the recorded intent.
+     * {@link TransferOutcome#SOURCE_MAPPING_CHANGED} and leaves every mapping untouched, so the caller
+     * reports a failed commit instead of repairing the recorded intent.
+     * <p>
+     * The destination region is resolved with a plain lookup under the write lock, so a retired destination
+     * is never recreated by a commit that was recorded against the previous region state. A region that is
+     * ticking or submitted to a worker is never written to; that answers {@link TransferOutcome#REGION_BUSY}
+     * exactly like {@link #mergeRegions(RegionState, RegionState)} defers a merge under an active lease.
      * <p>
      * The destination mapping is written before the source region is retired, so the only intermediate
      * state is a duplicate entry while the write lock is held; a reader can never observe a missing one.
-     * No callback, event, chunk access or user code runs inside the lock scope.
+     * The retirement and merge recalculation that follow the write do run regionizer code under the lock: a
+     * pending split or merge may read {@code entity.level()} and {@code entity.blockPosition()} and may
+     * re-point the transferred entities to a merged region. That maintenance is best effort - the mapping is
+     * already committed, so a failure is logged and the commit still reports
+     * {@link TransferOutcome#COMMITTED} instead of a failed transfer.
      *
-     * @return the destination region, or {@code null} when the recorded source mapping is no longer current
-     *         or the level identity was closed
+     * @return the outcome of the write, resolved under the write lock
      */
-    @Nullable
-    RegionState commitTransfer(RegionCoordinate sourceCoordinate, RegionCoordinate destinationCoordinate, List<Entity> entities, ServerLevel level) {
+    TransferOutcome commitTransfer(RegionCoordinate sourceCoordinate, RegionCoordinate destinationCoordinate, List<Entity> entities, ServerLevel level) {
         if (entities.isEmpty()) {
-            return null;
+            return TransferOutcome.SOURCE_MAPPING_CHANGED;
         }
         final long stamp = this.acquireWriteLock();
         try {
             if (this.closed || this.isLevelClosedLocked(level)) {
-                return null;
+                return TransferOutcome.LEVEL_CLOSED;
             }
             if (sourceCoordinate.level() != level || destinationCoordinate.level() != level) {
-                return null;
+                return TransferOutcome.SOURCE_MAPPING_CHANGED;
             }
             for (final Entity entity : entities) {
                 final RegionState current = this.entities.get(entity);
                 if (current == null || !current.coordinate().equals(sourceCoordinate)) {
-                    return null;
+                    return TransferOutcome.SOURCE_MAPPING_CHANGED;
                 }
                 if (this.entityLevels.get(entity) != level) {
-                    return null;
+                    return TransferOutcome.SOURCE_MAPPING_CHANGED;
                 }
             }
-            final RegionState destination = this.getOrCreateLocked(destinationCoordinate);
-            if (destination.isDead()) {
-                return null;
+            final RegionState source = this.getLocked(sourceCoordinate);
+            if (source == null || source.isDead()) {
+                return TransferOutcome.SOURCE_MAPPING_CHANGED;
+            }
+            final RegionState destination = this.getLocked(destinationCoordinate);
+            if (destination == null || destination.isDead()) {
+                return TransferOutcome.DESTINATION_INACTIVE;
+            }
+            if (source.isRunning() || source.isWorkerSubmitted() || destination.isRunning() || destination.isWorkerSubmitted()) {
+                return TransferOutcome.REGION_BUSY;
             }
             boolean changed = false;
             for (final Entity entity : entities) {
@@ -349,18 +366,44 @@ final class ThreadedRegionizer {
                     changed = true;
                 }
             }
-            if (changed) {
-                this.structuralChangeCount.incrementAndGet();
-                this.requestMergeCheckIfNeeded(sectionCoordinate(destinationCoordinate), destination);
+            // The mapping is committed from here on. Everything below is recalculation for the regions the
+            // write emptied or filled; it must not turn the written transfer into a failed one.
+            try {
+                if (changed) {
+                    this.structuralChangeCount.incrementAndGet();
+                    this.requestMergeCheckIfNeeded(sectionCoordinate(destinationCoordinate), destination);
+                }
+                final RegionState retiringSource = this.regions.get(sourceCoordinate);
+                if (retiringSource != null && retiringSource != destination) {
+                    this.removeIfEmptyLocked(retiringSource);
+                }
+            } catch (RuntimeException | Error maintenanceFailure) {
+                LOGGER.warn("Region maintenance after a recorded entity transfer from {} to {} failed; the recorded mapping is committed",
+                        sourceCoordinate, destinationCoordinate, maintenanceFailure);
             }
-            final RegionState source = this.regions.get(sourceCoordinate);
-            if (source != null && source != destination) {
-                this.removeIfEmptyLocked(source);
-            }
-            return destination;
+            return TransferOutcome.COMMITTED;
         } finally {
             this.releaseWriteLock(stamp);
         }
+    }
+
+    /**
+     * Outcome of {@link #commitTransfer(RegionCoordinate, RegionCoordinate, List, ServerLevel)}.
+     * <p>
+     * The values are resolved under the regionizer write lock, so the engine reports the exact reason a
+     * recorded transfer was not applied instead of collapsing every rejection into a missing mapping.
+     */
+    enum TransferOutcome {
+        /** The recorded mapping was written to the recorded destination. */
+        COMMITTED,
+        /** A member no longer maps to the recorded source, or the token names another level. */
+        SOURCE_MAPPING_CHANGED,
+        /** The recorded destination is absent or retired. */
+        DESTINATION_INACTIVE,
+        /** The source or destination region is ticked or submitted to a region worker. */
+        REGION_BUSY,
+        /** The level identity or the whole regionizer was closed. */
+        LEVEL_CLOSED
     }
 
     /**
