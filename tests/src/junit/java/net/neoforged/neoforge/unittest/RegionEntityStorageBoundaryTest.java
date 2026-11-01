@@ -30,10 +30,12 @@ import java.io.StringWriter;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -67,12 +69,14 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.entity.ChunkEntities;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.entity.EntityPersistentStorage;
 import net.minecraft.world.level.entity.EntityTypeTest;
 import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
+import net.minecraft.world.level.entity.Visibility;
 import net.minecraft.world.level.saveddata.maps.MapDecoration;
 import net.minecraft.world.level.saveddata.maps.MapDecorationTypes;
 import net.minecraft.world.level.saveddata.maps.MapFrame;
@@ -502,6 +506,83 @@ class RegionEntityStorageBoundaryTest {
     }
 
     @Test
+    void serverObtainedGetAllIterableRejectsNativeWorkerIterationBeforeEntityRead() {
+        this.installEngine();
+        final EntityPersistentStorage<Entity> storage = mock(EntityPersistentStorage.class);
+        when(storage.loadEntities(any(ChunkPos.class))).thenAnswer(invocation -> CompletableFuture.completedFuture(
+                new ChunkEntities<>((ChunkPos) invocation.getArgument(0), List.of())));
+        final PersistentEntitySectionManager<Entity> manager = newGuardedManager(storage);
+        final TestEntity entity = new TestEntity(mockServerLevel());
+        entity.setPos(1.0, 64.0, 1.0);
+        manager.updateChunkStatus(new ChunkPos(0, 0), Visibility.TICKING);
+        assertTrue(manager.addNewEntityWithoutEvent(entity), "the server thread must be able to register the entity");
+
+        // A live view captured on the server thread is exactly what a mod can hand to a worker.
+        final LevelEntityGetter<Entity> getter = manager.getEntityGetter();
+        final Iterable<Entity> view = getter.getAll();
+        final List<Entity> serverView = new ArrayList<>();
+        view.forEach(serverView::add);
+        assertEquals(List.of(entity), serverView, "the server thread must iterate the live view inline");
+
+        // Only iterator() runs on the worker: the rejection has to happen there, before the live storage
+        // iterator is obtained and before any entity is read.
+        final IllegalStateException rejected = assertThrows(IllegalStateException.class,
+                () -> this.runOnNativeWorker(view::iterator));
+        assertTrue(rejected.getMessage().contains("PersistentEntitySectionManager.getEntityGetter().getAll"),
+                "the rejection must name the getter operation, got: " + rejected.getMessage());
+
+        // The rejected worker iteration must not disturb the server-owned storage or the live view.
+        // A mod can also capture the iterator itself on the server thread and advance it on a worker later,
+        // so the rejection must be repeated for every element operation, not only when the view is obtained.
+        final Iterator<Entity> serverIterator = view.iterator();
+        assertTrue(serverIterator.hasNext(), "the server thread must run the wrapper iterator inline");
+        assertThrows(IllegalStateException.class, () -> this.runOnNativeWorker(serverIterator::hasNext),
+                "a worker must not advance a server-obtained iterator");
+        assertThrows(IllegalStateException.class, () -> this.runOnNativeWorker(serverIterator::next),
+                "a worker must not read an entity through a server-obtained iterator");
+        assertEquals(entity, serverIterator.next(), "a rejected advance must not consume the delegate iterator");
+        assertFalse(serverIterator.hasNext(), "the delegate iterator must be exhausted exactly like vanilla");
+
+        // The wrapper must stay a live view, not a snapshot: an entity admitted after the view was captured
+        // has to be visible through the same iterable.
+        final TestEntity later = new TestEntity(mockServerLevel());
+        later.setPos(2.0, 64.0, 2.0);
+        assertTrue(manager.addNewEntityWithoutEvent(later), "the server thread must admit a later entity");
+        serverView.clear();
+        view.forEach(serverView::add);
+        assertEquals(2, serverView.size(), "the server thread must keep iterating the same live view");
+        assertTrue(serverView.containsAll(List.of(entity, later)), "the live view must expose the later entity");
+        assertTrue(manager.isLoaded(entity.getUUID()));
+        assertTrue(manager.isLoaded(later.getUUID()));
+        assertEquals(2, manager.count());
+    }
+
+    @Test
+    void genericManagerKeepsTheVanillaLiveIterableWithoutAnyGuard() {
+        this.installEngine();
+        final EntityPersistentStorage<Entity> storage = mock(EntityPersistentStorage.class);
+        when(storage.loadEntities(any(ChunkPos.class))).thenAnswer(invocation -> CompletableFuture.completedFuture(
+                new ChunkEntities<>((ChunkPos) invocation.getArgument(0), List.of())));
+        // The 3-argument constructor keeps the no-op check, so a generic manager must not gain a guard.
+        final PersistentEntitySectionManager<Entity> manager = new PersistentEntitySectionManager<>(Entity.class,
+                (LevelCallback) mock(LevelCallback.class), storage);
+        final TestEntity entity = new TestEntity(mockServerLevel());
+        entity.setPos(1.0, 64.0, 1.0);
+        manager.updateChunkStatus(new ChunkPos(0, 0), Visibility.TICKING);
+        assertTrue(manager.addNewEntityWithoutEvent(entity));
+
+        final Iterable<Entity> view = manager.getEntityGetter().getAll();
+        final AtomicReference<List<Entity>> workerView = new AtomicReference<>();
+        this.runOnNativeWorker(() -> {
+            final List<Entity> seen = new ArrayList<>();
+            view.forEach(seen::add);
+            workerView.set(seen);
+        });
+        assertEquals(List.of(entity), workerView.get(),
+                "a no-op manager must keep the vanilla live iterable for any thread");
+    }
+
+    @Test
     void publicServerLevelStatusAccessRejectsNativeWorker() {
         this.installEngine();
         final ServerLevel level = mockServerLevel();
@@ -765,10 +846,15 @@ class RegionEntityStorageBoundaryTest {
 
     @SuppressWarnings({ "unchecked", "rawtypes" })
     private static PersistentEntitySectionManager<Entity> newGuardedManager() {
+        return newGuardedManager(mock(EntityPersistentStorage.class));
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private static PersistentEntitySectionManager<Entity> newGuardedManager(EntityPersistentStorage<Entity> storage) {
         return new PersistentEntitySectionManager<>(
                 Entity.class,
                 (LevelCallback) mock(LevelCallback.class),
-                (EntityPersistentStorage) mock(EntityPersistentStorage.class),
+                storage,
                 RegionThreadingHooks::assertServerEntityStorageAccess);
     }
 

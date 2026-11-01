@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.Iterator;
 import java.util.UUID;
 import java.util.function.Consumer;
 import net.minecraft.util.AbortableIterationConsumer;
@@ -27,6 +28,16 @@ import org.jetbrains.annotations.Nullable;
  * <p>
  * The check is supplied by the owning {@link PersistentEntitySectionManager}; the generic manager
  * constructor keeps a no-op check, so tests and other users see the vanilla getter unchanged.
+ * <p>
+ * {@link #getAll()} returns a live view in vanilla, so the returned iterable runs the check in
+ * {@link Iterable#iterator()} and in every iterator operation. A view captured on the server thread
+ * therefore rejects a native worker before it obtains or advances the live storage iterator, while the
+ * generic no-op manager keeps the vanilla live iteration semantics.
+ * <p>
+ * The wrapper is {@link Iterable}-only: it stays live (it does not buffer or snapshot) but it is not a
+ * {@link java.util.Collection}, and the returned iterator does not support {@link Iterator#remove()}.
+ * Rejection happens before the delegate iterator is obtained or advanced, so a rejected call does not
+ * consume an element.
  */
 @ApiStatus.Internal
 public final class EntityStorageGuardedGetter<T extends EntityAccess> implements LevelEntityGetter<T> {
@@ -55,7 +66,24 @@ public final class EntityStorageGuardedGetter<T extends EntityAccess> implements
     @Override
     public Iterable<T> getAll() {
         this.accessCheck.checkAccess("PersistentEntitySectionManager.getEntityGetter().getAll");
-        return this.delegate.getAll();
+        final Iterable<T> iterable = this.delegate.getAll();
+        return () -> {
+            this.accessCheck.checkAccess("PersistentEntitySectionManager.getEntityGetter().getAll.iterator");
+            final Iterator<T> delegateIterator = iterable.iterator();
+            return new Iterator<>() {
+                @Override
+                public boolean hasNext() {
+                    EntityStorageGuardedGetter.this.accessCheck.checkAccess("PersistentEntitySectionManager.getEntityGetter().getAll.iterator.hasNext");
+                    return delegateIterator.hasNext();
+                }
+
+                @Override
+                public T next() {
+                    EntityStorageGuardedGetter.this.accessCheck.checkAccess("PersistentEntitySectionManager.getEntityGetter().getAll.iterator.next");
+                    return delegateIterator.next();
+                }
+            };
+        };
     }
 
     @Override
