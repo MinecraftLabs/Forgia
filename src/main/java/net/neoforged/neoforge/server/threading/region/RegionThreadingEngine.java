@@ -6,10 +6,15 @@
 package net.neoforged.neoforge.server.threading.region;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,6 +38,7 @@ import net.neoforged.neoforge.server.threading.GlobalRegionScheduler;
 import net.neoforged.neoforge.server.threading.RegionScheduler;
 import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingContext;
+import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.ApiStatus;
@@ -131,6 +137,12 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final ThreadLocal<RandomSource> currentRandomTickRandom = new ThreadLocal<>();
     private final Set<RegionTickBatch> activeTickBatches = ConcurrentHashMap.newKeySet();
+    /**
+     * Pending and terminal decisions of the recorded cross-region entity transfer transaction. The
+     * journal, not the live entity state, decides whether a commit may run.
+     */
+    private final RegionEntityTransferJournal entityTransferJournal = new RegionEntityTransferJournal();
+    private final AtomicLong nextEntityTransferTokenId = new AtomicLong();
     /**
      * Serializes region drain activation with lifecycle cleanup. A drain holds the read lock only while
      * it checks the lifecycle state and marks the lease or worker submission; shutdown and level clear
@@ -2073,6 +2085,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // passed its shutdown check either publishes before this block (and is cleared below) or
                 // observes the closed level identity and rejects its work.
                 synchronized (this.admissionLock) {
+                    // A pending decision that touches the closing level becomes terminal here. A later
+                    // commit therefore cannot write a region mapping after the clear below.
+                    this.entityTransferJournal.clearPendingFor(level);
                     this.regionizer.clearLevel(level);
                     for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
                         if (task.isOwnedBy(level)) {
@@ -2176,6 +2191,247 @@ public final class RegionThreadingEngine implements RegionThreading {
             this.cancelEntityTasks(entity);
             return;
         }
+        this.notifyEntityMoved(entity);
+    }
+
+    /**
+     * Records a cross-region entity transfer decision without mutating any index.
+     * <p>
+     * The token records the entity, its current published identity epoch, the current source region and
+     * the supplied destination region. The caller owns the vanilla entity, world and network side effects;
+     * it records the intent first and commits the token on the server thread afterwards. A commit never
+     * reads the live position again, so the destination stays the one recorded here even when the entity
+     * moves in between.
+     * <p>
+     * Recording is a server-owned storage read: it is rejected for a native region worker before it reads
+     * the identity ledger. It answers {@code null} when no transfer can be recorded - no native engine
+     * ledger, an untracked or removed entity, a graph member without a current identity, the same source
+     * and destination region, or a full journal - and the caller then keeps the vanilla path.
+     */
+    @ApiStatus.Internal
+    @Nullable
+    public RegionEntityTransferToken recordEntityRegionTransfer(Entity entity, RegionCoordinate destinationRegion) {
+        RegionThreadingHooks.assertServerEntityStorageAccess("RegionEntityTransferJournal.record");
+        Objects.requireNonNull(destinationRegion, "destinationRegion");
+        if (this.shutdown || entity.isRemoved()) {
+            return null;
+        }
+        if (!(entity.level() instanceof ServerLevel level)) {
+            return null;
+        }
+        if (destinationRegion.level() != level) {
+            throw new IllegalArgumentException("Cross-level entity transfer is not supported: " + destinationRegion.level() + " != " + level);
+        }
+        final RegionState source = this.regionizer.regionFor(entity);
+        if (source == null || source.isDead() || source.coordinate().equals(destinationRegion)) {
+            return null;
+        }
+        final UUID uuid = entity.getUUID();
+        if (uuid == null) {
+            return null;
+        }
+        final RegionEntityTransferEpochSource rootEpochs = RegionEntityTransferEpochSource.of(level.entityIdentityLedger());
+        final long identityEpoch = rootEpochs.epoch(uuid);
+        if (identityEpoch == RegionEntityTransferEpochSource.MISSING_EPOCH) {
+            return null;
+        }
+        final Map<ServerLevel, RegionEntityTransferEpochSource> epochsByLevel = new IdentityHashMap<>();
+        epochsByLevel.put(level, rootEpochs);
+        final List<RegionEntityTransferToken.Member> ridingGraph = new ArrayList<>();
+        if (!this.collectRidingGraphMembers(topmostRidingEntity(entity), epochsByLevel, ridingGraph)) {
+            return null;
+        }
+        final RegionEntityTransferToken token = new RegionEntityTransferToken(
+                this.nextEntityTransferTokenId.incrementAndGet(),
+                RegionEntityTransferToken.Operation.REGION_MOVE,
+                entity,
+                uuid,
+                identityEpoch,
+                source.coordinate(),
+                destinationRegion,
+                ridingGraph);
+        return this.entityTransferJournal.record(token) ? token : null;
+    }
+
+    /**
+     * Commits one recorded transfer on the server thread.
+     * <p>
+     * A native region worker is rejected with the named operation before the journal or the regionizer is
+     * touched. The recorded values are validated in order and a mismatch aborts without a mutation. A
+     * replay of a committed token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED} and writes
+     * nothing a second time.
+     */
+    @ApiStatus.Internal
+    public RegionEntityTransferResult commitEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
+        RegionThreadingHooks.assertServerEntityStorageAccess("RegionEntityTransferJournal.commit");
+        if (token == null) {
+            return RegionEntityTransferResult.UNKNOWN_TOKEN;
+        }
+        final RegionEntityTransferJournal.Claim claim = this.entityTransferJournal.claim(token);
+        if (!claim.claimed()) {
+            final RegionEntityTransferResult terminal = claim.terminal();
+            if (terminal == RegionEntityTransferResult.UNKNOWN_TOKEN) {
+                // The journal clears pending entries when a level closes or the engine shuts down. Keep
+                // reporting the lifecycle reason instead of collapsing it into an unknown token.
+                if (this.shutdown) {
+                    return RegionEntityTransferResult.ENGINE_SHUT_DOWN;
+                }
+                if (this.regionizer.isLevelClosed(token.level())) {
+                    return RegionEntityTransferResult.LEVEL_CLOSED;
+                }
+            }
+            return terminal != null ? terminal : RegionEntityTransferResult.UNKNOWN_TOKEN;
+        }
+        final RegionEntityTransferResult result;
+        try {
+            result = this.applyRecordedEntityTransfer(token);
+        } catch (Throwable throwable) {
+            this.entityTransferJournal.aborted(token, RegionEntityTransferResult.COMMIT_FAILED);
+            LOGGER.warn("Entity transfer token {} failed before its region mapping was written", token.tokenId(), throwable);
+            return RegionEntityTransferResult.COMMIT_FAILED;
+        }
+        if (result == RegionEntityTransferResult.COMMITTED) {
+            this.entityTransferJournal.completed(token);
+        } else {
+            this.entityTransferJournal.aborted(token, result);
+        }
+        return result;
+    }
+
+    /** {@return the number of recorded transfers that still wait for a commit} */
+    @ApiStatus.Internal
+    public int pendingEntityTransferCount() {
+        return this.entityTransferJournal.pendingCount();
+    }
+
+    /** {@return the number of terminal transfer results kept for idempotent replays} */
+    @ApiStatus.Internal
+    public int rememberedEntityTransferResultCount() {
+        return this.entityTransferJournal.rememberedCount();
+    }
+
+    private RegionEntityTransferResult applyRecordedEntityTransfer(RegionEntityTransferToken token) {
+        if (token.entity().isRemoved()) {
+            return RegionEntityTransferResult.ENTITY_REMOVED;
+        }
+        if (this.shutdown) {
+            return RegionEntityTransferResult.ENGINE_SHUT_DOWN;
+        }
+        final ServerLevel level = token.level();
+        if (this.regionizer.isLevelClosed(level)) {
+            return RegionEntityTransferResult.LEVEL_CLOSED;
+        }
+        final RegionEntityTransferEpochSource epochs = RegionEntityTransferEpochSource.of(level.entityIdentityLedger());
+        if (epochs.epoch(token.uuid()) != token.identityEpoch()) {
+            return RegionEntityTransferResult.STALE_IDENTITY_EPOCH;
+        }
+        final RegionState destination = this.regionizer.get(token.destinationRegion());
+        if (destination == null || destination.isDead()) {
+            return RegionEntityTransferResult.DESTINATION_INACTIVE;
+        }
+        final RegionEntityTransferResult graphResult = this.validateRidingGraph(token, epochs);
+        if (graphResult != null) {
+            return graphResult;
+        }
+        final List<Entity> entities = new ArrayList<>(token.ridingGraph().size());
+        for (final RegionEntityTransferToken.Member member : token.ridingGraph()) {
+            entities.add(member.entity());
+        }
+        if (this.regionizer.commitTransfer(token.sourceRegion(), token.destinationRegion(), entities, level) == null) {
+            return RegionEntityTransferResult.SOURCE_MAPPING_CHANGED;
+        }
+        for (final Entity entity : entities) {
+            this.notifyEntityMoved(entity);
+        }
+        return RegionEntityTransferResult.COMMITTED;
+    }
+
+    /**
+     * Validates that the recorded riding graph is unchanged and still belongs to the recorded source.
+     * <p>
+     * An added or removed member, a member in another region or level, or a member whose identity epoch
+     * advanced rejects the whole token. A graph is never transferred partially.
+     */
+    @Nullable
+    private RegionEntityTransferResult validateRidingGraph(RegionEntityTransferToken token, RegionEntityTransferEpochSource epochs) {
+        if (token.ridingGraph().isEmpty()) {
+            return RegionEntityTransferResult.RIDING_GRAPH_SPLIT;
+        }
+        final Set<Entity> recorded = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (final RegionEntityTransferToken.Member member : token.ridingGraph()) {
+            recorded.add(member.entity());
+        }
+        final Set<Entity> current = Collections.newSetFromMap(new IdentityHashMap<>());
+        if (!collectCurrentRidingGraph(token.ridingGraph().get(0).entity(), current) || !current.equals(recorded)) {
+            return RegionEntityTransferResult.RIDING_GRAPH_SPLIT;
+        }
+        for (final RegionEntityTransferToken.Member member : token.ridingGraph()) {
+            final Entity entity = member.entity();
+            if (entity.isRemoved()) {
+                return RegionEntityTransferResult.ENTITY_REMOVED;
+            }
+            if (entity.level() != token.level()) {
+                return RegionEntityTransferResult.RIDING_GRAPH_SPLIT;
+            }
+            final RegionState region = this.regionizer.regionFor(entity);
+            if (region == null || !region.coordinate().equals(token.sourceRegion())) {
+                return RegionEntityTransferResult.RIDING_GRAPH_SPLIT;
+            }
+            if (!member.uuid().equals(entity.getUUID()) || epochs.epoch(member.uuid()) != member.identityEpoch()) {
+                return RegionEntityTransferResult.STALE_IDENTITY_EPOCH;
+            }
+        }
+        return null;
+    }
+
+    private boolean collectRidingGraphMembers(Entity entity, Map<ServerLevel, RegionEntityTransferEpochSource> epochsByLevel, List<RegionEntityTransferToken.Member> members) {
+        if (!(entity.level() instanceof ServerLevel entityLevel)) {
+            return false;
+        }
+        final UUID uuid = entity.getUUID();
+        if (uuid == null) {
+            return false;
+        }
+        final RegionEntityTransferEpochSource epochs = epochsByLevel.computeIfAbsent(entityLevel, level -> RegionEntityTransferEpochSource.of(level.entityIdentityLedger()));
+        final long identityEpoch = epochs.epoch(uuid);
+        if (identityEpoch == RegionEntityTransferEpochSource.MISSING_EPOCH) {
+            return false;
+        }
+        members.add(new RegionEntityTransferToken.Member(entity, uuid, identityEpoch));
+        for (final Entity passenger : entity.getPassengers()) {
+            if (passenger == null || !this.collectRidingGraphMembers(passenger, epochsByLevel, members)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean collectCurrentRidingGraph(Entity entity, Set<Entity> members) {
+        if (!members.add(entity)) {
+            return true;
+        }
+        for (final Entity passenger : entity.getPassengers()) {
+            if (passenger == null || !collectCurrentRidingGraph(passenger, members)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Entity topmostRidingEntity(Entity entity) {
+        Entity current = entity;
+        final Set<Entity> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        visited.add(current);
+        while (true) {
+            final Entity vehicle = current.getVehicle();
+            if (vehicle == null || !vehicle.hasPassenger(current) || !visited.add(vehicle)) {
+                return current;
+            }
+            current = vehicle;
+        }
+    }
+
+    private void notifyEntityMoved(Entity entity) {
         for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
             if (task.isFor(entity)) {
                 task.onEntityMoved();
@@ -2300,6 +2556,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                         return;
                     }
                     this.shutdown = true;
+                    this.entityTransferJournal.clear();
                 }
                 this.awaitActiveTickBatches(null);
                 this.awaitSubmittedRegionTasks(null);

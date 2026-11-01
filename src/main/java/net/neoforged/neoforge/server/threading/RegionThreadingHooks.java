@@ -17,7 +17,10 @@ import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
+import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
+import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
+import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan;
@@ -459,6 +462,42 @@ public final class RegionThreadingHooks {
                 engine.moveRegionEntity(entity);
             }
         });
+    }
+
+    /**
+     * Records a cross-region entity transfer decision in the installed engine without mutating any index.
+     * <p>
+     * This is the bridge for a caller that owns the vanilla entity, world and network side effects of a
+     * transfer: it records the destination region first, performs the vanilla sequence, and commits the
+     * token at a barrier with {@link #commitEntityRegionTransfer(RegionEntityTransferToken)}. The token
+     * records the identity epoch and both regions at decision time; the commit never re-reads the live
+     * position.
+     *
+     * @return the recorded token, or {@code null} when region threading is not installed or no transfer
+     *         can be recorded; in that case the caller keeps the vanilla path
+     */
+    @Nullable
+    public static RegionEntityTransferToken recordEntityRegionTransfer(Entity entity, RegionCoordinate destinationRegion) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.recordEntityRegionTransfer(entity, destinationRegion);
+        }
+        return null;
+    }
+
+    /**
+     * Commits a recorded cross-region entity transfer on the server thread.
+     * <p>
+     * With region threading not installed this is a no-op and answers
+     * {@link RegionEntityTransferResult#DISABLED}, which leaves the caller's vanilla behavior and return
+     * values unchanged.
+     */
+    public static RegionEntityTransferResult commitEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.commitEntityRegionTransfer(token);
+        }
+        return RegionEntityTransferResult.DISABLED;
     }
 
     /**

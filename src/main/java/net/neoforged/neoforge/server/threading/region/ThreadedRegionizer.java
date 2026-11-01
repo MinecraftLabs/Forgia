@@ -301,6 +301,69 @@ final class ThreadedRegionizer {
     }
 
     /**
+     * Applies one recorded region transfer of a complete entity graph under a single write lock.
+     * <p>
+     * The recorded source mapping is validated before anything is written: every entity must still map to
+     * {@code sourceCoordinate} and its recorded level must still be {@code level}. A mismatch returns
+     * {@code null} and leaves every mapping untouched, so the caller reports a failed commit instead of
+     * repairing the recorded intent.
+     * <p>
+     * The destination mapping is written before the source region is retired, so the only intermediate
+     * state is a duplicate entry while the write lock is held; a reader can never observe a missing one.
+     * No callback, event, chunk access or user code runs inside the lock scope.
+     *
+     * @return the destination region, or {@code null} when the recorded source mapping is no longer current
+     *         or the level identity was closed
+     */
+    @Nullable
+    RegionState commitTransfer(RegionCoordinate sourceCoordinate, RegionCoordinate destinationCoordinate, List<Entity> entities, ServerLevel level) {
+        if (entities.isEmpty()) {
+            return null;
+        }
+        final long stamp = this.acquireWriteLock();
+        try {
+            if (this.closed || this.isLevelClosedLocked(level)) {
+                return null;
+            }
+            if (sourceCoordinate.level() != level || destinationCoordinate.level() != level) {
+                return null;
+            }
+            for (final Entity entity : entities) {
+                final RegionState current = this.entities.get(entity);
+                if (current == null || !current.coordinate().equals(sourceCoordinate)) {
+                    return null;
+                }
+                if (this.entityLevels.get(entity) != level) {
+                    return null;
+                }
+            }
+            final RegionState destination = this.getOrCreateLocked(destinationCoordinate);
+            if (destination.isDead()) {
+                return null;
+            }
+            boolean changed = false;
+            for (final Entity entity : entities) {
+                final RegionState previous = this.entities.put(entity, destination);
+                this.entityLevels.put(entity, level);
+                if (previous != destination) {
+                    changed = true;
+                }
+            }
+            if (changed) {
+                this.structuralChangeCount.incrementAndGet();
+                this.requestMergeCheckIfNeeded(sectionCoordinate(destinationCoordinate), destination);
+            }
+            final RegionState source = this.regions.get(sourceCoordinate);
+            if (source != null && source != destination) {
+                this.removeIfEmptyLocked(source);
+            }
+            return destination;
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
      * {@return the region that currently owns {@code entity}, or {@code null} when it is not tracked}
      * <p>
      * Unlike {@link #moveEntity(Entity, RegionCoordinate)} this never publishes a new ownership. It is used
