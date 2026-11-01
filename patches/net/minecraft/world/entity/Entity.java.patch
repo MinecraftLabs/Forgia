@@ -39,6 +39,18 @@
      }
  
      public boolean isColliding(BlockPos p_20040_, BlockState p_20041_) {
+@@ -309,6 +_,11 @@
+     }
+ 
+     public void setId(int p_20235_) {
++        // Neo: the int id is part of the published identity. A re-id of an admitted entity (player respawn)
++        // rebinds the published record on the server thread; an entity that is not admitted is a no-op.
++        if (level() instanceof ServerLevel serverLevel) {
++            serverLevel.entityIdentityLedger().rebindId(this, this.id, p_20235_);
++        }
+         this.id = p_20235_;
+     }
+ 
 @@ -330,6 +_,9 @@
      }
  
@@ -356,6 +368,18 @@
          if (this.level() instanceof ServerLevel serverlevel && !this.isRemoved()) {
              ServerLevel serverlevel1 = p_350951_.newLevel();
              List<Entity> list = this.getPassengers();
+@@ -2649,6 +_,11 @@
+     }
+ 
+     public void setUUID(UUID p_20085_) {
++        // Neo: the UUID is part of the published identity. Changing it on an admitted entity rebinds the
++        // published record on the server thread instead of leaving the ledger keyed by the old UUID.
++        if (level() instanceof ServerLevel serverLevel) {
++            serverLevel.entityIdentityLedger().rebindUuid(this, this.uuid, p_20085_);
++        }
+         this.uuid = p_20085_;
+         this.stringUUID = this.uuid.toString();
+     }
 @@ -2667,6 +_,7 @@
          return this.stringUUID;
      }

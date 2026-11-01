@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -37,19 +_,58 @@
+@@ -37,19 +_,73 @@
      private final EntityLookup<T> visibleEntityStorage;
      final EntitySectionStorage<T> sectionStorage;
      private final LevelEntityGetter<T> entityGetter;
@@ -10,6 +10,7 @@
      private final LongSet chunksToUnload = new LongOpenHashSet();
      private final Queue<ChunkEntities<T>> loadingInbox = Queues.newConcurrentLinkedQueue();
 +    private final EntityStorageAccessCheck storageAccessCheck;
++    private final net.neoforged.neoforge.server.threading.region.EntityIdentityLedger identityLedger = new net.neoforged.neoforge.server.threading.region.EntityIdentityLedger();
  
      public PersistentEntitySectionManager(Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_) {
 +        this(p_157503_, p_157504_, p_157505_, operation -> {});
@@ -57,10 +58,24 @@
 +
 +    private void checkStorageAccess(String operation) {
 +        this.storageAccessCheck.checkAccess(operation);
++    }
++
++    /**
++     * Neo: the per-level identity publication of this manager. The ledger is the only entity identity
++     * surface a future region worker may read; it is not a second identity ledger over the vanilla maps,
++     * and its records are published after the server thread wrote the maps that back them. Obtaining it
++     * is a server-owned storage read, so a native region worker is rejected before it receives the
++     * reference. Mutating the ledger is rejected for a native region worker as well, while
++     * {@link net.neoforged.neoforge.server.threading.region.EntityIdentityLedger#current(java.util.UUID)}
++     * stays readable from any thread.
++     */
++    public net.neoforged.neoforge.server.threading.region.EntityIdentityLedger identityLedger() {
++        this.checkStorageAccess("PersistentEntitySectionManager.identityLedger");
++        return this.identityLedger;
      }
  
      void removeSectionIfEmpty(long p_157510_, EntitySection<T> p_157511_) {
-@@ -71,7 +_,18 @@
+@@ -71,14 +_,40 @@
          return this.addEntity(p_157534_, false);
      }
  
@@ -76,9 +91,31 @@
 +    }
 +
 +    private boolean addEntityWithoutEvent(T p_157539_, boolean p_157540_) {
++        // Neo: the identity is reserved before any vanilla map is written, so a duplicate UUID or a
++        // duplicate int id is rejected instead of silently overwriting a live binding. The reservation is
++        // published as RESERVED; a reader retries until the admission is published as ADMITTED.
++        if (p_157539_ instanceof Entity realEntity
++                && this.identityLedger.admit(realEntity) != net.neoforged.neoforge.server.threading.region.EntityIdentityLedger.Admission.ADMITTED) {
++            return false;
++        }
          if (!this.addEntityUuid(p_157539_)) {
++            if (p_157539_ instanceof Entity realEntity) {
++                this.identityLedger.abandon(realEntity);
++            }
              return false;
          } else {
+             long i = SectionPos.asLong(p_157539_.blockPosition());
+             EntitySection<T> entitysection = this.sectionStorage.getOrCreateSection(i);
+             entitysection.add(p_157539_);
+             p_157539_.setLevelCallback(new PersistentEntitySectionManager.Callback(p_157539_, i, entitysection));
++            // Neo: the vanilla UUID set and the section membership now contain the entity. Tracking, if any,
++            // publishes TRACKED from startTracking, which is sequenced after this publication.
++            if (p_157539_ instanceof Entity realEntity) {
++                this.identityLedger.publishAdmitted(realEntity);
++            }
+             if (!p_157540_) {
+                 this.callbacks.onCreated(p_157539_);
+             }
 @@ -101,11 +_,19 @@
      }
  
@@ -101,6 +138,29 @@
      }
  
      void startTicking(T p_157565_) {
+@@ -118,12 +_,22 @@
+ 
+     void startTracking(T p_157576_) {
+         this.visibleEntityStorage.add(p_157576_);
++        // Neo: published after the visible lookup contains the entity, so a reader that observes TRACKED
++        // can rely on the vanilla by-uuid/by-id binding. Re-entrant callbacks run after this store.
++        if (p_157576_ instanceof Entity realEntity) {
++            this.identityLedger.publishTracked(realEntity);
++        }
+         this.callbacks.onTrackingStart(p_157576_);
+     }
+ 
+     void stopTracking(T p_157581_) {
+         this.callbacks.onTrackingEnd(p_157581_);
+         this.visibleEntityStorage.remove(p_157581_);
++        // Neo: published after the visible lookup no longer contains the entity, so ADMITTED never claims
++        // a binding that was just removed. A departure keeps DEPARTING and is not reopened here.
++        if (p_157581_ instanceof Entity realEntity) {
++            this.identityLedger.publishUntracked(realEntity);
++        }
+     }
+ 
+     public void updateChunkStatus(ChunkPos p_287590_, FullChunkStatus p_287623_) {
 @@ -132,6 +_,7 @@
      }
  
@@ -145,12 +205,16 @@
          LongSet longset = this.getAllChunksToSave();
  
          while (!longset.isEmpty()) {
-@@ -280,31 +_,38 @@
+@@ -280,31 +_,42 @@
  
      @Override
      public void close() throws IOException {
 +        this.checkStorageAccess("PersistentEntitySectionManager.close");
          this.saveAll();
++        // Neo: sealing is the close transition of the level. Every remaining identity is published as gone,
++        // and an admission that a load completion or another caller attempts afterwards is rejected instead
++        // of writing the maps of a closed manager.
++        this.identityLedger.seal();
          this.permanentStorage.close();
      }
  
@@ -232,11 +296,28 @@
              }
          }
  
-@@ -428,6 +_,7 @@
+@@ -428,6 +_,12 @@
  
          @Override
          public void onRemove(Entity.RemovalReason p_157619_) {
 +            PersistentEntitySectionManager.this.checkStorageAccess("PersistentEntitySectionManager.Callback.onRemove");
++            // Neo: the departure is published before any map is written, so the identity stops being a
++            // valid admission target for the whole removal instead of only after the UUID is released.
++            if (this.realEntity != null) {
++                PersistentEntitySectionManager.this.identityLedger.publishDeparting(this.realEntity);
++            }
              if (!this.currentSection.remove(this.entity)) {
                  PersistentEntitySectionManager.LOGGER
                      .warn("Entity {} wasn't found in section {} (destroying due to {})", this.entity, SectionPos.of(this.currentSectionKey), p_157619_);
+@@ -449,6 +_,11 @@
+             PersistentEntitySectionManager.this.knownUuids.remove(this.entity.getUUID());
+             this.entity.setLevelCallback(NULL);
+             PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
++            // Neo: the removal is complete: the UUID set, the section membership and every visibility
++            // callback ran. Only now is the identity published as gone.
++            if (this.realEntity != null) {
++                PersistentEntitySectionManager.this.identityLedger.publishGone(this.realEntity);
++            }
+         }
+     }
+ 

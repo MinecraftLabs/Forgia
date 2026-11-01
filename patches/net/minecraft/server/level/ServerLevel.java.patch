@@ -412,6 +412,26 @@
          p_184103_.unpackTicks(this.getLevelData().getGameTime());
      }
  
+@@ -1679,6 +_,19 @@
+         return crashreportcategory;
+     }
+ 
++    /**
++     * Neo: the per-level identity publication owned by the entity manager.
++     * <p>
++     * The ledger is the only entity identity surface a future region worker may read. Obtaining it is a
++     * server-owned storage read, so it is rejected for a native region worker; the region entity tick lane
++     * receives the reference on the server thread when it builds a tick plan and reads
++     * {@link net.neoforged.neoforge.server.threading.region.EntityIdentityLedger#current(java.util.UUID)}
++     * from the worker. A record is a lifecycle publication, not an atomic snapshot of the vanilla maps.
++     */
++    public net.neoforged.neoforge.server.threading.region.EntityIdentityLedger entityIdentityLedger() {
++        return this.entityManager.identityLedger();
++    }
++
+     final class EntityCallbacks implements LevelCallback<Entity> {
+         public void onCreated(Entity p_143355_) {
+         }
 @@ -1713,8 +_,8 @@
                  ServerLevel.this.navigatingMobs.add(mob);
              }
