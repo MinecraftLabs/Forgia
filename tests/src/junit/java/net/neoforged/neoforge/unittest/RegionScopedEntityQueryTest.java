@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -29,12 +30,14 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.ChunkEntities;
 import net.minecraft.world.level.entity.EntityPersistentStorage;
 import net.minecraft.world.level.entity.EntitySectionStorage;
@@ -274,6 +277,12 @@ class RegionScopedEntityQueryTest {
         doReturn(List.of()).when(level).getPartEntities();
         setField(ServerLevel.class, level, "entityManager", manager);
         setField(ServerLevel.class, level, "regionAwareEntityGetter", new RegionAwareEntityGetter(level, manager.getEntityGetter()));
+        // The pre-load margin of an entity group asks the chunk source whether the neighborhood is
+        // loaded; the mock level reports every chunk as loaded, so groups are submitted like before.
+        final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
+        final LevelChunk loadedChunk = mock(LevelChunk.class);
+        when(chunkSource.getChunkNow(anyInt(), anyInt())).thenReturn(loadedChunk);
+        doReturn(chunkSource).when(level).getChunkSource();
         return level;
     }
 

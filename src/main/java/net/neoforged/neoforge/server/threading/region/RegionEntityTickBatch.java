@@ -43,6 +43,12 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private final List<Group> groups = new ArrayList<>();
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<Entity> fallbackEntities = new ArrayList<>();
+    /**
+     * Entities a worker handed back after the chunk source refused a chunk it needed. They are ticked on the
+     * server thread after the batch, like the entities whose region could not be leased. The list is filled
+     * from the worker threads, so it is synchronized.
+     */
+    private final List<Entity> chunkFallbackEntities = Collections.synchronizedList(new ArrayList<>());
     private final List<DeferredEntityUpdate> deferredUpdates = Collections.synchronizedList(new ArrayList<>());
     private final List<DeferredSectionUpdate> deferredSectionUpdates = Collections.synchronizedList(new ArrayList<>());
     /** Set when the engine shuts down; guarded by the monitor of {@link #deferredSectionUpdates}. */
@@ -83,6 +89,23 @@ final class RegionEntityTickBatch extends RegionTickBatch {
 
     List<Entity> fallbackEntities() {
         return this.fallbackEntities;
+    }
+
+    /**
+     * Records an entity that a worker could not tick because the chunk source refused a chunk the tick
+     * needed; the server thread ticks it after the batch instead.
+     */
+    void addChunkFallback(Entity entity) {
+        this.chunkFallbackEntities.add(entity);
+    }
+
+    /**
+     * Takes the entities a worker handed back because of a refused chunk request.
+     */
+    List<Entity> chunkFallbackEntities() {
+        synchronized (this.chunkFallbackEntities) {
+            return List.copyOf(this.chunkFallbackEntities);
+        }
     }
 
     boolean leases(RegionState region) {

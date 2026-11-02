@@ -35,12 +35,14 @@ import java.util.function.Consumer;
 import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntityPersistentStorage;
 import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
@@ -485,6 +487,12 @@ class RegionEntityOwnershipTest {
         doReturn("test-level").when(level).toString();
         // The target chunk acquisition of a deferred section update is server-owned storage.
         doAnswer(invocation -> null).when(level).getChunk(anyInt(), anyInt());
+        // The pre-load margin of an entity group asks the chunk source whether the neighborhood is
+        // loaded; the mock level reports every chunk as loaded, so groups are submitted like before.
+        final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
+        final LevelChunk loadedChunk = mock(LevelChunk.class);
+        when(chunkSource.getChunkNow(anyInt(), anyInt())).thenReturn(loadedChunk);
+        doReturn(chunkSource).when(level).getChunkSource();
         return level;
     }
 

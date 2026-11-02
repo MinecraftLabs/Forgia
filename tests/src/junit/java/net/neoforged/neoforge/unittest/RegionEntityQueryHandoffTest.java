@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -35,12 +36,14 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.ticks.LevelChunkTicks;
@@ -620,6 +623,12 @@ class RegionEntityQueryHandoffTest {
             return null;
         }).when(server).execute(any(Runnable.class));
         doReturn(server).when(level).getServer();
+        // The pre-load margin of an entity group asks the chunk source whether the neighborhood is
+        // loaded; the mock level reports every chunk as loaded, so groups are submitted like before.
+        final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
+        final LevelChunk loadedChunk = mock(LevelChunk.class);
+        when(chunkSource.getChunkNow(anyInt(), anyInt())).thenReturn(loadedChunk);
+        doReturn(chunkSource).when(level).getChunkSource();
         return level;
     }
 

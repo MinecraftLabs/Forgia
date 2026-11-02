@@ -109,7 +109,7 @@
      }
  
      public void updateNeighborsAtExceptFromFacing(BlockPos p_46591_, Block p_46592_, Direction p_46593_) {
-@@ -486,42 +_,111 @@
+@@ -486,42 +_,116 @@
      }
  
      public void addBlockEntityTicker(TickingBlockEntity p_151526_) {
@@ -229,6 +229,11 @@
 +            net.neoforged.neoforge.server.timings.TimeTracker.ENTITY_UPDATE.trackStart(p_46655_);
              p_46654_.accept(p_46655_);
          } catch (Throwable throwable) {
++            // Neo: a refused chunk request of a region worker is a handoff to the server-thread fallback, not
++            // a crash. It is rethrown unwrapped so no crash report is built and the entity is never discarded
++            // by removeErroringEntities; the entity tick group ticks it on the server thread instead.
++            if (net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable))
++                throw throwable;
              CrashReport crashreport = CrashReport.forThrowable(throwable, "Ticking entity");
              CrashReportCategory crashreportcategory = crashreport.addCategory("Entity being ticked");
              p_46655_.fillCrashReportCategory(crashreportcategory);

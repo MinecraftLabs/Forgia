@@ -137,10 +137,16 @@ public class ServerLoadBenchmarkGameTests {
      * is the operation the guard rejected, so the blocker table is keyed by that operation.
      */
     private static final String STORAGE_ACCESS_REJECTION_PREFIX = "Native region worker attempted server-owned entity storage access: ";
+    /**
+     * System property that turns the diagnostic engine's entity tick worker execution off, so the same
+     * workload measures the server-thread reference on the same grid, population and window. Defaults to the
+     * worker measurement; the reference run sets it to {@code false}.
+     */
+    static final String ENTITY_WORKER_TICKS_PROPERTY = "neoforge.serverBenchmarkEntityWorkerTicks";
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -321,7 +327,7 @@ public class ServerLoadBenchmarkGameTests {
                         spawnZombies(level, grid, origin, zombies, helper);
                     })
                     .thenExecute(() -> {
-                        replaced.set(installEntityWorkerEngine(blockers));
+                        replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()));
                         before.set(RegionThreadingHooks.diagnostics());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
@@ -705,23 +711,33 @@ public class ServerLoadBenchmarkGameTests {
      * Replaces the installed engine with the diagnostics engine of this run.
      * <p>
      * The diagnostic engine has the same layout, worker count and slices as the configured engine, but
-     * region-owned entity storage and entity tick worker execution enabled. The swap runs on the server
-     * thread outside any batch: {@link RegionThreadingManager#clear()} shuts the configured engine down
-     * before the diagnostic one is installed.
+     * region-owned entity storage and, unless {@value #ENTITY_WORKER_TICKS_PROPERTY} turned it off, entity
+     * tick worker execution enabled. The swap runs on the server thread outside any batch:
+     * {@link RegionThreadingManager#clear()} shuts the configured engine down before the diagnostic one is
+     * installed.
      *
+     * @param entityTickWorkers whether entity ticks execute on the region workers, or stay on the server
+     *                          thread for the reference measurement
      * @return the flags and layout of the replaced engine, so the configured engine can be rebuilt afterwards
      */
-    private static InstalledEngine installEntityWorkerEngine(EntityWorkerBlockers blockers) {
+    private static InstalledEngine installEntityWorkerEngine(EntityWorkerBlockers blockers, boolean entityTickWorkers) {
         final RegionThreading installed = RegionThreadingManager.getOrThrow();
         if (!(installed instanceof RegionThreadingEngine configured)) {
             throw new IllegalStateException("the entity worker diagnostics need the native region threading engine, got " + installed.getClass().getName());
         }
         final InstalledEngine replaced = new InstalledEngine(configured.diagnostics(), configured.regionLayout());
         RegionThreadingManager.clear();
-        final RegionThreadingEngine diagnostic = replaced.rebuild(true, RegionEntityStorageMode.REGION_OWNED);
+        final RegionThreadingEngine diagnostic = replaced.rebuild(entityTickWorkers, RegionEntityStorageMode.REGION_OWNED);
         diagnostic.setEntityTickFailureObserverForTesting(blockers::record);
         RegionThreadingManager.install(diagnostic);
         return replaced;
+    }
+
+    /**
+     * {@return true when the diagnostic engine ticks entities on the region workers}
+     */
+    private static boolean entityTickWorkers() {
+        return !"false".equalsIgnoreCase(System.getProperty(ENTITY_WORKER_TICKS_PROPERTY));
     }
 
     /**
@@ -774,12 +790,17 @@ public class ServerLoadBenchmarkGameTests {
                 + " entityQueriesAllowed=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesAllowedByLease)
                 + " entityQueriesTruncated=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesTruncatedByLease)
                 + " entityQueriesRejected=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesRejected)
+                + " chunkGuardRefusals=" + delta(before, after, RegionThreadingDiagnostics::chunkGuardRefusals)
+                + " chunkFallbackEntityTicks=" + delta(before, after, RegionThreadingDiagnostics::chunkFallbackEntityTicks)
+                + " chunkPreloadRefusedEntityTicks=" + delta(before, after, RegionThreadingDiagnostics::chunkPreloadRefusedEntityTicks)
+                + " chunkPreloadMargin=" + RegionThreadingEngine.entityTickChunkMargin()
+                + " entityTickMode=" + entityTickMode(after)
                 + " zombieSurvivors=" + survivors + "/" + zombies.size()
                 + " regionMismatches=" + mismatches
                 + " entityTickFailures=" + blockers.failureCount()
                 + " distinctBlockers=" + blockers.blockerCount());
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -809,9 +830,22 @@ public class ServerLoadBenchmarkGameTests {
                 mismatches,
                 survivors,
                 blockers.failureCount(),
-                blockers.blockerCount());
+                blockers.blockerCount(),
+                delta(before, after, RegionThreadingDiagnostics::chunkGuardRefusals),
+                delta(before, after, RegionThreadingDiagnostics::chunkFallbackEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::chunkPreloadRefusedEntityTicks),
+                RegionThreadingEngine.entityTickChunkMargin(),
+                entityTickMode(after));
         System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);
         blockers.printBlockers();
+    }
+
+    /**
+     * {@return the entity tick mode of the measured window, so a worker row and its server-thread reference
+     * row are distinguishable in the CSV}
+     */
+    private static String entityTickMode(Optional<RegionThreadingDiagnostics> diagnostics) {
+        return diagnostics.map(value -> value.entityTickWorkerExecutionEnabled() ? "worker" : "server").orElse("none");
     }
 
     /**

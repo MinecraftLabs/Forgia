@@ -46,6 +46,17 @@ package net.neoforged.neoforge.server.threading.region;
  * {@link #regionChunkSize()} is the edge length in chunks of one region coordinate of the installed
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
  * diagnostic consumer read the same value the engine and the physical section partitions use.
+ * <p>
+ * The three chunk counters report the entity and block-entity ticks that did not run on a worker because a
+ * chunk they need was not available. A guard refusal counts one chunk request that a native region worker
+ * refused instead of blocking on the server chunk source
+ * ({@link RegionWorkerChunkUnavailableException}); the same request is counted once, so a refusal is never
+ * double counted per entity or ticker. A chunk fallback entity tick counts one entity that a worker handed
+ * to the server-thread fallback after such a refusal; it is ticked there exactly once. A pre-load refusal
+ * counts one entity that was never submitted to a worker because its region's neighborhood was not loaded
+ * inside the pre-load margin. The counters therefore separate the ticks that never left the server thread
+ * (pre-load refusal) from the ticks that were attempted on a worker and completed on the server thread
+ * (chunk fallback), and the guard refusals count the chunk requests behind the latter.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -105,4 +116,7 @@ public record RegionThreadingDiagnostics(
         long legacyDeferredEntityMoveCount,
         long retriedDeferredEntityMoveCount,
         long deferredEntitySectionUpdatesApplied,
-        long droppedDeferredEntitySectionUpdates) {}
+        long droppedDeferredEntitySectionUpdates,
+        long chunkGuardRefusals,
+        long chunkFallbackEntityTicks,
+        long chunkPreloadRefusedEntityTicks) {}

@@ -13,6 +13,7 @@ import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
+import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 
 final class RegionThreadingCommand {
     private RegionThreadingCommand() {}
@@ -62,6 +63,10 @@ final class RegionThreadingCommand {
                 + ", entityQueriesRejected=" + diagnostics.entityQueriesRejected()
                 + ", deferredEntitySectionUpdatesApplied=" + diagnostics.deferredEntitySectionUpdatesApplied()
                 + ", droppedDeferredEntitySectionUpdates=" + diagnostics.droppedDeferredEntitySectionUpdates()
+                + ", chunkGuardRefusals=" + diagnostics.chunkGuardRefusals()
+                + ", chunkFallbackEntityTicks=" + diagnostics.chunkFallbackEntityTicks()
+                + ", chunkPreloadRefusedEntityTicks=" + diagnostics.chunkPreloadRefusedEntityTicks()
+                + ", entityTickChunkMargin=" + RegionThreadingEngine.entityTickChunkMargin()
                 + ", blockEntityTicksOnWorkers=" + diagnostics.blockEntityTicksOnWorkers()
                 + ", skippedBlockEntityTicks=" + diagnostics.skippedBlockEntityTicks()
                 + ", fallbackBlockEntityTicks=" + diagnostics.fallbackBlockEntityTicks()

@@ -32,6 +32,7 @@ import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.minecraft.world.level.chunk.ChunkSource;
 import net.minecraft.world.ticks.LevelTicks;
 import net.minecraft.world.ticks.ScheduledTick;
 import net.neoforged.neoforge.server.threading.EntityRegionScheduler;
@@ -59,6 +60,19 @@ public final class RegionThreadingEngine implements RegionThreading {
      * counted in barriers and never in a spin.
      */
     private static final int MAX_DEFERRED_ENTITY_MOVE_ATTEMPTS = 3;
+    /**
+     * Chunk margin around a region that the server thread requires to be loaded before it submits the
+     * region's entity group to a worker.
+     * <p>
+     * One chunk is 16 blocks and covers every block, fluid and collision read a vanilla entity tick makes
+     * with a loading request: the collision box and the eye position are read at most 2 blocks from the
+     * entity, and the AI block scans that reach further do not use the loading accessor
+     * ({@code RemoveBlockGoal} probes its 24-block search range with {@code getChunk(..., false)}, and
+     * pathfinding reads a {@code PathNavigationRegion} snapshot). A read that still leaves the margin is
+     * refused by the chunk source guard and handed to the server-thread fallback, so the margin is a
+     * heuristic that keeps the common case off the chunk source, not a correctness bound.
+     */
+    private static final int ENTITY_TICK_CHUNK_MARGIN = 1;
     private static final java.util.concurrent.atomic.AtomicLong DIAG_LAST = new java.util.concurrent.atomic.AtomicLong();
     private static final BasicRegionThreadingContext NONE_CONTEXT = new BasicRegionThreadingContext(RegionThreadingContext.Kind.NONE, null, null, null, null);
     private static final ThreadLocal<RegionThreadingContext> CURRENT_CONTEXT = ThreadLocal.withInitial(() -> NONE_CONTEXT);
@@ -85,6 +99,16 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong skippedEntityTicks = new AtomicLong();
     private final AtomicLong fallbackEntityTicks = new AtomicLong();
     private final AtomicLong deferredEntityTicks = new AtomicLong();
+    /**
+     * Entity ticks a worker handed back because the chunk source refused a chunk the tick needed. Each one
+     * is ticked on the server thread after the batch instead of blocking the worker on the chunk source.
+     */
+    private final AtomicLong chunkFallbackEntityTicks = new AtomicLong();
+    /**
+     * Entities a group refused to lease because their neighborhood was not loaded. They are ticked on the
+     * server thread like the entities whose region could not be leased.
+     */
+    private final AtomicLong chunkPreloadRefusedEntityTicks = new AtomicLong();
     private final AtomicLong blockEntityTicksOnWorkers = new AtomicLong();
     private final AtomicLong skippedBlockEntityTicks = new AtomicLong();
     private final AtomicLong fallbackBlockEntityTicks = new AtomicLong();
@@ -300,6 +324,17 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     public RegionLayout regionLayout() {
         return this.layout;
+    }
+
+    /**
+     * {@return the chunk margin around a region that has to be loaded before the region's entity group is
+     * submitted to a worker}
+     * <p>
+     * The margin is the heuristic that keeps the common entity tick off the server chunk source; a tick that
+     * still needs a chunk outside it is handed to the server-thread fallback by the chunk source guard.
+     */
+    public static int entityTickChunkMargin() {
+        return ENTITY_TICK_CHUNK_MARGIN;
     }
 
     @Override
@@ -1105,10 +1140,12 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Runs after the batch was published, so cleanup already waits for it and no lifecycle read gate may be
      * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt, because
      * a merge or split re-points the tracked entities to the surviving region. Anything that cannot be
-     * resolved to a live, leasable region is recorded as a server-thread fallback.
+     * resolved to a live, leasable region is recorded as a server-thread fallback, and so is every entity of
+     * a region whose neighborhood is not loaded enough to tick on a worker.
      */
     private void leaseEntityTickGroups(RegionEntityTickBatch batch, List<Entity> pending, RegionTickBarrier barrier) {
         List<Entity> remaining = pending;
+        final List<Entity> unloadedNeighborhood = new ArrayList<>();
         int batchedEntities = 0;
         for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
             final RegionTickGrouping<RegionState, Entity> grouping = new RegionTickGrouping<>();
@@ -1135,6 +1172,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                     batch.group(region).ifPresent(group -> group.addEntities(grouping.items(region)));
                     continue;
                 }
+                if (!this.isEntityTickNeighborhoodLoaded(batch.level(), region)) {
+                    // A worker must never load a chunk from inside its tick, so a region whose
+                    // neighborhood is not completely loaded is not submitted at all: its entities tick
+                    // on the server thread after the batch instead of hitting the chunk source guard.
+                    unloadedNeighborhood.addAll(grouping.items(region));
+                    this.chunkPreloadRefusedEntityTicks.addAndGet(grouping.size(region));
+                    continue;
+                }
                 if (!this.acquireRegionLease(region, barrier)) {
                     next.addAll(grouping.items(region));
                     continue;
@@ -1150,6 +1195,9 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
         }
 
+        for (final Entity entity : unloadedNeighborhood) {
+            batch.addFallback(entity);
+        }
         for (final Entity entity : remaining) {
             batch.addFallback(entity);
             this.fallbackEntityTicks.incrementAndGet();
@@ -1157,6 +1205,38 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (batchedEntities > 0 && this.entityTickWorkersNoticeLogged.compareAndSet(false, true)) {
             LOGGER.info("Region entity ticks are now executing on region workers: {} entities", batchedEntities);
         }
+    }
+
+    /**
+     * {@return true when every chunk of {@code region} plus the entity tick margin is loaded}
+     * <p>
+     * Runs on the server thread before the group of {@code region} is submitted, so a worker never has to
+     * ask the chunk source for a chunk that is not there. A chunk counts as loaded when the chunk source
+     * can hand out its {@code FULL} chunk without loading one, which is exactly what the worker-side
+     * immediate lookup of {@code ServerChunkCache.getChunk} answers. Nothing is force-loaded: a region whose
+     * neighborhood is incomplete is not submitted, and its entities tick on the server thread instead.
+     * <p>
+     * The margin is {@link #ENTITY_TICK_CHUNK_MARGIN} chunks around the region's own chunk rectangle. For a
+     * merged {@link RegionPolicy#DYNAMIC} region the rectangle is the region's own coordinate; chunks of the
+     * merged shape beyond it are still protected by the chunk source guard, which refuses the request and
+     * hands the entity to the server-thread fallback.
+     */
+    private boolean isEntityTickNeighborhoodLoaded(ServerLevel level, RegionState region) {
+        final RegionCoordinate coordinate = region.coordinate();
+        final int regionChunkSize = this.layout.regionChunkSize();
+        final int minChunkX = coordinate.regionX() * regionChunkSize - ENTITY_TICK_CHUNK_MARGIN;
+        final int minChunkZ = coordinate.regionZ() * regionChunkSize - ENTITY_TICK_CHUNK_MARGIN;
+        final int maxChunkX = coordinate.regionX() * regionChunkSize + regionChunkSize - 1 + ENTITY_TICK_CHUNK_MARGIN;
+        final int maxChunkZ = coordinate.regionZ() * regionChunkSize + regionChunkSize - 1 + ENTITY_TICK_CHUNK_MARGIN;
+        final ChunkSource chunkSource = level.getChunkSource();
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (chunkSource.getChunkNow(chunkX, chunkZ) == null) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -1222,8 +1302,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
                         for (final Entity entity : entities) {
                             if (failureObserver == null) {
-                                if (tickOwnedEntity(level, entity)) {
-                                    ++ticked[0];
+                                try {
+                                    if (tickOwnedEntity(level, entity)) {
+                                        ++ticked[0];
+                                    }
+                                } catch (Throwable throwable) {
+                                    if (!handOffRefusedChunk(group, entity, throwable)) {
+                                        throw throwable;
+                                    }
                                 }
                                 continue;
                             }
@@ -1232,6 +1318,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     ++ticked[0];
                                 }
                             } catch (Throwable throwable) {
+                                if (handOffRefusedChunk(group, entity, throwable)) {
+                                    continue;
+                                }
                                 // Diagnostics only: the observer records the rejected operation and the group
                                 // keeps ticking its remaining entities instead of aborting the batch.
                                 failureObserver.accept(entity, throwable);
@@ -1285,6 +1374,28 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Hands {@code entity} to the server-thread fallback when {@code throwable} is a chunk request the
+     * chunk source refused to a native region worker.
+     * <p>
+     * The entity tick group does not abort on the refusal: the entity is recorded as a chunk fallback and
+     * ticked on the server thread after the batch, exactly once, instead of blocking the worker on the chunk
+     * source. Every other failure keeps the production path, which aborts the group and the level tick. The
+     * worker attempt that was abandoned here is not rolled back; the fallback tick is the tick the entity
+     * completes, and the guard fires at the first block read that leaves the pre-loaded margin.
+     *
+     * @return {@code true} when the entity was handed off, {@code false} when the caller has to keep the
+     *         failure
+     */
+    private boolean handOffRefusedChunk(RegionEntityTickBatch.Group group, Entity entity, Throwable throwable) {
+        if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
+            return false;
+        }
+        group.batch().addChunkFallback(entity);
+        this.chunkFallbackEntityTicks.incrementAndGet();
+        return true;
+    }
+
+    /**
      * Runs the vanilla preconditions of one worker entity tick.
      *
      * @return {@code true} when the entity still has to be ticked
@@ -1298,11 +1409,15 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Ticks the entities whose region could not be leased safely on the server thread after the batch.
+     * Ticks the entities whose region could not be leased safely, and the entities a worker handed back
+     * after a refused chunk request, on the server thread after the batch.
      */
     private void tickFallbackEntities(RegionEntityTickBatch batch) {
         final ServerLevel level = batch.level();
         for (final Entity entity : batch.fallbackEntities()) {
+            this.tickEntityInline(level, entity);
+        }
+        for (final Entity entity : batch.chunkFallbackEntities()) {
             this.tickEntityInline(level, entity);
         }
     }
@@ -1521,6 +1636,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                         if (RegionWorkerScope.isNativeWorkerThread()) {
                             try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
                                 ticker.tick();
+                            } catch (Throwable throwable) {
+                                // A chunk request the chunk source refused is a handoff, not a failure: the
+                                // ticker is ticked on the server thread after the batch instead of aborting
+                                // the group.
+                                if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
+                                    throw throwable;
+                                }
+                                group.batch().addFallback(admission);
+                                this.fallbackBlockEntityTicks.incrementAndGet();
+                                continue;
                             }
                         } else {
                             // Executor rejection runs on the server thread and keeps the real load check.
@@ -3082,7 +3207,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.legacyDeferredEntityMoveCount.get(),
                 this.retriedDeferredEntityMoveCount.get(),
                 this.appliedDeferredSectionUpdateCount.get(),
-                this.droppedDeferredSectionUpdateCount.get());
+                this.droppedDeferredSectionUpdateCount.get(),
+                RegionWorkerChunkUnavailableException.refusalCount(),
+                this.chunkFallbackEntityTicks.get(),
+                this.chunkPreloadRefusedEntityTicks.get());
     }
 
     /**

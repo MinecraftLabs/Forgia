@@ -1,5 +1,15 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -135,6 +_,9 @@
+     @Override
+     public ChunkAccess getChunk(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
+         if (Thread.currentThread() != this.mainThread) {
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.isNativeRegionWorkerThread()) {
++                return this.getChunkForRegionWorker(p_8360_, p_8361_, p_330876_, p_8363_);
++            }
+             return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
+         } else {
+             ProfilerFiller profilerfiller = this.level.getProfiler();
 @@ -150,6 +_,10 @@
                  }
              }
@@ -11,6 +21,44 @@
              profilerfiller.incrementCounter("getChunkCacheMiss");
              CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
              this.mainThreadProcessor.managedBlock(completablefuture::isDone);
+@@ -164,6 +_,37 @@
+         }
+     }
+ 
++    /**
++     * Neo: serves a chunk request of a native region worker without ever blocking on the server thread.
++     * <p>
++     * An off-thread request is dispatched to the main-thread processor and waited for, but the server thread
++     * is inside the region tick batch barrier while its workers run, so a worker that waited would stall the
++     * tick until the chunk finished loading, or deadlock it. The worker therefore only receives a chunk that
++     * is already available: the visible chunk holder answers the request without a load, exactly like the
++     * main-thread path does after the cache lookup. A request that would have to load, generate or await a
++     * chunk is refused with {@link net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException},
++     * which the tick groups turn into a server-thread fallback for the affected entity or ticker.
++     * <p>
++     * A request that does not require the chunk answers {@code null} like the vanilla main-thread path, so
++     * callers that probe a chunk without loading it (for example {@code RemoveBlockGoal}) keep their exact
++     * semantics and simply lose the cross-thread round trip.
++     * <p>
++     * The result cache of the main-thread path is not read or written here: it is a plain array owned by the
++     * server thread. The visible holder and its futures are thread-safe.
++     */
++    @Nullable
++    private ChunkAccess getChunkForRegionWorker(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
++        ChunkHolder chunkholder = this.getVisibleChunkIfPresent(ChunkPos.asLong(p_8360_, p_8361_));
++        ChunkAccess chunkaccess = chunkholder == null ? null : chunkholder.getChunkIfPresent(p_330876_);
++        if (chunkaccess != null) {
++            return chunkaccess;
++        }
++        if (!p_8363_) {
++            return null;
++        }
++        throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forChunk(p_8360_, p_8361_, p_330876_);
++    }
++
+     @Nullable
+     @Override
+     public LevelChunk getChunkNow(int p_8357_, int p_8358_) {
 @@ -184,6 +_,7 @@
              if (chunkholder == null) {
                  return null;
@@ -19,6 +67,18 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
+@@ -205,6 +_,11 @@
+ 
+     public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {
+         boolean flag = Thread.currentThread() == this.mainThread;
++        if (!flag && net.neoforged.neoforge.server.threading.RegionThreadingHooks.isNativeRegionWorkerThread()) {
++            // Neo: the returned future is completed by the server thread, which is inside the batch barrier
++            // waiting for this worker, so the worker must not obtain it at all.
++            throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forChunkFuture(p_8432_, p_8433_, p_330326_);
++        }
+         CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
+         if (flag) {
+             completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
 @@ -270,6 +_,12 @@
          return this.mainThreadProcessor.pollTask();
      }
