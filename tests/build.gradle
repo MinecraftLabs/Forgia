@@ -48,10 +48,48 @@ sourceSets.each {
 }
 
 junitTest {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        // The timing harness reports numbers instead of asserting behavior; it is run on demand through
+        // :tests:junitBenchmark so a machine-dependent measurement can never fail the normal test run.
+        excludeTags "benchmark"
+    }
     classpath = sourceSets.junit.output + sourceSets.junit.runtimeClasspath
     testClassesDirs = sourceSets.junit.output.classesDirs
     outputs.upToDateWhen { false }
+}
+
+// Dedicated timing harness task. It runs only the classes tagged "benchmark" and prints their tables to
+// the console; no assertion on the reported timings exists, so it cannot fail the build on a slow machine.
+tasks.register("junitBenchmark", Test) { benchmark ->
+    group = "verification"
+    description = "Runs the region engine benchmark harness (JUnit tag 'benchmark')."
+    useJUnitPlatform {
+        includeTags "benchmark"
+    }
+    classpath = sourceSets.junit.output + sourceSets.junit.runtimeClasspath
+    testClassesDirs = sourceSets.junit.output.classesDirs
+    outputs.upToDateWhen { false }
+    // The block-entity workload builds real chunks, furnaces and their tickers per configuration, so the
+    // benchmark needs more headroom than the 512m Gradle default of junitTest.
+    maxHeapSize = "2g"
+    testLogging {
+        showStandardStreams = true
+        events "passed", "failed", "skipped"
+    }
+}
+
+// The benchmark needs the same NeoDev test harness (module path, mod loading, Minecraft test setup) as
+// junitTest, which NeoDevExtraPlugin configures on that task.
+def junitTestTask = tasks.named("junitTest", Test)
+tasks.named("junitBenchmark", Test).configure { benchmark ->
+    def source = junitTestTask.get()
+    benchmark.jvmArgumentProviders.addAll(source.jvmArgumentProviders)
+    benchmark.systemProperties.putAll(source.systemProperties)
+    benchmark.jvmArgs(source.jvmArgs)
+    benchmark.environment.putAll(source.environment)
+    benchmark.executable = source.executable
+    benchmark.workingDir = source.workingDir
+    benchmark.dependsOn source.dependsOn
 }
 
 neoDev {
