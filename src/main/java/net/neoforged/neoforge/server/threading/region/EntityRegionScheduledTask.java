@@ -61,8 +61,8 @@ final class EntityRegionScheduledTask implements ScheduledRegionTask {
         return this.cancelled || this.completed;
     }
 
-    boolean isFor(Entity entity) {
-        return this.entity == entity;
+    Entity entity() {
+        return this.entity;
     }
 
     boolean isOwnedBy(ServerLevel level) {
@@ -95,6 +95,7 @@ final class EntityRegionScheduledTask implements ScheduledRegionTask {
                 this.scheduledTask.cancel();
             }
         }
+        this.engine.recordEntityTaskMigration();
         this.scheduleNext(remainingTicks);
     }
 

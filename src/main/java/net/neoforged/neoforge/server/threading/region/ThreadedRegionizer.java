@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -49,6 +50,11 @@ final class ThreadedRegionizer {
     private final AtomicLong structuralChangeCount = new AtomicLong();
     private final AtomicLong splitCheckRequestCount = new AtomicLong();
     private final AtomicLong mergeCheckRequestCount = new AtomicLong();
+    /**
+     * Number of write-lock acquisitions, so one barrier that publishes many mappings in one scope is
+     * distinguishable from one acquisition per mapping.
+     */
+    private final AtomicLong writeLockAcquisitionCount = new AtomicLong();
     private final StampedLock regionLock = new StampedLock();
     private volatile boolean closed;
     private Thread writeLockOwner;
@@ -388,6 +394,131 @@ final class ThreadedRegionizer {
     }
 
     /**
+     * Publishes the deferred ownership updates of one entity batch barrier under a single write lock.
+     * <p>
+     * Every move is validated before the first write, so a refused batch never leaves a part of itself
+     * published: a closed regionizer, a destination in a level identity that finished a level clear, an
+     * entity tracked in another level, or a retired destination region refuses the whole batch and reports
+     * why. The caller then keeps its per-entity publication for that barrier, which is the behavior of a
+     * barrier that cannot batch.
+     * <p>
+     * A move names the region its deferring thread captured. An entity that is already mapped to exactly
+     * that live region has nothing to publish and is reported as unchanged instead of being written again, and
+     * an untracked entity - or one whose published region was retired - is added like
+     * {@link #addEntity(Entity, RegionCoordinate)} adds it. A move that names another region than the
+     * published one is not written here: it is reported as a transfer and goes through the recorded transfer
+     * transaction, which never writes a region that a worker is ticking and can defer a busy handoff to the
+     * next barrier.
+     *
+     * @param moves the ownership updates of one barrier, one per entity
+     * @return the applied result, or a refused result that names the reason nothing was written
+     */
+    MoveBatchResult publishEntityMoves(List<OwnerMove> moves) {
+        final long stamp = this.acquireWriteLock();
+        try {
+            if (this.closed) {
+                return MoveBatchResult.refused(MoveBatchOutcome.REGIONIZER_CLOSED);
+            }
+            for (final OwnerMove move : moves) {
+                if (this.isLevelClosedLocked(move.destination().level())) {
+                    return MoveBatchResult.refused(MoveBatchOutcome.LEVEL_CLOSED);
+                }
+            }
+            // The classification below is the rest of the validation: it only reads, so a refused batch still
+            // has written nothing when it returns.
+            final List<Entity> unchanged = new ArrayList<>();
+            final List<OwnerMove> transfers = new ArrayList<>();
+            final List<OwnerMove> additions = new ArrayList<>();
+            for (final OwnerMove move : moves) {
+                final ServerLevel level = move.destination().level();
+                final ServerLevel trackedLevel = this.entityLevels.get(move.entity());
+                if (trackedLevel != null && trackedLevel != level) {
+                    return MoveBatchResult.refused(MoveBatchOutcome.LEVEL_MISMATCH);
+                }
+                final RegionState current = this.entities.get(move.entity());
+                if (current != null && !current.isDead()) {
+                    if (current.coordinate().equals(move.destination())) {
+                        unchanged.add(move.entity());
+                    } else {
+                        transfers.add(move);
+                    }
+                    continue;
+                }
+                final RegionState destination = this.getLocked(move.destination());
+                if (destination != null && destination.isDead()) {
+                    return MoveBatchResult.refused(MoveBatchOutcome.DESTINATION_INACTIVE);
+                }
+                additions.add(move);
+            }
+            final List<Entity> published = new ArrayList<>(additions.size());
+            // A non-fixed layout recalculates merges per destination section, so the batch requests one merge
+            // check per destination region instead of one per entity it publishes into it.
+            final Set<RegionCoordinate> mergeChecks = this.layout.isFixed() ? null : new LinkedHashSet<>();
+            for (final OwnerMove move : additions) {
+                this.entities.put(move.entity(), this.getOrCreateLocked(move.destination()));
+                this.entityLevels.put(move.entity(), move.destination().level());
+                published.add(move.entity());
+                if (mergeChecks != null) {
+                    mergeChecks.add(move.destination());
+                }
+            }
+            if (!published.isEmpty()) {
+                // One structural change per written mapping, exactly like one single-entity publication counts
+                // one change per added or re-pointed entity.
+                this.structuralChangeCount.addAndGet(published.size());
+                if (mergeChecks != null) {
+                    for (final RegionCoordinate coordinate : mergeChecks) {
+                        this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), this.getOrCreateLocked(coordinate));
+                    }
+                }
+            }
+            return new MoveBatchResult(MoveBatchOutcome.APPLIED, published, unchanged, transfers);
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * One ownership update of a barrier: the entity and the destination region its deferring thread captured.
+     */
+    record OwnerMove(Entity entity, RegionCoordinate destination) {}
+
+    /**
+     * How {@link #publishEntityMoves(List)} resolved a batch: {@link #APPLIED} or the reason the batch was
+     * refused as a whole and wrote nothing.
+     */
+    enum MoveBatchOutcome {
+        /** Every move was resolved: unchanged, published, or reported as a transfer. */
+        APPLIED,
+        /** The regionizer finished its shutdown, so no mapping may be created or re-pointed. */
+        REGIONIZER_CLOSED,
+        /** A destination names a level identity that finished a level clear. */
+        LEVEL_CLOSED,
+        /** A destination names a level the entity is not tracked in. */
+        LEVEL_MISMATCH,
+        /** A destination region is retired. */
+        DESTINATION_INACTIVE
+    }
+
+    /**
+     * The result of one batch publication.
+     *
+     * @param published entities whose mapping the batch wrote, i.e. the entities that were untracked until
+     *                  this barrier
+     * @param unchanged entities that are already mapped to the destination, so nothing was written for them
+     * @param transfers entities that are mapped to another region and need a recorded transfer
+     */
+    record MoveBatchResult(MoveBatchOutcome outcome, List<Entity> published, List<Entity> unchanged, List<OwnerMove> transfers) {
+        static MoveBatchResult refused(MoveBatchOutcome outcome) {
+            return new MoveBatchResult(outcome, List.of(), List.of(), List.of());
+        }
+
+        boolean applied() {
+            return this.outcome == MoveBatchOutcome.APPLIED;
+        }
+    }
+
+    /**
      * Outcome of {@link #commitTransfer(RegionCoordinate, RegionCoordinate, List, ServerLevel)}.
      * <p>
      * The values are resolved under the regionizer write lock, so the engine reports the exact reason a
@@ -530,6 +661,7 @@ final class ThreadedRegionizer {
         }
         final long stamp = this.regionLock.writeLock();
         this.writeLockOwner = currentThread;
+        this.writeLockAcquisitionCount.incrementAndGet();
         return stamp;
     }
 
@@ -560,6 +692,10 @@ final class ThreadedRegionizer {
 
     long mergeCheckRequestCount() {
         return this.mergeCheckRequestCount.get();
+    }
+
+    long writeLockAcquisitionCount() {
+        return this.writeLockAcquisitionCount.get();
     }
 
     void requestSplitCheck(RegionState region) {

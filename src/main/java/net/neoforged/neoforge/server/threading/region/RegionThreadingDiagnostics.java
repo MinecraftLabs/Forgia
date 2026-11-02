@@ -57,6 +57,17 @@ package net.neoforged.neoforge.server.threading.region;
  * inside the pre-load margin. The counters therefore separate the ticks that never left the server thread
  * (pre-load refusal) from the ticks that were attempted on a worker and completed on the server thread
  * (chunk fallback), and the guard refusals count the chunk requests behind the latter.
+ * <p>
+ * {@link #regionizerWriteLockAcquisitions()} counts the write-lock acquisitions of the regionizer, so the
+ * publication scope of one entity batch barrier is observable: a barrier that publishes its deferred
+ * ownership updates in one batch takes one write lock for all of them, and a barrier that publishes them one
+ * by one takes one per update. {@link #batchedDeferredEntityMoves()} counts the deferred updates a barrier
+ * resolved through that batch, either by publishing an untracked entity or by reporting a cross-region move
+ * to the recorded transfer transaction; {@link #unchangedDeferredEntityMoves()} counts the updates that named
+ * the region their entity was already mapped to and therefore published nothing;
+ * {@link #refusedDeferredEntityMoveBatches()} counts the batches the regionizer refused as a whole, whose
+ * updates the barrier then published per entity. {@link #scheduledTaskMigrations()} counts the scheduled
+ * entity tasks a move notification had to migrate to the region that now contains the task's entity.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -119,4 +130,9 @@ public record RegionThreadingDiagnostics(
         long droppedDeferredEntitySectionUpdates,
         long chunkGuardRefusals,
         long chunkFallbackEntityTicks,
-        long chunkPreloadRefusedEntityTicks) {}
+        long chunkPreloadRefusedEntityTicks,
+        long regionizerWriteLockAcquisitions,
+        long batchedDeferredEntityMoves,
+        long unchangedDeferredEntityMoves,
+        long refusedDeferredEntityMoveBatches,
+        long scheduledTaskMigrations) {}

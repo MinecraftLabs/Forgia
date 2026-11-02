@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
@@ -80,7 +81,16 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final RegionLayout layout;
     private final GlobalRegionState globalRegion = new GlobalRegionState();
     private final ThreadedRegionizer regionizer;
-    private final Set<EntityRegionScheduledTask> entityTasks = ConcurrentHashMap.newKeySet();
+    /**
+     * Registered entity scheduled tasks, grouped by the entity they belong to.
+     * <p>
+     * A move notification only reaches the wrappers of its own entity, so the ownership handoff of a barrier
+     * looks the entity up instead of scanning every registered task: an unchanged handoff can then skip the
+     * scan for an entity that has no wrapper at all, and a changed one costs the wrappers of that entity.
+     * Every task is registered and unregistered through the same entry, so the entry of an entity disappears
+     * with its last wrapper and no entity stays reachable through an empty group.
+     */
+    private final Map<Entity, Set<EntityRegionScheduledTask>> entityTasksByEntity = new ConcurrentHashMap<>();
     private final RegionWorkerPool workerPool;
     private final GlobalRegionTickRunner globalTickRunner = new GlobalRegionTickRunner();
     private final RegionTickRunner tickRunner = new RegionTickRunner();
@@ -194,6 +204,27 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final List<DeferredEntityMove> pendingDeferredEntityMoves = new ArrayList<>();
     private final AtomicLong legacyDeferredEntityMoveCount = new AtomicLong();
     private final AtomicLong retriedDeferredEntityMoveCount = new AtomicLong();
+    /**
+     * Deferred ownership updates a barrier resolved through the regionizer batch, i.e. updates that needed a
+     * publication (an untracked entity) or a recorded transfer.
+     */
+    private final AtomicLong batchedDeferredEntityMoveCount = new AtomicLong();
+    /**
+     * Deferred ownership updates that named the region their entity was already mapped to. They publish
+     * nothing, and their scheduled-task notification is skipped for an entity without a wrapper.
+     */
+    private final AtomicLong unchangedDeferredEntityMoveCount = new AtomicLong();
+    /**
+     * Deferred ownership batches the regionizer refused as a whole (a closed regionizer, a closed level
+     * identity, a level mismatch or a retired destination). The barrier then publishes every update of that
+     * batch through the per-entity path, which is the behavior of a barrier that cannot batch.
+     */
+    private final AtomicLong refusedDeferredEntityMoveBatchCount = new AtomicLong();
+    /**
+     * Scheduled entity tasks that a move notification had to migrate to another region, i.e. tasks whose
+     * entity crossed a region boundary while the task waited.
+     */
+    private final AtomicLong entityTaskMigrationCount = new AtomicLong();
     private final AtomicLong appliedDeferredSectionUpdateCount = new AtomicLong();
     private final AtomicLong droppedDeferredSectionUpdateCount = new AtomicLong();
     /**
@@ -469,14 +500,30 @@ public final class RegionThreadingEngine implements RegionThreading {
     private EntityRegionScheduledTask scheduleEntityTask(Entity entity, Runnable task, long delayTicks, long periodTicks) {
         return this.callAdmitted(() -> {
             final EntityRegionScheduledTask scheduledTask = new EntityRegionScheduledTask(this, entity, task, delayTicks, periodTicks);
-            this.entityTasks.add(scheduledTask);
+            this.registerEntityTask(scheduledTask);
             try {
                 scheduledTask.start();
             } catch (RuntimeException | Error exception) {
-                this.entityTasks.remove(scheduledTask);
+                this.unregisterEntityTask(scheduledTask);
                 throw exception;
             }
             return scheduledTask;
+        });
+    }
+
+    /**
+     * Registers a wrapper, so a move notification of its entity reaches it.
+     * <p>
+     * The group of the entity is created and filled in one compute on the entity key, so a notification that
+     * reads the index observes either no group or a complete one, never a group that is still being filled.
+     */
+    private void registerEntityTask(EntityRegionScheduledTask task) {
+        this.entityTasksByEntity.compute(task.entity(), (entity, tasks) -> {
+            if (tasks == null) {
+                tasks = ConcurrentHashMap.newKeySet();
+            }
+            tasks.add(task);
+            return tasks;
         });
     }
 
@@ -1138,7 +1185,17 @@ public final class RegionThreadingEngine implements RegionThreading {
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
                 failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
-                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
+                // The ownership publication is timed on its own inside the handoff, so the cost of the
+                // deferred ownership handoff is separable from the fallback entity ticks that share the
+                // handoff segment.
+                final long publicationStart = attribution ? System.nanoTime() : 0L;
+                try {
+                    failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
+                } finally {
+                    if (attribution) {
+                        RegionEntityTickAttribution.recordDeferredPublication(System.nanoTime() - publicationStart);
+                    }
+                }
                 batch.finish();
                 this.activeTickBatches.remove(batch);
                 batch.clearExecutingOnCurrentThread();
@@ -2410,10 +2467,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.entityTransferJournal.clearPendingFor(level);
                     this.pendingDeferredEntityMoves.removeIf(move -> move.destination().level() == level);
                     this.regionizer.clearLevel(level);
-                    for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
+                    for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                         if (task.isOwnedBy(level)) {
                             task.cancel();
-                            this.entityTasks.remove(task);
                         }
                     }
                 }
@@ -2545,14 +2601,118 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private void applyDeferredEntityUpdates(RegionEntityTickBatch batch) {
         final List<DeferredEntityMove> waiting = this.pendingDeferredEntityMovesSnapshot();
-        for (final RegionEntityTickBatch.DeferredEntityUpdate update : batch.drainDeferredUpdates()) {
-            this.applyDeferredEntityUpdate(update.entity(), update.destination(), 0);
-        }
+        this.applyDeferredEntityUpdateBatch(batch.drainDeferredUpdates(), batch.level());
         for (final DeferredEntityMove move : waiting) {
             if (this.claimPendingDeferredEntityMove(move)) {
                 this.applyDeferredEntityUpdate(move.entity(), move.destination(), move.attempts());
             }
         }
+    }
+
+    /**
+     * Publishes the deferred ownership updates drained from one barrier, in one regionizer write scope.
+     * <p>
+     * An update the barrier cannot trust to the batch - a removed or cross-level entity, a destination that
+     * was not captured in the entity's current level, a shut-down engine or a barrier that is not the server
+     * thread - keeps the per-entity path, which is what the barrier did for every update before the batch
+     * existed. Every other update is handed to
+     * {@link ThreadedRegionizer#publishEntityMoves(List)}: the regionizer validates the whole list and then
+     * publishes the untracked entities and the no-ops under one write lock, so the common case of a tick that
+     * only re-observes the region of every entity costs one write-lock scope and no mapping write at all.
+     * <p>
+     * The moves that name another region than the published one are not written by the batch. They are
+     * returned as transfers and keep the recorded transfer transaction, which never writes a region that a
+     * worker is ticking and defers a busy handoff to the next barrier, exactly like before. A batch the
+     * regionizer refused as a whole (a closed regionizer or level identity, a level mismatch, a retired
+     * destination) is counted and published per entity instead, which keeps the legacy behavior of a barrier
+     * that cannot batch.
+     */
+    private void applyDeferredEntityUpdateBatch(List<RegionEntityTickBatch.DeferredEntityUpdate> updates, ServerLevel batchLevel) {
+        if (updates.isEmpty()) {
+            return;
+        }
+        final List<ThreadedRegionizer.OwnerMove> moves = new ArrayList<>(updates.size());
+        final List<RegionEntityTickBatch.DeferredEntityUpdate> perEntity = new ArrayList<>(0);
+        final boolean batchable = this.canBatchDeferredEntityMoves(batchLevel);
+        for (final RegionEntityTickBatch.DeferredEntityUpdate update : updates) {
+            if (batchable && this.isBatchableDeferredEntityMove(update)) {
+                moves.add(new ThreadedRegionizer.OwnerMove(update.entity(), update.destination()));
+            } else {
+                perEntity.add(update);
+            }
+        }
+        if (!moves.isEmpty()) {
+            final ThreadedRegionizer.MoveBatchResult result = this.regionizer.publishEntityMoves(moves);
+            if (result.applied()) {
+                this.publishDeferredEntityMoveBatch(result);
+            } else {
+                this.refusedDeferredEntityMoveBatchCount.incrementAndGet();
+                for (final ThreadedRegionizer.OwnerMove move : moves) {
+                    this.applyDeferredEntityUpdate(move.entity(), move.destination(), 0);
+                }
+            }
+        }
+        for (final RegionEntityTickBatch.DeferredEntityUpdate update : perEntity) {
+            this.applyDeferredEntityUpdate(update.entity(), update.destination(), 0);
+        }
+    }
+
+    /**
+     * Applies the result of a batch publication: counts it, notifies the entities that have scheduled tasks
+     * and hands the cross-region moves to the recorded transfer transaction.
+     * <p>
+     * A move notification only reaches the registered wrappers of its own entity, so exactly the entities that
+     * have one are notified. That includes the unchanged moves: a task whose entity stayed in its region does
+     * not need the notification, but a task that was scheduled in a region the entity has already left is
+     * migrated by it, so the notification is never dropped for an entity that has a task. An entity without a
+     * wrapper has nothing to migrate, so the scan is skipped for it - which is the whole population of a tick
+     * in the common case.
+     */
+    private void publishDeferredEntityMoveBatch(ThreadedRegionizer.MoveBatchResult result) {
+        this.batchedDeferredEntityMoveCount.addAndGet(result.published().size() + result.transfers().size());
+        this.unchangedDeferredEntityMoveCount.addAndGet(result.unchanged().size());
+        if (!this.entityTasksByEntity.isEmpty()) {
+            for (final Entity entity : result.published()) {
+                this.notifyEntityMoved(entity);
+            }
+            for (final Entity entity : result.unchanged()) {
+                this.notifyEntityMoved(entity);
+            }
+        }
+        for (final ThreadedRegionizer.OwnerMove move : result.transfers()) {
+            this.applyDeferredEntityUpdate(move.entity(), move.destination(), 0);
+        }
+    }
+
+    /**
+     * {@return true when this barrier may hand its deferred updates to the regionizer batch}
+     * <p>
+     * The regionizer storage is server-owned, and the batch publishes mappings on the thread that calls it. A
+     * barrier that is not the server thread owning the level of the batch, or that runs after the engine shut
+     * down, therefore keeps the per-entity publication instead.
+     */
+    private boolean canBatchDeferredEntityMoves(ServerLevel batchLevel) {
+        if (this.shutdown) {
+            return false;
+        }
+        final MinecraftServer server = batchLevel.getServer();
+        return server != null && server.isSameThread();
+    }
+
+    /**
+     * {@return true when {@code update} can be published by the regionizer batch}
+     * <p>
+     * The update carries the destination its deferring thread captured, so the batch only needs the entity to
+     * be alive, added to a server level, and to name that level: a removed entity is published as a removal
+     * and a destination outside the entity's current level keeps the vanilla publish from the live position,
+     * both exactly like the per-entity path does.
+     */
+    private boolean isBatchableDeferredEntityMove(RegionEntityTickBatch.DeferredEntityUpdate update) {
+        final RegionCoordinate destination = update.destination();
+        if (destination == null || update.entity().isRemoved()) {
+            return false;
+        }
+        return update.entity().level() instanceof ServerLevel level && destination.level() == level;
     }
 
     /**
@@ -2635,6 +2795,11 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * Applies one deferred ownership change at the entity batch barrier.
+     * <p>
+     * This is the per-entity path of the barrier: the ownership updates of a barrier are published by
+     * {@link #applyDeferredEntityUpdateBatch(List, ServerLevel)}, and this path serves the updates that batch
+     * cannot carry (a removed or cross-level entity, a refused batch) and the recorded transfers, busy retries
+     * and no-ops it hands back.
      * <p>
      * The destination was captured by the deferring thread and is committed through the recorded transfer
      * transaction, so the barrier decides it exactly once. The transaction is a bookmark, not a new
@@ -3126,21 +3291,61 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
     }
 
+    /**
+     * Notifies the registered scheduled tasks of {@code entity} that its region may have moved.
+     * <p>
+     * Only the wrappers of this entity are reached, so an entity without a wrapper costs one lookup and
+     * nothing else. {@link EntityRegionScheduledTask#onEntityMoved()} migrates a task that waits in another
+     * region and returns early when the entity still resolves to the region the task was scheduled for, so a
+     * notification for an unchanged mapping is never a migration.
+     */
     private void notifyEntityMoved(Entity entity) {
-        for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
-            if (task.isFor(entity)) {
-                task.onEntityMoved();
-            }
+        final Set<EntityRegionScheduledTask> tasks = this.entityTasksByEntity.get(entity);
+        if (tasks == null) {
+            return;
+        }
+        for (final EntityRegionScheduledTask task : List.copyOf(tasks)) {
+            task.onEntityMoved();
         }
     }
 
     private void cancelEntityTasks(Entity entity) {
-        for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
-            if (task.isFor(entity)) {
-                task.cancel();
-                this.entityTasks.remove(task);
-            }
+        final Set<EntityRegionScheduledTask> tasks = this.entityTasksByEntity.get(entity);
+        if (tasks == null) {
+            return;
         }
+        for (final EntityRegionScheduledTask task : List.copyOf(tasks)) {
+            task.cancel();
+        }
+    }
+
+    /**
+     * {@return every registered wrapper, so a lifecycle cleanup that retires a whole level or the engine
+     * itself can cancel them}
+     */
+    private List<EntityRegionScheduledTask> entityTaskSnapshot() {
+        final List<EntityRegionScheduledTask> snapshot = new ArrayList<>();
+        for (final Set<EntityRegionScheduledTask> tasks : this.entityTasksByEntity.values()) {
+            snapshot.addAll(tasks);
+        }
+        return snapshot;
+    }
+
+    /** {@return the number of registered wrappers, one per scheduled entity task} */
+    private int entityTaskCount() {
+        int count = 0;
+        for (final Set<EntityRegionScheduledTask> tasks : this.entityTasksByEntity.values()) {
+            count += tasks.size();
+        }
+        return count;
+    }
+
+    /**
+     * Records that a move notification had to migrate a scheduled task to the region that now contains its
+     * entity.
+     */
+    void recordEntityTaskMigration() {
+        this.entityTaskMigrationCount.incrementAndGet();
     }
 
     void publishEntityRemoval(Entity entity) {
@@ -3162,7 +3367,10 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     void unregisterEntityTask(EntityRegionScheduledTask task) {
-        this.entityTasks.remove(task);
+        this.entityTasksByEntity.computeIfPresent(task.entity(), (entity, tasks) -> {
+            tasks.remove(task);
+            return tasks.isEmpty() ? null : tasks;
+        });
     }
 
     /**
@@ -3181,7 +3389,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.regionizer.splitCheckRequestCount(),
                 this.regionizer.mergeCheckRequestCount(),
                 this.regionizer.entityCount(),
-                this.entityTasks.size(),
+                this.entityTaskCount(),
                 this.workerPool.threadCount(),
                 this.workerExecutionEnabled,
                 this.globalWorkerExecutionEnabled,
@@ -3231,7 +3439,12 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.droppedDeferredSectionUpdateCount.get(),
                 RegionWorkerChunkUnavailableException.refusalCount(),
                 this.chunkFallbackEntityTicks.get(),
-                this.chunkPreloadRefusedEntityTicks.get());
+                this.chunkPreloadRefusedEntityTicks.get(),
+                this.regionizer.writeLockAcquisitionCount(),
+                this.batchedDeferredEntityMoveCount.get(),
+                this.unchangedDeferredEntityMoveCount.get(),
+                this.refusedDeferredEntityMoveBatchCount.get(),
+                this.entityTaskMigrationCount.get());
     }
 
     /**
@@ -3279,10 +3492,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // submissions are allowed now, and all queued handoffs finish on this server thread.
                 this.regionizer.forEach(region -> this.drainRegionState(region));
                 this.globalRegion.clearTasks();
-                for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
+                for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                     task.cancel();
                 }
-                this.entityTasks.clear();
+                this.entityTasksByEntity.clear();
                 this.regionizer.clear();
                 this.workerPool.close();
             } finally {

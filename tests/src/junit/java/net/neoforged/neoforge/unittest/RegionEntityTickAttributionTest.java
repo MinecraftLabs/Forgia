@@ -35,6 +35,7 @@ class RegionEntityTickAttributionTest {
         RegionEntityTickAttribution.recordLease(1_000L);
         RegionEntityTickAttribution.recordAwait(1_000L);
         RegionEntityTickAttribution.recordHandoff(1_000L);
+        RegionEntityTickAttribution.recordDeferredPublication(1_000L);
         RegionEntityTickAttribution.endSlice();
 
         final RegionEntityTickAttribution.Snapshot snapshot = RegionEntityTickAttribution.snapshot();
@@ -44,6 +45,7 @@ class RegionEntityTickAttributionTest {
         assertEquals(0L, snapshot.leaseNanos());
         assertEquals(0L, snapshot.awaitNanos());
         assertEquals(0L, snapshot.handoffNanos());
+        assertEquals(0L, snapshot.deferredPublicationNanos());
         assertEquals(0L, snapshot.sliceNanos());
     }
 
@@ -56,6 +58,7 @@ class RegionEntityTickAttributionTest {
         RegionEntityTickAttribution.recordLease(1_000L);
         RegionEntityTickAttribution.recordAwait(2_000L);
         RegionEntityTickAttribution.recordHandoff(3_000L);
+        RegionEntityTickAttribution.recordDeferredPublication(2_500L);
         RegionEntityTickAttribution.endSlice();
 
         final RegionEntityTickAttribution.Snapshot snapshot = RegionEntityTickAttribution.snapshot();
@@ -64,6 +67,7 @@ class RegionEntityTickAttributionTest {
         assertEquals(1_000L, snapshot.leaseNanos());
         assertEquals(2_000L, snapshot.awaitNanos());
         assertEquals(3_000L, snapshot.handoffNanos());
+        assertEquals(2_500L, snapshot.deferredPublicationNanos());
         // The plan segment is the wall time from the open slice to the batch submission, so it is bounded by
         // the slice.
         assertTrue(snapshot.planNanos() >= 0L);
@@ -82,6 +86,7 @@ class RegionEntityTickAttributionTest {
         assertEquals(0L, snapshot.leaseNanos());
         assertEquals(0L, snapshot.awaitNanos());
         assertEquals(0L, snapshot.handoffNanos());
+        assertEquals(0L, snapshot.deferredPublicationNanos());
         assertTrue(snapshot.sliceNanos() >= snapshot.planNanos());
     }
 

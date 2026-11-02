@@ -13,7 +13,8 @@ import org.jetbrains.annotations.ApiStatus;
  * The slice starts where the level begins collecting the entities of its entity tick pass and ends where the
  * pass returns, so it covers the whole server-thread entity slice of one level tick. Inside the slice the
  * instrumentation accumulates three segments: the region lease acquisition, the wait for the batch barrier
- * and the deferred work that runs after the barrier. The rest of the slice is the collection and admission
+ * and the deferred work that runs after the barrier; the deferred ownership publication inside that deferred
+ * work is accumulated as its own sub-segment. The rest of the slice is the collection and admission
  * of the entities before the batch, which is closed by {@link #endPlanSegment()} exactly like the plan
  * segment of the block-entity attribution.
  * <p>
@@ -37,6 +38,7 @@ public final class RegionEntityTickAttribution {
     private static long leaseNanos;
     private static long awaitNanos;
     private static long handoffNanos;
+    private static long deferredPublicationNanos;
     private static long sliceNanos;
     private static long sliceCount;
 
@@ -66,6 +68,7 @@ public final class RegionEntityTickAttribution {
         leaseNanos = 0L;
         awaitNanos = 0L;
         handoffNanos = 0L;
+        deferredPublicationNanos = 0L;
         sliceNanos = 0L;
         sliceCount = 0L;
     }
@@ -142,10 +145,21 @@ public final class RegionEntityTickAttribution {
     }
 
     /**
+     * Adds the part of the handoff the server thread spent applying the deferred ownership updates of the
+     * barrier, so the publication of the ownership handoff is separable from the fallback entity ticks that
+     * run in the same segment.
+     */
+    public static void recordDeferredPublication(long durationNanos) {
+        if (enabled) {
+            deferredPublicationNanos += durationNanos;
+        }
+    }
+
+    /**
      * {@return the accumulated attribution of the server thread so far}
      */
     public static Snapshot snapshot() {
-        return new Snapshot(planNanos, leaseNanos, awaitNanos, handoffNanos, sliceNanos, sliceCount);
+        return new Snapshot(planNanos, leaseNanos, awaitNanos, handoffNanos, deferredPublicationNanos, sliceNanos, sliceCount);
     }
 
     /**
@@ -159,6 +173,7 @@ public final class RegionEntityTickAttribution {
             long leaseNanos,
             long awaitNanos,
             long handoffNanos,
+            long deferredPublicationNanos,
             long sliceNanos,
             long sliceCount) {}
 }
