@@ -45,6 +45,7 @@ import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
+import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -66,8 +67,9 @@ import net.neoforged.testframework.gametest.ExtendedGameTestHelper;
  * The furnace test also enables {@link RegionBlockEntityTickAttribution} for its window and reports the
  * per-tick wall time of the server-thread block-entity slice segments: the plan collection, the region lease
  * acquisition, the wait for the worker batch, the deferred work after the barrier and the whole slice. The
- * attribution is disabled again when the window ends, so the entity test and every other batch stay
- * uninstrumented.
+ * entity worker test enables the equivalent {@link RegionEntityTickAttribution} for its window and reports
+ * the same segments of the server-thread entity slice. Both attributions are disabled again when their
+ * window ends, so the other batches stay uninstrumented.
  * <p>
  * The furnace workload places {@value #FURNACE_COUNT} lit furnaces by default, or as many as the
  * {@value #FURNACE_COUNT_PROPERTY} property asks for; they smelt and burn for the whole window, so every
@@ -128,10 +130,17 @@ public class ServerLoadBenchmarkGameTests {
     /** Radius of the entity-ticking chunk ticket of the forced grid. */
     private static final int ENTITY_TICKING_TICKET_RADIUS = 2;
     /**
-     * Zombies of the entity worker diagnostics workload. The population only has to keep the region workers
-     * busy; the reported numbers are per operation, not per entity.
+     * Zombies of the entity worker diagnostics workload when {@value #ZOMBIE_COUNT_PROPERTY} is unset. The
+     * population only has to keep the region workers busy; the reported numbers are per operation, not per
+     * entity.
      */
     private static final int ENTITY_WORKER_ZOMBIE_COUNT = 64;
+    /**
+     * System property that overrides {@link #ENTITY_WORKER_ZOMBIE_COUNT}, so the population of the entity
+     * worker workload can be varied without editing the test. An unparsable or negative value fails instead
+     * of silently measuring the default population.
+     */
+    static final String ZOMBIE_COUNT_PROPERTY = "neoforge.serverBenchmarkZombies";
     /**
      * Message prefix of {@code RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess}. The suffix
      * is the operation the guard rejected, so the blocker table is keyed by that operation.
@@ -146,7 +155,7 @@ public class ServerLoadBenchmarkGameTests {
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -286,6 +295,10 @@ public class ServerLoadBenchmarkGameTests {
      * the server config are changed by the run. The guards stay untouched: a rejected operation is still
      * rejected and counted, only the batch is kept alive so one run can collect the whole blocker list
      * instead of the first blocker.
+     * <p>
+     * A run without an installed engine (region threading off) has nothing to replace: the workload then
+     * ticks its entities inline on the server thread and reports the server-thread reference row for the
+     * same grid, population and window.
      */
     @GameTest(batch = "benchmarkEntityWorkers", timeoutTicks = 2000)
     @EmptyTemplate(value = "15x10x15", floor = true)
@@ -300,10 +313,11 @@ public class ServerLoadBenchmarkGameTests {
             final ServerLevel level = helper.getLevel();
             final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
             final List<ChunkPos> grid = gridChunks(origin);
-            final List<Zombie> zombies = new ArrayList<>(ENTITY_WORKER_ZOMBIE_COUNT);
+            final List<Zombie> zombies = new ArrayList<>(entityWorkerZombieCount());
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
             final EntityWorkerBlockers blockers = new EntityWorkerBlockers();
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<RegionEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionEntityTickAttribution.snapshot());
             final AtomicReference<InstalledEngine> replaced = new AtomicReference<>();
             final AtomicBoolean cleaned = new AtomicBoolean();
             final GameRules.BooleanValue daylight = level.getGameRules().getRule(GameRules.RULE_DAYLIGHT);
@@ -327,8 +341,13 @@ public class ServerLoadBenchmarkGameTests {
                         spawnZombies(level, grid, origin, zombies, helper);
                     })
                     .thenExecute(() -> {
-                        replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()));
+                        replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()).orElse(null));
+                        // The attribution is reported per measured tick, so it is reset when the warmup
+                        // ends and the warmup itself stays unmeasured.
+                        sampler.onMeasuredWindowStart(RegionEntityTickAttribution::reset);
+                        RegionEntityTickAttribution.setEnabled(true);
                         before.set(RegionThreadingHooks.diagnostics());
+                        attributionBefore.set(RegionEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
                     })
@@ -336,7 +355,7 @@ public class ServerLoadBenchmarkGameTests {
                     .thenExecute(() -> {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         // The counters of the diagnostic engine are read before it is replaced again.
-                        reportEntityWorkers(helper, sampler, before.get(), zombies, blockers, grid.size());
+                        reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), zombies, blockers, grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, Optional.ofNullable(replaced.get()));
                         }
@@ -394,25 +413,41 @@ public class ServerLoadBenchmarkGameTests {
     /**
      * {@return the number of furnaces of this run, {@value #FURNACE_COUNT} unless
      * {@value #FURNACE_COUNT_PROPERTY} overrides it}
-     * <p>
-     * An unparsable override fails instead of silently measuring the default workload, so a mistyped
-     * measurement knob cannot produce a row that looks like a different profile.
      */
     private static int furnaceCount() {
-        final String configured = System.getProperty(FURNACE_COUNT_PROPERTY);
+        return intProperty(FURNACE_COUNT_PROPERTY, FURNACE_COUNT);
+    }
+
+    /**
+     * {@return the population of the entity worker diagnostics workload,
+     * {@value #ENTITY_WORKER_ZOMBIE_COUNT} unless {@value #ZOMBIE_COUNT_PROPERTY} overrides it}
+     */
+    private static int entityWorkerZombieCount() {
+        return intProperty(ZOMBIE_COUNT_PROPERTY, ENTITY_WORKER_ZOMBIE_COUNT);
+    }
+
+    /**
+     * {@return the integer value of the system property {@code key}, or {@code defaultValue} when it is
+     * unset or blank}
+     * <p>
+     * An unparsable or negative override fails instead of silently measuring the default workload, so a
+     * mistyped measurement knob cannot produce a row that looks like a different profile.
+     */
+    private static int intProperty(String key, int defaultValue) {
+        final String configured = System.getProperty(key);
         if (configured == null || configured.isBlank()) {
-            return FURNACE_COUNT;
+            return defaultValue;
         }
-        final int count;
+        final int value;
         try {
-            count = Integer.parseInt(configured.trim());
+            value = Integer.parseInt(configured.trim());
         } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException(FURNACE_COUNT_PROPERTY + " is not an integer: " + configured, exception);
+            throw new IllegalArgumentException(key + " is not an integer: " + configured, exception);
         }
-        if (count < 0) {
-            throw new IllegalArgumentException(FURNACE_COUNT_PROPERTY + " must not be negative: " + count);
+        if (value < 0) {
+            throw new IllegalArgumentException(key + " must not be negative: " + value);
         }
-        return count;
+        return value;
     }
 
     /**
@@ -680,7 +715,8 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Zombie> zombies, ExtendedGameTestHelper helper) {
         final RandomSource random = RandomSource.create(0x5EED5EEDL);
-        for (int index = 0; index < ENTITY_WORKER_ZOMBIE_COUNT; index++) {
+        final int count = entityWorkerZombieCount();
+        for (int index = 0; index < count; index++) {
             final ChunkPos chunk = grid.get(index % grid.size());
             final Zombie zombie = new Zombie(EntityType.ZOMBIE, level);
             zombie.moveTo(chunk.getMinBlockX() + 8.5, origin.getY() + 2, chunk.getMinBlockZ() + 8.5, random.nextFloat() * 360.0F, 0.0F);
@@ -698,6 +734,7 @@ public class ServerLoadBenchmarkGameTests {
      * the diagnostic engine installed or the grid forced.
      */
     private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Zombie> zombies, GameRules.BooleanValue daylight, boolean previousDaylight, Optional<InstalledEngine> replaced) {
+        RegionEntityTickAttribution.setEnabled(false);
         for (Zombie zombie : zombies) {
             zombie.discard();
         }
@@ -718,10 +755,17 @@ public class ServerLoadBenchmarkGameTests {
      *
      * @param entityTickWorkers whether entity ticks execute on the region workers, or stay on the server
      *                          thread for the reference measurement
-     * @return the flags and layout of the replaced engine, so the configured engine can be rebuilt afterwards
+     * @return the flags and layout of the replaced engine, so the configured engine can be rebuilt
+     *         afterwards, or empty when no engine is installed: the workload then ticks its entities
+     *         inline on the server thread, which is the server-thread reference row
      */
-    private static InstalledEngine installEntityWorkerEngine(EntityWorkerBlockers blockers, boolean entityTickWorkers) {
-        final RegionThreading installed = RegionThreadingManager.getOrThrow();
+    private static Optional<InstalledEngine> installEntityWorkerEngine(EntityWorkerBlockers blockers, boolean entityTickWorkers) {
+        final RegionThreading installed = RegionThreadingManager.currentOrNull();
+        if (installed == null) {
+            // Region threading is off for this run: there is no engine to replace, and the workload ticks
+            // its entities inline on the server thread exactly like the vanilla level tick.
+            return Optional.empty();
+        }
         if (!(installed instanceof RegionThreadingEngine configured)) {
             throw new IllegalStateException("the entity worker diagnostics need the native region threading engine, got " + installed.getClass().getName());
         }
@@ -730,7 +774,7 @@ public class ServerLoadBenchmarkGameTests {
         final RegionThreadingEngine diagnostic = replaced.rebuild(entityTickWorkers, RegionEntityStorageMode.REGION_OWNED);
         diagnostic.setEntityTickFailureObserverForTesting(blockers::record);
         RegionThreadingManager.install(diagnostic);
-        return replaced;
+        return Optional.of(replaced);
     }
 
     /**
@@ -770,15 +814,20 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
-     * Prints the entity worker diagnostics: the counters of the measured window, the region mismatches and
-     * one line per rejected operation, ordered by count.
+     * Prints the entity worker diagnostics: the counters of the measured window, the per-tick attribution of
+     * the entity tick slice, the region mismatches and one line per rejected operation, ordered by count.
+     * <p>
+     * The attribution columns are the deltas over the measured window divided by the number of measured
+     * slices (the {@code sliceSamples} column), so each one is the per-tick wall time of that segment. A
+     * segment that never ran in the window reports {@code 0}, and a window without slices reports {@code -1}.
      */
-    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, List<Zombie> zombies, EntityWorkerBlockers blockers, int chunks) {
+    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionEntityTickAttribution.Snapshot attributionBefore, RegionEntityTickAttribution.Snapshot attributionAfter, List<Zombie> zombies, EntityWorkerBlockers blockers, int chunks) {
         final long[] sorted = sampler.sortedSamples();
         helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
         final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
         final String profile = profileName(after);
         final int mismatches = regionMismatches(helper.getLevel(), zombies);
+        final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
         int survivors = 0;
         for (Zombie zombie : zombies) {
             if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
@@ -798,13 +847,14 @@ public class ServerLoadBenchmarkGameTests {
                 + " zombieSurvivors=" + survivors + "/" + zombies.size()
                 + " regionMismatches=" + mismatches
                 + " entityTickFailures=" + blockers.failureCount()
-                + " distinctBlockers=" + blockers.blockerCount());
+                + " distinctBlockers=" + blockers.blockerCount()
+                + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
-                ENTITY_WORKER_ZOMBIE_COUNT,
+                entityWorkerZombieCount(),
                 chunks,
                 averageMillis(sorted),
                 percentileMillis(sorted, 0.50),
@@ -835,7 +885,13 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::chunkFallbackEntityTicks),
                 delta(before, after, RegionThreadingDiagnostics::chunkPreloadRefusedEntityTicks),
                 RegionThreadingEngine.entityTickChunkMargin(),
-                entityTickMode(after));
+                entityTickMode(after),
+                millisPerSlice(attributionAfter.planNanos() - attributionBefore.planNanos(), slices),
+                millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
+                millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
+                millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
+                slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);
         blockers.printBlockers();
     }
@@ -843,9 +899,12 @@ public class ServerLoadBenchmarkGameTests {
     /**
      * {@return the entity tick mode of the measured window, so a worker row and its server-thread reference
      * row are distinguishable in the CSV}
+     * <p>
+     * A run without an installed engine ticks its entities on the server thread, so it reports the server
+     * mode as well.
      */
     private static String entityTickMode(Optional<RegionThreadingDiagnostics> diagnostics) {
-        return diagnostics.map(value -> value.entityTickWorkerExecutionEnabled() ? "worker" : "server").orElse("none");
+        return diagnostics.map(value -> value.entityTickWorkerExecutionEnabled() ? "worker" : "server").orElse("server");
     }
 
     /**

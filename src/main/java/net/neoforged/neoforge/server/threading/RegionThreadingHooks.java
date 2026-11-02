@@ -25,6 +25,7 @@ import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope;
+import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
@@ -356,6 +357,10 @@ public final class RegionThreadingHooks {
 
     /**
      * Starts collecting the entities of the current level tick that should tick on region workers.
+     * <p>
+     * The call opens the slice of the opt-in entity tick attribution, which is closed by
+     * {@link #runEntityTickPlan(RegionEntityTickPlan)} and stays disabled unless a diagnostics run enables
+     * it.
      *
      * @param inEntityTickingRange the vanilla entity ticking range predicate, evaluated on the server thread
      * @param barrier              waits for the submitted region work on the server thread
@@ -363,6 +368,7 @@ public final class RegionThreadingHooks {
      */
     @Nullable
     public static RegionEntityTickPlan beginEntityTickPlan(ServerLevel level, Predicate<Entity> inEntityTickingRange, RegionTickBarrier barrier) {
+        RegionEntityTickAttribution.beginSlice();
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine) {
             return engine.beginEntityTickPlan(level, inEntityTickingRange, barrier);
@@ -374,8 +380,14 @@ public final class RegionThreadingHooks {
      * Ticks the entities collected by {@code plan} on region workers and waits for the batch.
      */
     public static void runEntityTickPlan(@Nullable RegionEntityTickPlan plan) {
-        if (plan != null) {
-            plan.executeAndAwait();
+        try {
+            if (plan != null) {
+                plan.executeAndAwait();
+            }
+        } finally {
+            // The slice covers the whole entity pass, including a failing batch: the attribution only
+            // measures, so it must not lose the slice of a tick that threw.
+            RegionEntityTickAttribution.endSlice();
         }
     }
 

@@ -1100,32 +1100,53 @@ public final class RegionThreadingEngine implements RegionThreading {
         // This thread owns the batch until it finished; a shutdown or unload requested from inside it
         // (deferred work included) cannot wait for a batch that only this thread can complete.
         batch.markExecutingOnCurrentThread();
+        // The opt-in attribution is decided once per batch, never per entity: a disabled attribution only
+        // costs this one volatile read and takes no timestamp.
+        final boolean attribution = RegionEntityTickAttribution.isEnabled();
         Throwable failure = null;
         try {
+            final long leaseStart = attribution ? System.nanoTime() : 0L;
             try {
                 this.leaseEntityTickGroups(batch, pending, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
-                try {
-                    batch.submitAndAwait(this.workerPool, barrier);
-                } catch (Throwable throwable) {
-                    if (failure == null) {
-                        failure = throwable;
-                    }
+                if (attribution) {
+                    RegionEntityTickAttribution.recordLease(System.nanoTime() - leaseStart);
+                }
+            }
+            final long awaitStart = attribution ? System.nanoTime() : 0L;
+            try {
+                batch.submitAndAwait(this.workerPool, barrier);
+            } catch (Throwable throwable) {
+                if (failure == null) {
+                    failure = throwable;
+                }
+            } finally {
+                if (attribution) {
+                    RegionEntityTickAttribution.recordAwait(System.nanoTime() - awaitStart);
                 }
             }
         } finally {
-            // The section publication and the target chunk acquisition of a worker entity move are the
-            // vanilla effects of the move itself, so they run before any other server-thread work observes
-            // the entity and before the ownership handoff of the batch commits a new region.
-            failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
-            failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
-            failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
-            failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
-            batch.finish();
-            this.activeTickBatches.remove(batch);
-            batch.clearExecutingOnCurrentThread();
+            // The deferred work after the barrier is measured as its own segment, so the fallback ticks and
+            // the section publication are reported instead of being folded into the barrier wait.
+            final long handoffStart = attribution ? System.nanoTime() : 0L;
+            try {
+                // The section publication and the target chunk acquisition of a worker entity move are the
+                // vanilla effects of the move itself, so they run before any other server-thread work observes
+                // the entity and before the ownership handoff of the batch commits a new region.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
+                failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
+                failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
+                batch.finish();
+                this.activeTickBatches.remove(batch);
+                batch.clearExecutingOnCurrentThread();
+            } finally {
+                if (attribution) {
+                    RegionEntityTickAttribution.recordHandoff(System.nanoTime() - handoffStart);
+                }
+            }
         }
 
         if (failure != null) {

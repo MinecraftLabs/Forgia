@@ -78,6 +78,9 @@ public final class RegionEntityTickPlan {
 
     @org.jetbrains.annotations.VisibleForTesting
     public void executeAndAwait(RegionTickBarrier barrier) {
+        // The server thread is done collecting and admitting the entities; the attribution of the slice
+        // closes its plan segment here, before the batch is published.
+        RegionEntityTickAttribution.endPlanSegment();
         try {
             this.engine.tickEntities(this.level, this.accepted, barrier);
         } finally {
