@@ -123,6 +123,16 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private volatile boolean legacyEntityQueryHandoffForTesting;
     /**
+     * Diagnostics-only observer of a worker entity tick failure.
+     * <p>
+     * The entity worker diagnostics benchmark installs it so one failing tick is recorded and the group
+     * continues with the next entity; the production tick loop has no catch and lets the first failure
+     * abort the group, the batch and the level tick. Production leaves this {@code null}, so the worker
+     * body keeps the vanilla failure path.
+     */
+    @Nullable
+    private volatile BiConsumer<Entity, Throwable> entityTickFailureObserverForTesting;
+    /**
      * Random source of the scheduled tick group that executes on the current thread. It is only set for
      * the duration of a worker group, so {@link #scheduledTickRandom()} returns {@code null} everywhere
      * else and the vanilla level random stays authoritative outside a batch.
@@ -868,6 +878,23 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Installs the diagnostics-only observer of worker entity tick failures, or removes it with
+     * {@code null}.
+     * <p>
+     * Only the entity worker diagnostics benchmark calls this. Every failing tick is reported to the
+     * observer and the group continues with its next entity, so one run collects every blocked operation
+     * instead of only the first one. A tick that fails under an observer also skips the vanilla crash-report
+     * wrapper, which would build a crash report - and with it a system hardware enumeration - per rejection.
+     * Without an observer the worker body has no catch: the first failure reaches {@code guardEntityTick}
+     * (which turns it into a {@code ReportedException}), fails the group, and
+     * {@code RegionTickBatch#throwIfFailed()} rethrows it on the server thread.
+     */
+    @ApiStatus.Internal
+    public void setEntityTickFailureObserverForTesting(@Nullable BiConsumer<Entity, Throwable> observer) {
+        this.entityTickFailureObserverForTesting = observer;
+    }
+
+    /**
      * {@return the random source of the random tick group executing on the current thread, or
      * {@code null} outside a random tick worker group}
      */
@@ -1190,18 +1217,25 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // The entity ownership lease covers exactly this worker tick loop: it is opened after the
                 // region lease and closed before it, so a worker task outside the loop never sees it.
                 final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                final BiConsumer<Entity, Throwable> failureObserver = this.entityTickFailureObserverForTesting;
                 try {
                     this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
                         for (final Entity entity : entities) {
-                            if (entity.isRemoved()) {
+                            if (failureObserver == null) {
+                                if (tickOwnedEntity(level, entity)) {
+                                    ++ticked[0];
+                                }
                                 continue;
                             }
-                            entity.checkDespawn();
-                            if (entity.isRemoved()) {
-                                continue;
+                            try {
+                                if (tickOwnedEntityForDiagnostics(level, entity)) {
+                                    ++ticked[0];
+                                }
+                            } catch (Throwable throwable) {
+                                // Diagnostics only: the observer records the rejected operation and the group
+                                // keeps ticking its remaining entities instead of aborting the batch.
+                                failureObserver.accept(entity, throwable);
                             }
-                            level.guardEntityTick(level::tickNonPassenger, entity);
-                            ++ticked[0];
                         }
                     });
                 } finally {
@@ -1217,6 +1251,50 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.regionizer.removeIfEmpty(region);
             }
         };
+    }
+
+    /**
+     * Ticks one entity of a worker group: the vanilla despawn check followed by the non-passenger tick.
+     *
+     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
+     */
+    private static boolean tickOwnedEntity(ServerLevel level, Entity entity) {
+        if (!prepareOwnedEntityTick(entity)) {
+            return false;
+        }
+        level.guardEntityTick(level::tickNonPassenger, entity);
+        return true;
+    }
+
+    /**
+     * Diagnostics counterpart of {@link #tickOwnedEntity(ServerLevel, Entity)}: the same despawn check and
+     * non-passenger tick, but without the vanilla crash-report wrapper.
+     * <p>
+     * Building a crash report enumerates the system hardware through external processes, which costs tens of
+     * milliseconds per rejected tick and would dominate the diagnostic window; the failure itself reaches the
+     * observer unchanged.
+     *
+     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
+     */
+    private static boolean tickOwnedEntityForDiagnostics(ServerLevel level, Entity entity) {
+        if (!prepareOwnedEntityTick(entity)) {
+            return false;
+        }
+        level.tickNonPassenger(entity);
+        return true;
+    }
+
+    /**
+     * Runs the vanilla preconditions of one worker entity tick.
+     *
+     * @return {@code true} when the entity still has to be ticked
+     */
+    private static boolean prepareOwnedEntityTick(Entity entity) {
+        if (entity.isRemoved()) {
+            return false;
+        }
+        entity.checkDespawn();
+        return !entity.isRemoved();
     }
 
     /**

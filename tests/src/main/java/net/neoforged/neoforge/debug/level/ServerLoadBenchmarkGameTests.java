@@ -8,14 +8,20 @@ package net.neoforged.neoforge.debug.level;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.TicketType;
@@ -34,9 +40,14 @@ import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
+import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
+import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.testframework.DynamicTest;
 import net.neoforged.testframework.annotation.ForEachTest;
 import net.neoforged.testframework.annotation.TestHolder;
@@ -116,9 +127,21 @@ public class ServerLoadBenchmarkGameTests {
     private static final int BLOCK_TICKING_TICKET_RADIUS = 1;
     /** Radius of the entity-ticking chunk ticket of the forced grid. */
     private static final int ENTITY_TICKING_TICKET_RADIUS = 2;
+    /**
+     * Zombies of the entity worker diagnostics workload. The population only has to keep the region workers
+     * busy; the reported numbers are per operation, not per entity.
+     */
+    private static final int ENTITY_WORKER_ZOMBIE_COUNT = 64;
+    /**
+     * Message prefix of {@code RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess}. The suffix
+     * is the operation the guard rejected, so the blocker table is keyed by that operation.
+     */
+    private static final String STORAGE_ACCESS_REJECTION_PREFIX = "Native region worker attempted server-owned entity storage access: ";
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers";
+    static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
     @EmptyTemplate(value = "15x10x15", floor = true)
@@ -239,6 +262,77 @@ public class ServerLoadBenchmarkGameTests {
                             churn.discardAll();
                             daylight.set(previousDaylight, level.getServer());
                             releaseChunks(level, grid, ENTITY_TICKING_TICKET_RADIUS);
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    /**
+     * Diagnoses what blocks entity ticks on region workers: it replaces the configured engine with one that
+     * has region-owned entity storage and entity tick worker execution enabled, ticks a real zombie
+     * population on the workers for {@value #WARMUP_TICKS} warmup and {@value #MEASURED_TICKS} measured
+     * ticks, and reports every rejected operation with its count, its entity type and the first stack frame
+     * of its first failure.
+     * <p>
+     * The diagnostic engine keeps the layout, the worker count and the other slices of the configured
+     * engine, and it is rebuilt from those flags after the window, so neither the production defaults nor
+     * the server config are changed by the run. The guards stay untouched: a rejected operation is still
+     * rejected and counted, only the batch is kept alive so one run can collect the whole blocker list
+     * instead of the first blocker.
+     */
+    @GameTest(batch = "benchmarkEntityWorkers", timeoutTicks = 2000)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Diagnoses the operations that reject entity ticks on region workers; only runs when neoforge.serverBenchmark is set")
+    static void diagnosesEntityTicksOnRegionWorkers(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_BENCH_NOTE skipped entity worker diagnostics: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = gridChunks(origin);
+            final List<Zombie> zombies = new ArrayList<>(ENTITY_WORKER_ZOMBIE_COUNT);
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
+            final EntityWorkerBlockers blockers = new EntityWorkerBlockers();
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<InstalledEngine> replaced = new AtomicReference<>();
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            final GameRules.BooleanValue daylight = level.getGameRules().getRule(GameRules.RULE_DAYLIGHT);
+            final boolean previousDaylight = daylight.get();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, Optional.ofNullable(replaced.get()));
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> forceChunks(level, grid, ENTITY_TICKING_TICKET_RADIUS))
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the benchmark chunk grid never finished its entity load"))
+                    .thenExecute(() -> {
+                        // Zombies burn in daylight, so the window runs at night like the entity workload.
+                        daylight.set(false, level.getServer());
+                        level.setDayTime(18000L);
+                        spawnZombies(level, grid, origin, zombies, helper);
+                    })
+                    .thenExecute(() -> {
+                        replaced.set(installEntityWorkerEngine(blockers));
+                        before.set(RegionThreadingHooks.diagnostics());
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(sampler);
+                    })
+                    .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 1)
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        // The counters of the diagnostic engine are read before it is replaced again.
+                        reportEntityWorkers(helper, sampler, before.get(), zombies, blockers, grid.size());
+                        if (cleaned.compareAndSet(false, true)) {
+                            cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, Optional.ofNullable(replaced.get()));
                         }
                     })
                     .thenSucceed();
@@ -542,7 +636,9 @@ public class ServerLoadBenchmarkGameTests {
         helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
         final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
         final String profile = profileName(after);
-        final int mismatches = regionMismatches(helper.getLevel(), churn);
+        final List<Entity> tracked = new ArrayList<>(churn.zombies());
+        tracked.addAll(churn.items());
+        final int mismatches = regionMismatches(helper.getLevel(), tracked);
         System.out.println(sampler.note(profile, after)
                 + " zombieSurvivors=" + churn.survivors() + "/" + ZOMBIE_COUNT
                 + " itemSurvivors=" + churn.itemSurvivors() + "/" + ITEM_COUNT
@@ -571,17 +667,259 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
+     * Spawns the zombie population of the entity worker diagnostics workload, spread over the grid.
+     * <p>
+     * The zombies keep their vanilla AI and carry nothing, so the measured operations are the ones a plain
+     * {@code Zombie.tick} reaches: despawn, collisions, pathfinding, target selection and movement.
+     */
+    private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Zombie> zombies, ExtendedGameTestHelper helper) {
+        final RandomSource random = RandomSource.create(0x5EED5EEDL);
+        for (int index = 0; index < ENTITY_WORKER_ZOMBIE_COUNT; index++) {
+            final ChunkPos chunk = grid.get(index % grid.size());
+            final Zombie zombie = new Zombie(EntityType.ZOMBIE, level);
+            zombie.moveTo(chunk.getMinBlockX() + 8.5, origin.getY() + 2, chunk.getMinBlockZ() + 8.5, random.nextFloat() * 360.0F, 0.0F);
+            // Without a nearby player a mob despawns; the diagnostic needs the population to stay put.
+            zombie.setPersistenceRequired();
+            helper.assertTrue(level.addFreshEntity(zombie), "the entity worker diagnostics could not spawn a benchmark zombie");
+            zombies.add(zombie);
+        }
+    }
+
+    /**
+     * Removes the workload, rebuilds the configured engine and releases the forced grid.
+     * <p>
+     * Runs from the measured window and from the end listener, so a failing or timing-out test never leaves
+     * the diagnostic engine installed or the grid forced.
+     */
+    private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Zombie> zombies, GameRules.BooleanValue daylight, boolean previousDaylight, Optional<InstalledEngine> replaced) {
+        for (Zombie zombie : zombies) {
+            zombie.discard();
+        }
+        zombies.clear();
+        replaced.ifPresent(ServerLoadBenchmarkGameTests::restoreConfiguredEngine);
+        daylight.set(previousDaylight, level.getServer());
+        releaseChunks(level, grid, ENTITY_TICKING_TICKET_RADIUS);
+    }
+
+    /**
+     * Replaces the installed engine with the diagnostics engine of this run.
+     * <p>
+     * The diagnostic engine has the same layout, worker count and slices as the configured engine, but
+     * region-owned entity storage and entity tick worker execution enabled. The swap runs on the server
+     * thread outside any batch: {@link RegionThreadingManager#clear()} shuts the configured engine down
+     * before the diagnostic one is installed.
+     *
+     * @return the flags and layout of the replaced engine, so the configured engine can be rebuilt afterwards
+     */
+    private static InstalledEngine installEntityWorkerEngine(EntityWorkerBlockers blockers) {
+        final RegionThreading installed = RegionThreadingManager.getOrThrow();
+        if (!(installed instanceof RegionThreadingEngine configured)) {
+            throw new IllegalStateException("the entity worker diagnostics need the native region threading engine, got " + installed.getClass().getName());
+        }
+        final InstalledEngine replaced = new InstalledEngine(configured.diagnostics(), configured.regionLayout());
+        RegionThreadingManager.clear();
+        final RegionThreadingEngine diagnostic = replaced.rebuild(true, RegionEntityStorageMode.REGION_OWNED);
+        diagnostic.setEntityTickFailureObserverForTesting(blockers::record);
+        RegionThreadingManager.install(diagnostic);
+        return replaced;
+    }
+
+    /**
+     * Rebuilds the configured engine from the flags captured before the diagnostic window, so the rest of
+     * the server run keeps the configured entity storage mode and entity tick policy.
+     */
+    private static void restoreConfiguredEngine(InstalledEngine replaced) {
+        RegionThreadingManager.clear();
+        final RegionThreadingDiagnostics flags = replaced.flags();
+        RegionThreadingManager.install(replaced.rebuild(flags.entityTickWorkerExecutionEnabled(), flags.entityStorageMode()));
+    }
+
+    /**
+     * The engine flags and layout of one run: what the diagnostic engine copies and what the configured
+     * engine is rebuilt from.
+     */
+    private record InstalledEngine(RegionThreadingDiagnostics flags, RegionLayout layout) {
+        RegionThreadingEngine rebuild(boolean entityTickWorkers, RegionEntityStorageMode storageMode) {
+            return new RegionThreadingEngine(
+                    this.flags.workerThreadCount(),
+                    this.flags.workerExecutionEnabled(),
+                    this.flags.globalWorkerExecutionEnabled(),
+                    entityTickWorkers,
+                    this.flags.blockEntityTickWorkerExecutionEnabled(),
+                    this.flags.scheduledTickWorkerExecutionEnabled(),
+                    this.flags.randomTickWorkerExecutionEnabled(),
+                    this.layout,
+                    storageMode);
+        }
+    }
+
+    /**
+     * Prints the entity worker diagnostics: the counters of the measured window, the region mismatches and
+     * one line per rejected operation, ordered by count.
+     */
+    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, List<Zombie> zombies, EntityWorkerBlockers blockers, int chunks) {
+        final long[] sorted = sampler.sortedSamples();
+        helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final int mismatches = regionMismatches(helper.getLevel(), zombies);
+        int survivors = 0;
+        for (Zombie zombie : zombies) {
+            if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+                survivors++;
+            }
+        }
+        System.out.println(sampler.note(profile, after)
+                + " entityStorageMode=" + after.map(RegionThreadingDiagnostics::entityStorageMode).map(Object::toString).orElse("NONE")
+                + " zombieSurvivors=" + survivors + "/" + zombies.size()
+                + " regionMismatches=" + mismatches
+                + " entityTickFailures=" + blockers.failureCount()
+                + " distinctBlockers=" + blockers.blockerCount());
+        System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                profile,
+                after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
+                ENTITY_WORKER_ZOMBIE_COUNT,
+                chunks,
+                averageMillis(sorted),
+                percentileMillis(sorted, 0.50),
+                percentileMillis(sorted, 0.95),
+                percentileMillis(sorted, 0.99),
+                delta(before, after, RegionThreadingDiagnostics::entityTicksOnWorkers),
+                delta(before, after, RegionThreadingDiagnostics::fallbackEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::skippedEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::entityMutationsAllowedByOwnership),
+                delta(before, after, RegionThreadingDiagnostics::entityMutationsRejectedByOwnership),
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntitySectionUpdatesApplied),
+                delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntitySectionUpdates),
+                after.map(RegionThreadingDiagnostics::pendingEntityTransferCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::rememberedEntityTransferResultCount).orElse(0),
+                delta(before, after, RegionThreadingDiagnostics::rejectedEntityTransferRecordCount),
+                delta(before, after, RegionThreadingDiagnostics::legacyDeferredEntityMoveCount),
+                delta(before, after, RegionThreadingDiagnostics::retriedDeferredEntityMoveCount),
+                mismatches,
+                survivors,
+                blockers.failureCount(),
+                blockers.blockerCount());
+        System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);
+        blockers.printBlockers();
+    }
+
+    /**
+     * Collects the entity tick failures of the diagnostic window, keyed by the operation the failure names.
+     * <p>
+     * The failures are recorded on the region workers and printed on the server thread after the window, so
+     * the counts are accumulated in concurrent structures. A storage guard rejection names its operation in
+     * the message; any other failure is keyed by its throwable class.
+     */
+    private static final class EntityWorkerBlockers {
+        private final Map<String, Blocker> blockers = new ConcurrentHashMap<>();
+        private final AtomicLong failures = new AtomicLong();
+
+        void record(Entity entity, Throwable throwable) {
+            this.failures.incrementAndGet();
+            final String operation = operationName(throwable);
+            final String entityType = entityTypeName(entity);
+            this.blockers.compute(operation, (name, existing) -> {
+                final Blocker blocker = existing != null ? existing : new Blocker(name, throwable);
+                blocker.count++;
+                blocker.entityTypes.add(entityType);
+                return blocker;
+            });
+        }
+
+        long failureCount() {
+            return this.failures.get();
+        }
+
+        int blockerCount() {
+            return this.blockers.size();
+        }
+
+        void printBlockers() {
+            final List<Blocker> sorted = new ArrayList<>(this.blockers.values());
+            sorted.sort(Comparator.comparingLong((Blocker blocker) -> blocker.count).reversed());
+            for (Blocker blocker : sorted) {
+                System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_BLOCKER %s,%d,%s,%s%n",
+                        blocker.operation,
+                        blocker.count,
+                        firstFrame(blocker.firstFailure),
+                        String.join("|", blocker.entityTypes));
+                System.out.println("SERVER_BENCH_ENTITY_WORKER_STACK " + blocker.operation);
+                blocker.firstFailure.printStackTrace(System.out);
+            }
+        }
+    }
+
+    /**
+     * One rejected operation: its failure count, the entities it rejected and the first failure, which
+     * carries the stack trace the report prints once.
+     */
+    private static final class Blocker {
+        private final String operation;
+        private final Throwable firstFailure;
+        private final Set<String> entityTypes = ConcurrentHashMap.newKeySet();
+        private long count;
+
+        Blocker(String operation, Throwable firstFailure) {
+            this.operation = operation;
+            this.firstFailure = firstFailure;
+        }
+    }
+
+    /**
+     * {@return the operation a failure names, or the throwable class when it names none}
+     * <p>
+     * A storage guard rejection carries the rejected operation in its message; {@code guardEntityTick} wraps
+     * it in a crash report exception, so the cause chain is searched.
+     */
+    private static String operationName(Throwable throwable) {
+        for (Throwable current = throwable; current != null; current = current.getCause()) {
+            final String message = current.getMessage();
+            if (message != null && message.startsWith(STORAGE_ACCESS_REJECTION_PREFIX)) {
+                return message.substring(STORAGE_ACCESS_REJECTION_PREFIX.length());
+            }
+        }
+        return throwable.getClass().getName();
+    }
+
+    /**
+     * {@return the innermost cause of {@code throwable}, which is where the rejected operation threw}
+     */
+    private static Throwable deepestCause(Throwable throwable) {
+        Throwable deepest = throwable;
+        while (deepest.getCause() != null) {
+            deepest = deepest.getCause();
+        }
+        return deepest;
+    }
+
+    /**
+     * {@return the first stack frame of the innermost cause of {@code throwable}, or {@code -} when the
+     * failure carries no stack trace}
+     */
+    private static String firstFrame(Throwable throwable) {
+        final StackTraceElement[] trace = deepestCause(throwable).getStackTrace();
+        return trace.length == 0 ? "-" : trace[0].toString();
+    }
+
+    private static String entityTypeName(Entity entity) {
+        return String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()));
+    }
+
+    /**
      * {@return the number of tracked entities that are not indexed in the entity section of their position}
      * <p>
      * A section belongs to exactly one region of the installed layout, so an entity that is indexed in the
      * section of its own block position is in the region of its block position. A non-zero count means the
      * entity storage kept a stale section for a moved entity.
      */
-    private static int regionMismatches(ServerLevel level, EntityChurn churn) {
+    private static int regionMismatches(ServerLevel level, List<? extends Entity> tracked) {
         final EntitySectionStorage<Entity> storage = persistentSections(level);
         int mismatches = 0;
-        final List<Entity> tracked = new ArrayList<>(churn.zombies());
-        tracked.addAll(churn.items());
         for (Entity entity : tracked) {
             if (entity.isRemoved()) {
                 continue;
