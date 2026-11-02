@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
@@ -2203,22 +2202,28 @@ public final class RegionThreadingEngine implements RegionThreading {
      * reads the live position again, so the destination stays the one recorded here even when the entity
      * moves in between.
      * <p>
-     * Recording is a server-owned storage read: it is rejected for a native region worker before it reads
-     * the identity ledger. It answers {@code null} when no transfer can be recorded - no native engine
-     * ledger, an untracked or removed entity, a graph member without a current identity, the same source
-     * and destination region, a destination in another level, or a full journal - and the caller then keeps
-     * the vanilla path. The vanilla cross-level transfer is therefore never interrupted by an exception from
-     * this bookmark; a destination recorded in another level is simply not part of the region transaction.
+     * Recording is a server-owned storage operation: it is rejected for a native region worker before it
+     * reads the identity ledger, and for any other thread except the server thread owning the entity's
+     * level. It answers {@code null} when no transfer can be recorded - no native engine ledger, an
+     * untracked or removed entity, a graph member without a current identity, a graph that is not confined
+     * to this level, the same source and destination region, a destination in another level, or a full
+     * journal - and the caller then keeps the vanilla path. The vanilla cross-level transfer is therefore
+     * never interrupted by an exception from this bookmark; a destination in another level and a riding
+     * graph that spans levels are simply not part of the region transaction.
+     *
+     * @throws IllegalStateException when the caller is a native region worker, or any other thread except
+     *                               the server thread owning the entity's level
      */
     @ApiStatus.Internal
     @Nullable
     public RegionEntityTransferToken recordEntityRegionTransfer(Entity entity, RegionCoordinate destinationRegion) {
         RegionThreadingHooks.assertServerEntityStorageAccess("RegionThreadingEngine.recordEntityRegionTransfer");
         Objects.requireNonNull(destinationRegion, "destinationRegion");
-        if (this.shutdown || entity.isRemoved()) {
+        if (!(entity.level() instanceof ServerLevel level)) {
             return null;
         }
-        if (!(entity.level() instanceof ServerLevel level)) {
+        RegionThreadingHooks.assertServerThreadEntityTransfer(level, "RegionThreadingEngine.recordEntityRegionTransfer");
+        if (this.shutdown || entity.isRemoved()) {
             return null;
         }
         if (destinationRegion.level() != level) {
@@ -2232,15 +2237,13 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (uuid == null) {
             return null;
         }
-        final RegionEntityTransferEpochSource rootEpochs = RegionEntityTransferEpochSource.of(level.entityIdentityLedger());
-        final long identityEpoch = rootEpochs.epoch(uuid);
+        final RegionEntityTransferEpochSource epochs = RegionEntityTransferEpochSource.of(level.entityIdentityLedger());
+        final long identityEpoch = epochs.epoch(uuid);
         if (identityEpoch == RegionEntityTransferEpochSource.MISSING_EPOCH) {
             return null;
         }
-        final Map<ServerLevel, RegionEntityTransferEpochSource> epochsByLevel = new IdentityHashMap<>();
-        epochsByLevel.put(level, rootEpochs);
         final List<RegionEntityTransferToken.Member> ridingGraph = new ArrayList<>();
-        if (!this.collectRidingGraphMembers(topmostRidingEntity(entity), epochsByLevel, ridingGraph)) {
+        if (!this.collectRidingGraphMembers(topmostRidingEntity(entity), level, epochs, ridingGraph)) {
             return null;
         }
         final RegionEntityTransferToken token = new RegionEntityTransferToken(
@@ -2252,8 +2255,17 @@ public final class RegionThreadingEngine implements RegionThreading {
                 source.coordinate(),
                 destinationRegion,
                 ridingGraph);
-        if (this.entityTransferJournal.record(token)) {
-            return token;
+        synchronized (this.admissionLock) {
+            // The graph reads above run outside the admission lock so they never delay admissions. The
+            // insertion reuses the admission serialization that a level clear and a shutdown use for
+            // their journal cleanup, so a decision either becomes visible before that cleanup and is
+            // cleared by it, or it observes the retired level/engine here and is not recorded at all.
+            if (this.shutdown || this.regionizer.isLevelClosed(level)) {
+                return null;
+            }
+            if (this.entityTransferJournal.record(token)) {
+                return token;
+            }
         }
         final long rejected = this.entityTransferJournal.rejectedRecordCount();
         if (Long.bitCount(rejected) == 1) {
@@ -2280,15 +2292,17 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Commits one recorded transfer on the server thread.
      * <p>
      * A native region worker is rejected with the named operation before the journal or the regionizer is
-     * touched. The recorded values are validated in order and a mismatch aborts without a mutation. A
-     * replay of a committed token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED} and writes
-     * nothing a second time; a token another commit is still applying answers
+     * touched, and every other caller except the server thread owning the token's level is rejected before
+     * the journal entry is claimed. The recorded values are validated in order and a mismatch aborts without
+     * a mutation. A replay of a committed token answers {@link RegionEntityTransferResult#ALREADY_COMMITTED}
+     * and writes nothing a second time; a token another commit is still applying answers
      * {@link RegionEntityTransferResult#IN_PROGRESS} and keeps its pending entry.
      * <p>
      * A commit never writes while the recorded source or destination region is ticking or submitted to a
      * worker; that answers {@link RegionEntityTransferResult#REGION_BUSY}. A written mapping is never
      * reported as a failure: post-commit bookkeeping failures are logged and the token stays
-     * {@link RegionEntityTransferResult#COMMITTED}.
+     * {@link RegionEntityTransferResult#COMMITTED}. A completion that a level clear or a shutdown already
+     * retired does not re-create its terminal journal entry.
      */
     @ApiStatus.Internal
     public RegionEntityTransferResult commitEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
@@ -2296,6 +2310,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (token == null) {
             return RegionEntityTransferResult.UNKNOWN_TOKEN;
         }
+        RegionThreadingHooks.assertServerThreadEntityTransfer(token.level(), "RegionThreadingEngine.commitEntityRegionTransfer");
         final RegionEntityTransferJournal.Claim claim = this.entityTransferJournal.claim(token);
         if (!claim.claimed()) {
             return this.lifecycleTransferResult(token, claim.terminal());
@@ -2322,7 +2337,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * The pending entry is released without touching any index, so a caller that gave up on the vanilla
      * side of a transfer does not leave a decision behind that would keep rejecting recordings once the
      * journal bound is reached. A replay of an already terminal token answers its recorded result, so an
-     * abort is idempotent.
+     * abort is idempotent. A native region worker and any other caller that is not the server thread
+     * owning the token's level are rejected before the pending entry is released.
      */
     @ApiStatus.Internal
     public RegionEntityTransferResult abortEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
@@ -2330,6 +2346,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (token == null) {
             return RegionEntityTransferResult.UNKNOWN_TOKEN;
         }
+        RegionThreadingHooks.assertServerThreadEntityTransfer(token.level(), "RegionThreadingEngine.abortEntityRegionTransfer");
         return this.lifecycleTransferResult(token, this.entityTransferJournal.abort(token));
     }
 
@@ -2494,22 +2511,30 @@ public final class RegionThreadingEngine implements RegionThreading {
         return null;
     }
 
-    private boolean collectRidingGraphMembers(Entity entity, Map<ServerLevel, RegionEntityTransferEpochSource> epochsByLevel, List<RegionEntityTransferToken.Member> members) {
-        if (!(entity.level() instanceof ServerLevel entityLevel)) {
+    /**
+     * Collects the recorded riding graph of one level.
+     * <p>
+     * The recorded operation is a region move inside {@code level}, so every member has to belong to that
+     * level. A graph that spans levels is refused before anything is recorded: no level clear could release
+     * a decision that touches members of two levels, so such a token would stay pending until shutdown.
+     *
+     * @return {@code false} when the graph leaves {@code level} or a member has no published identity
+     */
+    private static boolean collectRidingGraphMembers(Entity entity, ServerLevel level, RegionEntityTransferEpochSource epochs, List<RegionEntityTransferToken.Member> members) {
+        if (entity.level() != level) {
             return false;
         }
         final UUID uuid = entity.getUUID();
         if (uuid == null) {
             return false;
         }
-        final RegionEntityTransferEpochSource epochs = epochsByLevel.computeIfAbsent(entityLevel, level -> RegionEntityTransferEpochSource.of(level.entityIdentityLedger()));
         final long identityEpoch = epochs.epoch(uuid);
         if (identityEpoch == RegionEntityTransferEpochSource.MISSING_EPOCH) {
             return false;
         }
         members.add(new RegionEntityTransferToken.Member(entity, uuid, identityEpoch));
         for (final Entity passenger : entity.getPassengers()) {
-            if (passenger == null || !this.collectRidingGraphMembers(passenger, epochsByLevel, members)) {
+            if (passenger == null || !collectRidingGraphMembers(passenger, level, epochs, members)) {
                 return false;
             }
         }

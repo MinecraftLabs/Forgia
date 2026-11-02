@@ -55,7 +55,12 @@ public enum RegionEntityTransferResult {
      * already moved are both reported here.
      */
     SOURCE_MAPPING_CHANGED,
-    /** The riding graph gained or lost a member, or a member belongs to another level. */
+    /**
+     * The riding graph gained or lost a member, or a member belongs to another level.
+     * <p>
+     * Recording itself never accepts a graph that already spans levels; this answer covers a member that
+     * left the recorded level after the decision or a token that was not produced by the recording path.
+     */
     RIDING_GRAPH_SPLIT,
     /**
      * The recorded source or the recorded destination region is ticked or submitted to a region worker, so

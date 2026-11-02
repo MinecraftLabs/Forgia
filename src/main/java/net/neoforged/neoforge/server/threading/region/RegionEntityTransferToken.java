@@ -25,6 +25,10 @@ import org.jetbrains.annotations.ApiStatus;
  * and are <em>not</em> made atomic by the token. The commit runs on the server thread between existing
  * barrier points and moves the region mapping of the recorded riding graph as one unit.
  * <p>
+ * Recording, committing and aborting are owned by the server thread of the level. The token is created by
+ * {@code RegionThreadingEngine.recordEntityRegionTransfer} and never by a caller on another thread, a
+ * native region worker, or a level without an owning server.
+ * <p>
  * Identity is the recorded {@code (uuid, identityEpoch)} pair, not the {@link Entity} object alone: the
  * reference is only used to resolve the current region mapping and to run the recorded side effects, and
  * every use is validated against the recorded identity first.
@@ -35,7 +39,8 @@ public final class RegionEntityTransferToken {
      * The recorded operation.
      * <p>
      * Only a region move inside one level is part of this transaction. The operation is recorded, so a
-     * commit never upgrades a move into a level transfer by looking at the live entity again.
+     * commit never upgrades a move into a level transfer by looking at the live entity again. Recording
+     * refuses a riding graph that spans levels, because no level clear could then release the decision.
      */
     public enum Operation {
         REGION_MOVE
@@ -45,7 +50,8 @@ public final class RegionEntityTransferToken {
      * One member of the recorded riding graph.
      * <p>
      * The member carries the identity fields of the moment it was recorded, so a member whose identity
-     * advanced cancels the whole token instead of being transferred partially.
+     * advanced cancels the whole token instead of being transferred partially. All members of a token
+     * belong to the same level, the level of the recorded source region.
      */
     public record Member(Entity entity, UUID uuid, long identityEpoch) {
         public Member {

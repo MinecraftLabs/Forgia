@@ -10,14 +10,18 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,7 +32,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
@@ -40,6 +46,7 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionWorkerExecutor;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -62,6 +69,8 @@ class RegionEntityTransferTest {
     private RegionThreadingEngine secondaryEngine;
     private ServerLevel level;
     private EntityIdentityLedger ledger;
+    /** Thread that runs the test body; the mock server answers {@code isSameThread()} for it only. */
+    private Thread ownerThread;
     private final AtomicInteger nextEntityId = new AtomicInteger(1);
     private final AtomicLong nextForgedTokenId = new AtomicLong(-1);
 
@@ -80,6 +89,7 @@ class RegionEntityTransferTest {
             }
             this.level = null;
             this.ledger = null;
+            this.ownerThread = null;
         }
     }
 
@@ -238,6 +248,119 @@ class RegionEntityTransferTest {
     }
 
     @Test
+    void workerAbortIsRejectedBeforeThePendingEntryIsReleased() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+        assertNotNull(token);
+
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final CountDownLatch done = new CountDownLatch(1);
+        assertTrue(workerPool(this.engine).execute("entity transfer abort probe", () -> {
+            try {
+                this.engine.abortEntityRegionTransfer(token);
+            } catch (Throwable throwable) {
+                failure.set(throwable);
+            } finally {
+                done.countDown();
+            }
+        }), "the worker pool must accept the probe");
+        assertTrue(await(done), "the worker probe did not finish");
+
+        assertOperationRejected(failure.get(), "RegionThreadingEngine.abortEntityRegionTransfer");
+        assertEquals(1, this.engine.pendingEntityTransferCount(), "a worker abort must not release the decision");
+        assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(token),
+                "the rejected worker abort must not have cancelled the decision");
+        assertEquals(destination, trackedCoordinate(this.engine, entity));
+    }
+
+    @Test
+    void foreignThreadRecordCommitAndAbortAreRejectedBeforeAnyJournalOrMappingChange() throws Exception {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate source = trackedCoordinate(this.engine, entity);
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+        assertNotNull(token);
+
+        // Counts prove the foreign thread is rejected before the identity ledger read and the riding-graph
+        // traversal, not merely before the journal insertion.
+        final AtomicInteger ledgerReads = new AtomicInteger();
+        doAnswer(invocation -> {
+            ledgerReads.incrementAndGet();
+            return this.ledger;
+        }).when(this.level).entityIdentityLedger();
+        final AtomicInteger passengerReads = new AtomicInteger();
+        when(entity.getPassengers()).thenAnswer(invocation -> {
+            passengerReads.incrementAndGet();
+            return List.of();
+        });
+
+        final AtomicReference<Throwable> recordFailure = new AtomicReference<>();
+        final AtomicReference<Throwable> commitFailure = new AtomicReference<>();
+        final AtomicReference<Throwable> abortFailure = new AtomicReference<>();
+        final CountDownLatch done = new CountDownLatch(1);
+        final Thread foreignThread = new Thread(() -> {
+            try {
+                try {
+                    this.engine.recordEntityRegionTransfer(entity, destination);
+                } catch (Throwable throwable) {
+                    recordFailure.set(throwable);
+                }
+                try {
+                    this.engine.commitEntityRegionTransfer(token);
+                } catch (Throwable throwable) {
+                    commitFailure.set(throwable);
+                }
+                try {
+                    this.engine.abortEntityRegionTransfer(token);
+                } catch (Throwable throwable) {
+                    abortFailure.set(throwable);
+                }
+            } finally {
+                done.countDown();
+            }
+        }, "entity transfer foreign thread");
+        foreignThread.setDaemon(true);
+        foreignThread.start();
+        assertTrue(await(done), "the foreign-thread probe did not finish");
+        foreignThread.join(TimeUnit.SECONDS.toMillis(10));
+
+        // The foreign thread is not a native pool worker, so its rejection has to come from the level's
+        // own MinecraftServer owner and must name the exact operation it attempted.
+        assertOperationRejected(recordFailure.get(), "RegionThreadingEngine.recordEntityRegionTransfer");
+        assertOperationRejected(commitFailure.get(), "RegionThreadingEngine.commitEntityRegionTransfer");
+        assertOperationRejected(abortFailure.get(), "RegionThreadingEngine.abortEntityRegionTransfer");
+        assertEquals(0, ledgerReads.get(), "a foreign thread must not read the identity ledger");
+        assertEquals(0, passengerReads.get(), "a foreign thread must not traverse the riding graph");
+        assertEquals(1, this.engine.pendingEntityTransferCount(),
+                "a foreign thread must neither add nor claim nor release the decision");
+        assertEquals(source, trackedCoordinate(this.engine, entity), "a foreign thread must not write the mapping");
+
+        assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(token),
+                "the server thread still owns the same token after the foreign-thread rejections");
+        assertEquals(destination, trackedCoordinate(this.engine, entity));
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+    }
+
+    @Test
+    void aLevelWithoutAnOwningServerIsRejectedInsteadOfRecording() {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+
+        doReturn(null).when(this.level).getServer();
+
+        final IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> this.engine.recordEntityRegionTransfer(entity, destination),
+                "a level without an owning server must fail closed");
+        assertTrue(failure.getMessage().contains("RegionThreadingEngine.recordEntityRegionTransfer"),
+                () -> "the rejection must name the engine operation, got: " + failure.getMessage());
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+    }
+
+    @Test
     void ridingGraphSpanningTwoRegionsIsRejectedWholeAsSourceMappingChanged() throws ReflectiveOperationException {
         this.installEngine();
         final Entity root = registeredEntity(new BlockPos(0, 64, 0));
@@ -260,24 +383,68 @@ class RegionEntityTransferTest {
     }
 
     @Test
-    void ridingGraphThatWouldSplitAcrossLevelsIsRejectedWhole() throws ReflectiveOperationException {
+    void crossLevelRidingGraphIsRefusedAndAMemberLevelClearReleasesNothing() throws ReflectiveOperationException {
         this.installEngine();
         final Entity root = registeredEntity(new BlockPos(0, 64, 0));
-        final ServerLevel otherLevel = mock(ServerLevel.class);
+        final RegionCoordinate rootSource = trackedCoordinate(this.engine, root);
         final EntityIdentityLedger otherLedger = new EntityIdentityLedger();
-        doReturn(otherLedger).when(otherLevel).entityIdentityLedger();
+        final ServerLevel otherLevel = transferLevel(otherLedger);
         final Entity passenger = registeredEntity(otherLevel, otherLedger, new BlockPos(4096, 64, 0));
         when(root.getPassengers()).thenReturn(List.of(passenger));
-        final RegionCoordinate rootSource = trackedCoordinate(this.engine, root);
-        final RegionCoordinate passengerSource = trackedCoordinate(this.engine, passenger);
         final RegionCoordinate destination = activeDestination(new BlockPos(8192, 64, 0));
 
+        // A same-level decision that the member-level clear must preserve.
+        final Entity unrelated = registeredEntity(new BlockPos(64, 64, 0));
+        final RegionEntityTransferToken unrelatedToken = this.engine.recordEntityRegionTransfer(unrelated, destination);
+        assertNotNull(unrelatedToken);
+        assertNotNull(trackedRegion(this.engine, passenger), "the passenger starts tracked in its own level");
+
+        // A graph that spans levels is outside the strictly same-level REGION_MOVE scope, so it is never
+        // recorded: no level clear could release such a decision later.
+        assertNull(this.engine.recordEntityRegionTransfer(root, destination),
+                "a graph that spans levels must not be recorded");
+        assertEquals(1, this.engine.pendingEntityTransferCount(), "a refused cross-level graph retains nothing");
+
+        this.engine.clearLevelRegionTasks(otherLevel);
+
+        assertNull(trackedRegion(this.engine, passenger), "the member-level clear retired its entity");
+        assertEquals(1, this.engine.pendingEntityTransferCount(),
+                "a member-level clear must not release a decision of another level");
+        assertEquals(rootSource, trackedCoordinate(this.engine, root), "the root belongs to another level");
+
+        assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(unrelatedToken));
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+    }
+
+    @Test
+    void rootLevelUnloadReleasesItsRecordedGraphAndKeepsOtherLevelDecisions() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity root = registeredEntity(new BlockPos(0, 64, 0));
+        final Entity passenger = registeredEntity(new BlockPos(64, 64, 0));
+        when(root.getPassengers()).thenReturn(List.of(passenger));
+        final RegionCoordinate destination = activeDestination(new BlockPos(8192, 64, 0));
         final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(root, destination);
         assertNotNull(token);
+        assertEquals(2, token.ridingGraph().size(), "both graph members belong to the recorded level");
 
-        assertEquals(RegionEntityTransferResult.RIDING_GRAPH_SPLIT, this.engine.commitEntityRegionTransfer(token));
-        assertEquals(rootSource, trackedCoordinate(this.engine, root));
-        assertEquals(passengerSource, trackedCoordinate(this.engine, passenger));
+        final EntityIdentityLedger otherLedger = new EntityIdentityLedger();
+        final ServerLevel otherLevel = transferLevel(otherLedger);
+        final Entity other = registeredEntity(otherLevel, otherLedger, new BlockPos(0, 64, 0));
+        final BlockPos otherDestinationPosition = new BlockPos(8192, 64, 0);
+        final RegionCoordinate otherDestination = RegionLayout.DYNAMIC.regionAt(otherLevel, otherDestinationPosition);
+        this.engine.addRegionSection(otherLevel, chunkX(otherDestinationPosition), chunkZ(otherDestinationPosition));
+        final RegionEntityTransferToken otherToken = this.engine.recordEntityRegionTransfer(other, otherDestination);
+        assertNotNull(otherToken);
+        assertEquals(2, this.engine.pendingEntityTransferCount());
+
+        this.engine.clearLevelRegionTasks(this.level);
+
+        assertEquals(1, this.engine.pendingEntityTransferCount(),
+                "the clear must keep the decision of the level that stays loaded");
+        assertEquals(RegionEntityTransferResult.LEVEL_CLOSED, this.engine.commitEntityRegionTransfer(token),
+                "the recorded graph belonged to the unloaded level");
+        assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(otherToken));
+        assertEquals(otherDestination, trackedCoordinate(this.engine, other));
         assertEquals(0, this.engine.pendingEntityTransferCount());
     }
 
@@ -488,6 +655,189 @@ class RegionEntityTransferTest {
     }
 
     @Test
+    void aPreWriteFailureAnswersCommitFailedAndLeavesATerminalJournalEntry() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate source = trackedCoordinate(this.engine, entity);
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+        assertNotNull(token);
+
+        // The recorded-epoch read is the first dependency the engine touches after the claim and before the
+        // regionizer write, so making it fail is a real pre-write exception and not a reported outcome.
+        doThrow(new IllegalStateException("injected identity ledger failure before the region write"))
+                .when(this.level).entityIdentityLedger();
+
+        assertEquals(RegionEntityTransferResult.COMMIT_FAILED, this.engine.commitEntityRegionTransfer(token));
+        assertEquals(source, trackedCoordinate(this.engine, entity), "the source mapping must stay intact");
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+        assertEquals(1, this.engine.rememberedEntityTransferResultCount(),
+                "the failed commit stays terminal in the journal");
+
+        assertEquals(RegionEntityTransferResult.COMMIT_FAILED, this.engine.commitEntityRegionTransfer(token),
+                "a pre-write failure is terminal and is never retried");
+        assertEquals(source, trackedCoordinate(this.engine, entity));
+    }
+
+    @Test
+    void aMaintenanceFailureAfterTheWriteKeepsTheTransferCommitted() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity);
+        final AtomicInteger maintenanceAttempts = new AtomicInteger();
+        try {
+            // The engine discards the deferred ownership handoff of the committed entity after the region
+            // mapping was written. Replacing that batch's deferred list with one that refuses the discard
+            // makes the real maintenance step throw at its real call point.
+            setDeferredUpdates(batch, new ArrayList<Entity>(List.of(entity)) {
+                @Override
+                public boolean removeIf(Predicate<? super Entity> filter) {
+                    maintenanceAttempts.incrementAndGet();
+                    throw new IllegalStateException("injected deferred-update discard failure after the region write");
+                }
+            });
+
+            final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+            assertNotNull(token);
+
+            assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(token),
+                    "a post-write maintenance failure must not downgrade the committed mapping");
+            assertTrue(maintenanceAttempts.get() > 0, "the maintenance path must have been reached");
+            assertEquals(destination, trackedCoordinate(this.engine, entity));
+            assertEquals(0, this.engine.pendingEntityTransferCount());
+            assertEquals(1, this.engine.rememberedEntityTransferResultCount());
+
+            assertEquals(RegionEntityTransferResult.ALREADY_COMMITTED, this.engine.commitEntityRegionTransfer(token));
+            assertEquals(destination, trackedCoordinate(this.engine, entity));
+            assertEquals(0, this.engine.pendingEntityTransferCount());
+        } finally {
+            discardPublishedBatch(this.engine, batch);
+        }
+    }
+
+    @Test
+    void aNotificationFailureAfterTheWriteKeepsTheTransferCommitted() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        this.engine.entityScheduler().runDelayed(entity, () -> {}, 1L);
+        final AtomicInteger notificationAttempts = new AtomicInteger();
+
+        final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+        assertNotNull(token);
+        // The committed transfer notifies the registered scheduled task of the moved entity. The task's
+        // real onEntityMoved() reads the entity position first, which throws here.
+        when(entity.blockPosition()).thenAnswer(invocation -> {
+            notificationAttempts.incrementAndGet();
+            throw new IllegalStateException("injected scheduled-task notification failure after the region write");
+        });
+
+        assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(token),
+                "a post-write notification failure must not downgrade the committed mapping");
+        assertTrue(notificationAttempts.get() > 0, "the notification path must have been reached");
+        assertEquals(destination, trackedCoordinate(this.engine, entity));
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+        assertEquals(1, this.engine.rememberedEntityTransferResultCount());
+
+        assertEquals(RegionEntityTransferResult.ALREADY_COMMITTED, this.engine.commitEntityRegionTransfer(token));
+        assertEquals(destination, trackedCoordinate(this.engine, entity));
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+    }
+
+    @Test
+    void aRecordingThatRacedALevelClearDoesNotInsertAPendingDecision() throws Exception {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final CountDownLatch recordingAtLedger = new CountDownLatch(1);
+        final CountDownLatch clearFinished = new CountDownLatch(1);
+        final AtomicReference<Throwable> clearFailure = new AtomicReference<>();
+        final Thread clearThread = new Thread(() -> {
+            try {
+                if (!recordingAtLedger.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("the recording did not reach the recorded-epoch read");
+                }
+                this.engine.clearLevelRegionTasks(this.level);
+            } catch (Throwable throwable) {
+                clearFailure.set(throwable);
+            } finally {
+                clearFinished.countDown();
+            }
+        }, "entity transfer level clear racer");
+        clearThread.setDaemon(true);
+        clearThread.start();
+        doAnswer(invocation -> {
+            // The recorded-epoch read is the last read of the recording path before its admission. The
+            // clear completes while the recording is paused here, so the admission re-check is forced.
+            recordingAtLedger.countDown();
+            if (!clearFinished.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the level clear did not complete");
+            }
+            return this.ledger;
+        }).when(this.level).entityIdentityLedger();
+
+        // The recording runs on the level's server thread (this test thread), the lifecycle clear on the
+        // racing thread; the recording is paused inside the recorded-epoch read until that clear finished.
+        final RegionEntityTransferToken recorded = this.engine.recordEntityRegionTransfer(entity, destination);
+        clearThread.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertNull(clearFailure.get(), () -> "the level clear failed: " + clearFailure.get());
+        assertFalse(clearThread.isAlive(), "the level clear must finish");
+        assertNull(recorded, "a recording that observed the retired level must not return a token");
+        assertEquals(0, this.engine.pendingEntityTransferCount(),
+                "no pending decision may survive a level clear that the recording raced");
+        assertEquals(0, this.engine.rememberedEntityTransferResultCount());
+    }
+
+    @Test
+    void aLateCommitCompletionAfterShutdownDoesNotResurrectAJournalEntry() throws Exception {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, destination);
+        assertNotNull(token);
+
+        final CountDownLatch commitAtLedger = new CountDownLatch(1);
+        final CountDownLatch shutdownFinished = new CountDownLatch(1);
+        final AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+        doAnswer(invocation -> {
+            // The commit claimed the token and is paused at the recorded-epoch read, before any regionizer
+            // write. The shutdown then clears the journal and the index under the commit.
+            commitAtLedger.countDown();
+            if (!shutdownFinished.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the engine shutdown did not complete");
+            }
+            return this.ledger;
+        }).when(this.level).entityIdentityLedger();
+
+        final Thread shutdownThread = new Thread(() -> {
+            try {
+                if (!commitAtLedger.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("the commit did not reach the recorded-epoch read");
+                }
+                this.engine.shutdown();
+            } catch (Throwable throwable) {
+                shutdownFailure.set(throwable);
+            } finally {
+                shutdownFinished.countDown();
+            }
+        }, "region threading shutdown racer");
+        shutdownThread.setDaemon(true);
+        shutdownThread.start();
+
+        final RegionEntityTransferResult result = this.engine.commitEntityRegionTransfer(token);
+        shutdownThread.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertNull(shutdownFailure.get(), () -> "the engine shutdown failed: " + shutdownFailure.get());
+        assertFalse(shutdownThread.isAlive(), "the shutdown thread must finish");
+        assertNotEquals(RegionEntityTransferResult.COMMITTED, result, "the shutdown must win over the late commit");
+        assertEquals(0, this.engine.pendingEntityTransferCount());
+        assertEquals(0, this.engine.rememberedEntityTransferResultCount(),
+                "a late completion must not resurrect a terminal journal entry after shutdown");
+    }
+
+    @Test
     void journalStaysBoundedAndTheRefusalIsObservable() {
         this.installEngine();
         final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
@@ -600,9 +950,23 @@ class RegionEntityTransferTest {
 
     private void installEngine() {
         this.engine = new RegionThreadingEngine(1, false, false);
-        this.level = mock(ServerLevel.class);
+        this.ownerThread = Thread.currentThread();
         this.ledger = new EntityIdentityLedger();
-        doReturn(this.ledger).when(this.level).entityIdentityLedger();
+        this.level = transferLevel(this.ledger);
+    }
+
+    /**
+     * Creates a mechanics level whose server answers {@link MinecraftServer#isSameThread()} for the test's
+     * own thread only, so a test that runs on an ordinary background thread is rejected while the test body
+     * itself keeps the server-thread affinity of a recorded transfer.
+     */
+    private ServerLevel transferLevel(EntityIdentityLedger levelLedger) {
+        final ServerLevel mockLevel = mock(ServerLevel.class);
+        doReturn(levelLedger).when(mockLevel).entityIdentityLedger();
+        final MinecraftServer server = mock(MinecraftServer.class);
+        when(server.isSameThread()).thenAnswer(invocation -> Thread.currentThread() == this.ownerThread);
+        doReturn(server).when(mockLevel).getServer();
+        return mockLevel;
     }
 
     private Entity registeredEntity(BlockPos position) {
@@ -649,6 +1013,14 @@ class RegionEntityTransferTest {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(exception);
         }
+    }
+
+    private static void assertOperationRejected(@Nullable Throwable failure, String operation) {
+        assertNotNull(failure, () -> "the " + operation + " attempt was not rejected");
+        assertTrue(failure instanceof IllegalStateException,
+                () -> "the rejection must be an IllegalStateException, got: " + failure);
+        assertTrue(failure.getMessage().contains(operation),
+                () -> "the rejection must name " + operation + ", got: " + failure.getMessage());
     }
 
     private static RegionWorkerExecutor workerPool(RegionThreadingEngine engine) throws ReflectiveOperationException {
@@ -750,6 +1122,13 @@ class RegionEntityTransferTest {
         deferEntityUpdate.setAccessible(true);
         deferEntityUpdate.invoke(batch, deferred);
         return batch;
+    }
+
+    /** Replaces the deferred-update list of a published batch with an injected failing dependency. */
+    private static void setDeferredUpdates(Object batch, List<Entity> updates) throws ReflectiveOperationException {
+        final Field field = batch.getClass().getDeclaredField("deferredUpdates");
+        field.setAccessible(true);
+        field.set(batch, updates);
     }
 
     private static void applyDeferredEntityUpdates(Object batch, RegionThreadingEngine engine) throws ReflectiveOperationException {

@@ -8,6 +8,7 @@ package net.neoforged.neoforge.server.threading;
 import java.util.Optional;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
@@ -141,6 +142,34 @@ public final class RegionThreadingHooks {
     public static void assertServerEntityStorageAccess(Entity entity, String operation) {
         if (entity.level() instanceof ServerLevel) {
             assertServerEntityStorageAccess(operation);
+        }
+    }
+
+    /**
+     * Rejects a recorded transfer operation that runs on any thread except the server thread owning
+     * {@code level}.
+     * <p>
+     * A recorded transfer reads the level's identity ledger, validates the recorded riding graph against
+     * the region index and writes the recorded mapping, so it belongs to the same logical server thread
+     * as every other entity storage mutation. The owner is the {@link MinecraftServer} of the level itself
+     * ({@link MinecraftServer#isSameThread()}), not the first caller, the installed engine, or a thread
+     * name: an ordinary background thread that never touched the worker pool is rejected by the same
+     * check. The check fails closed when the level has no owning server.
+     * <p>
+     * It runs after {@link #assertServerEntityStorageAccess(String)}, so a native region worker always
+     * reports that violation first with the exact operation name.
+     *
+     * @throws IllegalStateException when the current thread is not the level's server thread, or when the
+     *                               level has no owning server
+     */
+    public static void assertServerThreadEntityTransfer(ServerLevel level, String operation) {
+        final MinecraftServer server = level.getServer();
+        if (server == null) {
+            throw new IllegalStateException("Recorded entity transfer operation has no owning server: " + operation);
+        }
+        if (!server.isSameThread()) {
+            throw new IllegalStateException("Recorded entity transfer operation must run on the server thread: "
+                    + operation + " was called from thread '" + Thread.currentThread().getName() + "'");
         }
     }
 
@@ -473,8 +502,12 @@ public final class RegionThreadingHooks {
      * records the identity epoch and both regions at decision time; the commit never re-reads the live
      * position.
      * <p>
-     * The bookmark never interrupts the vanilla path: a destination in another level, an untracked entity, a
-     * full journal or a native region worker all answer {@code null} instead of throwing.
+     * The bookmark does not interrupt the vanilla path for a normal server-thread caller: a destination in
+     * another level, a riding graph that spans levels, an untracked entity or a full journal answer
+     * {@code null} instead of throwing, and the caller keeps the vanilla behavior. Two callers are rejected
+     * with an {@link IllegalStateException} instead: a native region worker, which names the operation, and
+     * any other thread that is not the server thread owning the level; see
+     * {@link #assertServerThreadEntityTransfer(ServerLevel, String)}.
      *
      * @return the recorded token, or {@code null} when region threading is not installed or no transfer
      *         can be recorded; in that case the caller keeps the vanilla path
@@ -491,7 +524,9 @@ public final class RegionThreadingHooks {
     /**
      * Commits a recorded cross-region entity transfer on the server thread.
      * <p>
-     * With region threading not installed this is a no-op and answers
+     * A caller on another thread is rejected before the journal entry is claimed; see
+     * {@link #assertServerThreadEntityTransfer(ServerLevel, String)}. With region threading not installed
+     * this is a no-op and answers
      * {@link RegionEntityTransferResult#DISABLED}, which leaves the caller's vanilla behavior and return
      * values unchanged.
      */
@@ -508,8 +543,9 @@ public final class RegionThreadingHooks {
      * <p>
      * A caller that gave up on the vanilla side of a transfer releases its pending decision here instead of
      * leaving it in the journal until the pending bound is exhausted. The abort never mutates a region
-     * mapping and is idempotent: a terminal token answers its recorded result. With region threading not
-     * installed this answers {@link RegionEntityTransferResult#DISABLED}.
+     * mapping and is idempotent: a terminal token answers its recorded result. A caller on another thread
+     * is rejected before the pending entry is released. With region threading not installed this answers
+     * {@link RegionEntityTransferResult#DISABLED}.
      */
     public static RegionEntityTransferResult abortEntityRegionTransfer(@Nullable RegionEntityTransferToken token) {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();

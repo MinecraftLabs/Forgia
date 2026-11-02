@@ -24,9 +24,11 @@ import org.jetbrains.annotations.Nullable;
  * (or the recorded abort reason); the terminal map stores the result enum only, never the token or the
  * entity, so clearing the journal leaves no strong reference to any entity behind.
  * <p>
- * A level clear cancels the pending decisions that touch the closed level and an engine shutdown clears
- * both maps. A commit can therefore never write a region mapping after the level or engine cleanup that
- * owns the index started.
+ * A level clear cancels the pending decisions of the closed level and an engine shutdown clears both maps.
+ * A recorded token never spans levels, so a level clear can always release every decision that touches the
+ * closing level. A commit can therefore never write a region mapping after the level or engine cleanup that
+ * owns the index started, and a completion that arrives after that cleanup does not re-create its terminal
+ * entry: the caller's replay reports the lifecycle outcome instead of a result of a discarded transaction.
  */
 final class RegionEntityTransferJournal {
     /** Maximum number of recorded decisions that wait for a commit. */
@@ -112,15 +114,30 @@ final class RegionEntityTransferJournal {
         return new Claim(RegionEntityTransferResult.UNKNOWN_TOKEN);
     }
 
-    /** Removes the claimed entry and remembers the commit for idempotent replays. */
+    /**
+     * Removes the claimed entry and remembers the commit for idempotent replays.
+     * <p>
+     * A level clear or a shutdown can retire the entry while the commit is applying its recorded decision.
+     * That completion must not add a terminal entry back into the cleared journal, so a missing pending
+     * entry leaves the journal untouched and the caller's replay reports the lifecycle outcome.
+     */
     synchronized void completed(RegionEntityTransferToken token) {
-        this.pending.remove(token.tokenId());
+        if (this.pending.remove(token.tokenId()) == null) {
+            return;
+        }
         this.remember(token.tokenId(), RegionEntityTransferResult.COMMITTED);
     }
 
-    /** Removes the claimed entry and remembers the abort for idempotent replays. */
+    /**
+     * Removes the claimed entry and remembers the abort for idempotent replays.
+     * <p>
+     * Like {@link #completed(RegionEntityTransferToken)} this leaves a journal alone whose entry a lifecycle
+     * step already retired.
+     */
     synchronized void aborted(RegionEntityTransferToken token, RegionEntityTransferResult result) {
-        this.pending.remove(token.tokenId());
+        if (this.pending.remove(token.tokenId()) == null) {
+            return;
+        }
         this.remember(token.tokenId(), result);
     }
 
@@ -156,7 +173,7 @@ final class RegionEntityTransferJournal {
         return rememberedResult != null ? rememberedResult : RegionEntityTransferResult.UNKNOWN_TOKEN;
     }
 
-    /** Cancels the pending decisions that belong to {@code level}, without retaining their entities. */
+    /** Cancels the pending decisions of {@code level}, without retaining their entities. */
     synchronized void clearPendingFor(ServerLevel level) {
         this.pending.values().removeIf(entry -> entry.token.level() == level);
     }
