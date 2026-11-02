@@ -121,6 +121,13 @@ runs {
     }
     gameTestServer {
             type = "gameTestServer"
+            // The server load measurement GameTest is registered in every GameTest run, but it only runs
+            // its workload when this property is set. A normal run therefore does not force-load a 16x16
+            // chunk grid with thousands of furnaces; the measurement passes -PserverBenchmark=true.
+            systemProperty("neoforge.serverBenchmark", providers.gradleProperty("serverBenchmark").getOrElse("false"))
+            // Measurement runs pass -PgameTestFilter=benchmarkFurnace,benchmarkEntity so only the
+            // benchmark batches run instead of the whole GameTest suite. Unset keeps every test.
+            systemProperty("neoforge.gameTestServer.filter", providers.gradleProperty("gameTestFilter").getOrElse(""))
     }
     data {
             data()

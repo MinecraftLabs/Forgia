@@ -28,6 +28,10 @@ public class GameTestHooks {
     private static boolean registeredGametests = false;
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Type GAME_TEST_HOLDER = Type.getType(GameTestHolder.class);
+    /**
+     * System property of the measurement runs: a comma-separated list of GameTest batch names to keep.
+     */
+    private static final String BATCH_FILTER_PROPERTY = "neoforge.gameTestServer.filter";
 
     public static boolean isGametestEnabled() {
         return !FMLLoader.isProduction() && (SharedConstants.IS_RUNNING_IN_IDE || isGametestServer() || Boolean.getBoolean("neoforge.enableGameTest"));
@@ -58,8 +62,33 @@ public class GameTestHooks {
                 GameTestRegistry.register(gameTestMethod, enabledNamespaces);
             }
 
+            filterGameTestBatches();
+
             registeredGametests = true;
         }
+    }
+
+    /**
+     * Restricts the registered GameTests to the comma-separated batch names of the
+     * {@value #BATCH_FILTER_PROPERTY} system property. The test framework registers all of its dynamic tests
+     * through a single generator, so the filter has to run after registration. Measurement runs set the
+     * property so a single benchmark batch does not wait for the whole GameTest suite; without it every
+     * registered test runs exactly as before.
+     */
+    private static void filterGameTestBatches() {
+        String filter = System.getProperty(BATCH_FILTER_PROPERTY);
+        if (filter == null || filter.isBlank()) {
+            return;
+        }
+
+        Set<String> batches = Arrays.stream(filter.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toUnmodifiableSet());
+        int before = GameTestRegistry.getAllTestFunctions().size();
+        GameTestRegistry.getAllTestFunctions().removeIf(function -> !batches.contains(function.batchName()));
+        LOGGER.info("GameTest batch filter {}: kept {} of {} tests", batches,
+                GameTestRegistry.getAllTestFunctions().size(), before);
     }
 
     private static Set<String> getEnabledNamespaces() {
