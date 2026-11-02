@@ -153,9 +153,9 @@ public class ServerLoadBenchmarkGameTests {
      */
     static final String ENTITY_WORKER_TICKS_PROPERTY = "neoforge.serverBenchmarkEntityWorkerTicks";
 
-    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
+    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -850,7 +850,7 @@ public class ServerLoadBenchmarkGameTests {
                 + " distinctBlockers=" + blockers.blockerCount()
                 + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -877,6 +877,9 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::rejectedEntityTransferRecordCount),
                 delta(before, after, RegionThreadingDiagnostics::legacyDeferredEntityMoveCount),
                 delta(before, after, RegionThreadingDiagnostics::retriedDeferredEntityMoveCount),
+                delta(before, after, RegionThreadingDiagnostics::unchangedDeferredEntityMoves),
+                delta(before, after, RegionThreadingDiagnostics::batchedDeferredEntityMoves),
+                delta(before, after, RegionThreadingDiagnostics::refusedDeferredEntityMoveBatches),
                 mismatches,
                 survivors,
                 blockers.failureCount(),
@@ -890,6 +893,7 @@ public class ServerLoadBenchmarkGameTests {
                 millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
                 millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
                 millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.deferredPublicationNanos() - attributionBefore.deferredPublicationNanos(), slices),
                 millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
                 slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);

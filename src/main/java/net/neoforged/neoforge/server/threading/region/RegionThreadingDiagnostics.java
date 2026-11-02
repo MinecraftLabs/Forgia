@@ -53,10 +53,10 @@ package net.neoforged.neoforge.server.threading.region;
  * ({@link RegionWorkerChunkUnavailableException}); the same request is counted once, so a refusal is never
  * double counted per entity or ticker. A chunk fallback entity tick counts one entity that a worker handed
  * to the server-thread fallback after such a refusal; it is ticked there exactly once. A pre-load refusal
- * counts one entity that was never submitted to a worker because its region's neighborhood was not loaded
- * inside the pre-load margin. The counters therefore separate the ticks that never left the server thread
- * (pre-load refusal) from the ticks that were attempted on a worker and completed on the server thread
- * (chunk fallback), and the guard refusals count the chunk requests behind the latter.
+ * counts one entity that was never submitted to a worker because its own chunk neighborhood was not
+ * loaded inside the pre-load margin. The counters therefore separate the ticks that never left the server
+ * thread (pre-load refusal) from the ticks that were attempted on a worker and completed on the server
+ * thread (chunk fallback), and the guard refusals count the chunk requests behind the latter.
  * <p>
  * {@link #regionizerWriteLockAcquisitions()} counts the write-lock acquisitions of the regionizer, so the
  * publication scope of one entity batch barrier is observable: a barrier that publishes its deferred

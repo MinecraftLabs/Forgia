@@ -5,6 +5,8 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import it.unimi.dsi.fastutil.longs.Long2ByteMap;
+import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -33,7 +35,6 @@ import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
-import net.minecraft.world.level.chunk.ChunkSource;
 import net.minecraft.world.ticks.LevelTicks;
 import net.minecraft.world.ticks.ScheduledTick;
 import net.neoforged.neoforge.server.threading.EntityRegionScheduler;
@@ -62,8 +63,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private static final int MAX_DEFERRED_ENTITY_MOVE_ATTEMPTS = 3;
     /**
-     * Chunk margin around a region that the server thread requires to be loaded before it submits the
-     * region's entity group to a worker.
+     * Chunk margin around an entity's own chunk that the server thread requires to be loaded before it
+     * submits that entity to a worker.
      * <p>
      * One chunk is 16 blocks and covers every block, fluid and collision read a vanilla entity tick makes
      * with a loading request: the collision box and the eye position are read at most 2 blocks from the
@@ -74,6 +75,10 @@ public final class RegionThreadingEngine implements RegionThreading {
      * heuristic that keeps the common case off the chunk source, not a correctness bound.
      */
     private static final int ENTITY_TICK_CHUNK_MARGIN = 1;
+    /** Sentinels of the per batch neighborhood cache: chunk not asked yet, computed not loaded, loaded. */
+    private static final byte NEIGHBORHOOD_UNKNOWN = -1;
+    private static final byte NEIGHBORHOOD_NOT_LOADED = 0;
+    private static final byte NEIGHBORHOOD_LOADED = 1;
     private static final java.util.concurrent.atomic.AtomicLong DIAG_LAST = new java.util.concurrent.atomic.AtomicLong();
     private static final BasicRegionThreadingContext NONE_CONTEXT = new BasicRegionThreadingContext(RegionThreadingContext.Kind.NONE, null, null, null, null);
     private static final ThreadLocal<RegionThreadingContext> CURRENT_CONTEXT = ThreadLocal.withInitial(() -> NONE_CONTEXT);
@@ -115,8 +120,9 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final AtomicLong chunkFallbackEntityTicks = new AtomicLong();
     /**
-     * Entities a group refused to lease because their neighborhood was not loaded. They are ticked on the
-     * server thread like the entities whose region could not be leased.
+     * Entities the pre-load check refused because their own chunk neighborhood was not loaded. They are
+     * ticked on the server thread like the entities whose region could not be leased, while the rest of
+     * their region still runs on a worker.
      */
     private final AtomicLong chunkPreloadRefusedEntityTicks = new AtomicLong();
     private final AtomicLong blockEntityTicksOnWorkers = new AtomicLong();
@@ -358,7 +364,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * {@return the chunk margin around a region that has to be loaded before the region's entity group is
+     * {@return the chunk margin around an entity's own chunk that has to be loaded before the entity is
      * submitted to a worker}
      * <p>
      * The margin is the heuristic that keeps the common entity tick off the server chunk source; a tick that
@@ -1218,12 +1224,14 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Runs after the batch was published, so cleanup already waits for it and no lifecycle read gate may be
      * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt, because
      * a merge or split re-points the tracked entities to the surviving region. Anything that cannot be
-     * resolved to a live, leasable region is recorded as a server-thread fallback, and so is every entity of
-     * a region whose neighborhood is not loaded enough to tick on a worker.
+     * resolved to a live, leasable region is recorded as a server-thread fallback, and so is every entity
+     * whose own chunk neighborhood is not loaded enough to tick on a worker.
      */
     private void leaseEntityTickGroups(RegionEntityTickBatch batch, List<Entity> pending, RegionTickBarrier barrier) {
-        List<Entity> remaining = pending;
         final List<Entity> unloadedNeighborhood = new ArrayList<>();
+        final List<Entity> tickable = new ArrayList<>(pending.size());
+        this.splitPreloadRefusedEntities(batch.level(), pending, tickable, unloadedNeighborhood);
+        List<Entity> remaining = tickable;
         int batchedEntities = 0;
         for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
             final RegionTickGrouping<RegionState, Entity> grouping = new RegionTickGrouping<>();
@@ -1248,14 +1256,6 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // An earlier group of this same batch already owns the lease. It cannot be
                     // acquired again and must never be awaited on this thread.
                     batch.group(region).ifPresent(group -> group.addEntities(grouping.items(region)));
-                    continue;
-                }
-                if (!this.isEntityTickNeighborhoodLoaded(batch.level(), region)) {
-                    // A worker must never load a chunk from inside its tick, so a region whose
-                    // neighborhood is not completely loaded is not submitted at all: its entities tick
-                    // on the server thread after the batch instead of hitting the chunk source guard.
-                    unloadedNeighborhood.addAll(grouping.items(region));
-                    this.chunkPreloadRefusedEntityTicks.addAndGet(grouping.size(region));
                     continue;
                 }
                 if (!this.acquireRegionLease(region, barrier)) {
@@ -1286,35 +1286,93 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * {@return true when every chunk of {@code region} plus the entity tick margin is loaded}
+     * Splits {@code pending} into the entities whose own chunk neighborhood is loaded enough to tick on a
+     * worker and the ones that have to tick on the server thread.
      * <p>
-     * Runs on the server thread before the group of {@code region} is submitted, so a worker never has to
-     * ask the chunk source for a chunk that is not there. A chunk counts as loaded when the chunk source
-     * can hand out its {@code FULL} chunk without loading one, which is exactly what the worker-side
-     * immediate lookup of {@code ServerChunkCache.getChunk} answers. Nothing is force-loaded: a region whose
-     * neighborhood is incomplete is not submitted, and its entities tick on the server thread instead.
+     * Runs on the server thread before any group is submitted. A chunk counts as loaded when the chunk
+     * source can hand out its {@code FULL} chunk without loading one, which is exactly what the worker-side
+     * immediate lookup of {@code ServerChunkCache.getChunk} answers. Nothing is force-loaded. The check is
+     * per entity, so an entity at the edge of the loaded area falls back alone while the rest of its region
+     * stays on the workers; a whole region was refused only because one of its chunks was missing, which is
+     * what made the edge entities the dominant server-thread cost of the handoff.
      * <p>
-     * The margin is {@link #ENTITY_TICK_CHUNK_MARGIN} chunks around the region's own chunk rectangle. For a
-     * merged {@link RegionPolicy#DYNAMIC} region the rectangle is the region's own coordinate; chunks of the
-     * merged shape beyond it are still protected by the chunk source guard, which refuses the request and
-     * hands the entity to the server-thread fallback.
+     * The neighborhood of a chunk is a pure function of its coordinate, so it is computed once per chunk and
+     * shared by every entity standing in it, and the answer of the chunk source for one chunk is shared by
+     * every neighborhood that contains it. Both memos are batch local, so the server thread asks the chunk
+     * source once per distinct chunk of the batch instead of once per entity. The split happens once per
+     * batch: no entity moves before its lease (the server thread only awaits region work in between), a chunk
+     * that was missing is only ever loaded later, and a refused entity therefore never reaches a worker in
+     * this tick.
+     *
+     * @param level    the level whose chunk source answers the check
+     * @param pending  the entities of the batch, in snapshot order
+     * @param tickable receives the entities whose neighborhood is loaded
+     * @param refused  receives the entities that fall back to the server thread
      */
-    private boolean isEntityTickNeighborhoodLoaded(ServerLevel level, RegionState region) {
-        final RegionCoordinate coordinate = region.coordinate();
-        final int regionChunkSize = this.layout.regionChunkSize();
-        final int minChunkX = coordinate.regionX() * regionChunkSize - ENTITY_TICK_CHUNK_MARGIN;
-        final int minChunkZ = coordinate.regionZ() * regionChunkSize - ENTITY_TICK_CHUNK_MARGIN;
-        final int maxChunkX = coordinate.regionX() * regionChunkSize + regionChunkSize - 1 + ENTITY_TICK_CHUNK_MARGIN;
-        final int maxChunkZ = coordinate.regionZ() * regionChunkSize + regionChunkSize - 1 + ENTITY_TICK_CHUNK_MARGIN;
-        final ChunkSource chunkSource = level.getChunkSource();
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                if (chunkSource.getChunkNow(chunkX, chunkZ) == null) {
-                    return false;
+    private void splitPreloadRefusedEntities(ServerLevel level, List<Entity> pending, List<Entity> tickable, List<Entity> refused) {
+        final Long2ByteMap chunkLoaded = new Long2ByteOpenHashMap();
+        chunkLoaded.defaultReturnValue(NEIGHBORHOOD_UNKNOWN);
+        final Long2ByteMap neighborhoodLoaded = new Long2ByteOpenHashMap();
+        neighborhoodLoaded.defaultReturnValue(NEIGHBORHOOD_UNKNOWN);
+        for (final Entity entity : pending) {
+            // The cached block position of the entity: it is the chunk the entity's tick starts from and
+            // reading it allocates nothing, unlike deriving a chunk position per entity.
+            final BlockPos pos = entity.blockPosition();
+            final int chunkX = SectionPos.blockToSectionCoord(pos.getX());
+            final int chunkZ = SectionPos.blockToSectionCoord(pos.getZ());
+            if (this.isEntityTickNeighborhoodLoaded(level, chunkX, chunkZ, chunkLoaded, neighborhoodLoaded)) {
+                tickable.add(entity);
+            } else {
+                refused.add(entity);
+                this.chunkPreloadRefusedEntityTicks.incrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * {@return true when the {@link #ENTITY_TICK_CHUNK_MARGIN} neighborhood of the chunk at
+     * {@code chunkX, chunkZ} is loaded}
+     * <p>
+     * {@code neighborhoodLoaded} memoizes the answer per chunk of the batch (absent, not loaded, loaded), so
+     * the entities of one chunk ask once instead of once per entity, and {@code chunkLoaded} memoizes the
+     * chunk source answer per chunk, so a chunk shared by the neighborhoods of two adjacent chunks is looked
+     * up once. Nothing is force-loaded: a chunk that the chunk source does not already hold makes its
+     * neighborhood unloaded.
+     */
+    private boolean isEntityTickNeighborhoodLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded, Long2ByteMap neighborhoodLoaded) {
+        final long key = ChunkPos.asLong(chunkX, chunkZ);
+        final byte cached = neighborhoodLoaded.get(key);
+        if (cached != NEIGHBORHOOD_UNKNOWN) {
+            return cached == NEIGHBORHOOD_LOADED;
+        }
+        boolean loaded = true;
+        for (int offsetX = -ENTITY_TICK_CHUNK_MARGIN; offsetX <= ENTITY_TICK_CHUNK_MARGIN && loaded; offsetX++) {
+            for (int offsetZ = -ENTITY_TICK_CHUNK_MARGIN; offsetZ <= ENTITY_TICK_CHUNK_MARGIN; offsetZ++) {
+                if (!isChunkLoaded(level, chunkX + offsetX, chunkZ + offsetZ, chunkLoaded)) {
+                    loaded = false;
+                    break;
                 }
             }
         }
-        return true;
+        neighborhoodLoaded.put(key, loaded ? NEIGHBORHOOD_LOADED : NEIGHBORHOOD_NOT_LOADED);
+        return loaded;
+    }
+
+    /**
+     * {@return true when the chunk source can hand out the {@code FULL} chunk at {@code chunkX, chunkZ}
+     * without loading one}
+     * <p>
+     * {@code chunkLoaded} memoizes the answer per chunk of the batch.
+     */
+    private static boolean isChunkLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded) {
+        final long key = ChunkPos.asLong(chunkX, chunkZ);
+        final byte cached = chunkLoaded.get(key);
+        if (cached != NEIGHBORHOOD_UNKNOWN) {
+            return cached == NEIGHBORHOOD_LOADED;
+        }
+        final boolean loaded = level.getChunkSource().getChunkNow(chunkX, chunkZ) != null;
+        chunkLoaded.put(key, loaded ? NEIGHBORHOOD_LOADED : NEIGHBORHOOD_NOT_LOADED);
+        return loaded;
     }
 
     /**
