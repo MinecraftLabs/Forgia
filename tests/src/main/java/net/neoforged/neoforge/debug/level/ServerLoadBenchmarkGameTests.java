@@ -58,8 +58,9 @@ import net.neoforged.testframework.gametest.ExtendedGameTestHelper;
  * attribution is disabled again when the window ends, so the entity test and every other batch stay
  * uninstrumented.
  * <p>
- * The furnace workload places {@value #FURNACE_COUNT} lit furnaces that smelt and burn for the whole
- * window, so every furnace ticks every tick. The furnaces sit in region-interior chunks so the
+ * The furnace workload places {@value #FURNACE_COUNT} lit furnaces by default, or as many as the
+ * {@value #FURNACE_COUNT_PROPERTY} property asks for; they smelt and burn for the whole window, so every
+ * furnace ticks every tick. The furnaces sit in region-interior chunks so the
  * block-entity worker slice can lease their regions: a chunk whose coordinates are {@code 1} modulo 3 is
  * the center chunk of a 3x3 region and an interior chunk of a 9x9 region, so the placement rule does not
  * depend on the installed layout and every measured profile ticks the same furnaces at the same absolute
@@ -89,8 +90,16 @@ public class ServerLoadBenchmarkGameTests {
     private static final int WARMUP_TICKS = 200;
     /** Ticks sampled and reported. */
     private static final int MEASURED_TICKS = 600;
-    /** Furnaces of the block entity workload. */
+    /**
+     * Furnaces of the block entity workload when {@value #FURNACE_COUNT_PROPERTY} is unset.
+     */
     private static final int FURNACE_COUNT = 4096;
+    /**
+     * System property that overrides {@link #FURNACE_COUNT}, so the size of the furnace workload can be
+     * varied without editing the test. {@code 0} places no furnace at all: the block-entity slice then has
+     * no ticker to admit and reports its server-thread segments without a worker batch.
+     */
+    static final String FURNACE_COUNT_PROPERTY = "neoforge.serverBenchmarkFurnaces";
     /**
      * Chunk residue of a furnace column. Residue 1 is the center chunk of a 3x3 region and an interior
      * chunk of a 9x9 region, so a furnace in such a column is admissible to the block-entity worker slice
@@ -256,8 +265,8 @@ public class ServerLoadBenchmarkGameTests {
      * <p>
      * The furnaces are distributed over the interior columns of the grid, round-robin, with distinct
      * positions per column and additional vertical layers when a column holds more than one chunk worth.
-     * The positions only depend on {@code origin}, never on the installed region layout, so all measured
-     * profiles tick the same furnaces at the same places.
+     * The positions only depend on {@code origin} and {@link #furnaceCount()}, never on the installed region
+     * layout, so all measured profiles tick the same furnaces at the same places.
      */
     private static List<BlockPos> furnacePositions(BlockPos origin) {
         final List<ChunkPos> columns = new ArrayList<>();
@@ -269,8 +278,9 @@ public class ServerLoadBenchmarkGameTests {
         if (columns.isEmpty()) {
             throw new IllegalStateException("the benchmark grid has no interior chunk for the furnace columns");
         }
-        final List<BlockPos> positions = new ArrayList<>(FURNACE_COUNT);
-        for (int index = 0; index < FURNACE_COUNT; index++) {
+        final int count = furnaceCount();
+        final List<BlockPos> positions = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
             final ChunkPos column = columns.get(index % columns.size());
             final int slot = index / columns.size();
             final int offsetX = slot & 15;
@@ -279,6 +289,30 @@ public class ServerLoadBenchmarkGameTests {
             positions.add(new BlockPos(column.getMinBlockX() + offsetX, origin.getY() + 2 + 2 * layer, column.getMinBlockZ() + offsetZ));
         }
         return positions;
+    }
+
+    /**
+     * {@return the number of furnaces of this run, {@value #FURNACE_COUNT} unless
+     * {@value #FURNACE_COUNT_PROPERTY} overrides it}
+     * <p>
+     * An unparsable override fails instead of silently measuring the default workload, so a mistyped
+     * measurement knob cannot produce a row that looks like a different profile.
+     */
+    private static int furnaceCount() {
+        final String configured = System.getProperty(FURNACE_COUNT_PROPERTY);
+        if (configured == null || configured.isBlank()) {
+            return FURNACE_COUNT;
+        }
+        final int count;
+        try {
+            count = Integer.parseInt(configured.trim());
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException(FURNACE_COUNT_PROPERTY + " is not an integer: " + configured, exception);
+        }
+        if (count < 0) {
+            throw new IllegalArgumentException(FURNACE_COUNT_PROPERTY + " must not be negative: " + count);
+        }
+        return count;
     }
 
     /**

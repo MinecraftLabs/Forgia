@@ -176,6 +176,31 @@ class RegionThreadingEngineTest {
     }
 
     @Test
+    void blockRegionOwnershipCoversExactlyTheGroupsRegion() {
+        this.engine = new RegionThreadingEngine(1, false, false);
+        final ServerLevel level = mock(ServerLevel.class);
+        final ServerLevel otherLevel = mock(ServerLevel.class);
+        final BlockPos leased = new BlockPos(1, 0, 1);
+        // Chunks 0..15 are the dynamic region (0,0): 255 is still inside it, 256 is not, and the negative
+        // chunk -1 belongs to the region (-1,-1) that the leased group does not hold.
+        final BlockPos sameRegion = new BlockPos(255, 0, 255);
+        final BlockPos otherRegion = new BlockPos(256, 0, 256);
+        final BlockPos negativeRegion = new BlockPos(-1, 0, -1);
+
+        this.engine.runInBlockRegion(level, leased, () -> {
+            assertTrue(this.engine.isOwnedByCurrentRegion(level, leased));
+            assertTrue(this.engine.isOwnedByCurrentRegion(level, sameRegion), "a position of the leased region must be owned");
+            assertFalse(this.engine.isOwnedByCurrentRegion(level, otherRegion), "a position of the next region must not be owned");
+            assertFalse(this.engine.isOwnedByCurrentRegion(level, negativeRegion), "the region across the origin must not be owned");
+            assertFalse(this.engine.isOwnedByCurrentRegion(otherLevel, sameRegion), "the same coordinate of another level must not be owned");
+        });
+
+        this.drainRegion(level, leased);
+        assertEquals(0, this.engine.diagnostics().regionCount());
+        assertEquals(0, this.engine.diagnostics().ownershipViolationCount());
+    }
+
+    @Test
     void globalAndLevelContextsAreRestored() {
         this.engine = new RegionThreadingEngine(1, false, false);
         final ServerLevel level = mock(ServerLevel.class);

@@ -633,10 +633,13 @@ public final class RegionThreadingHooks {
 
     /**
      * Runs {@code task} in the owning block region context when the native engine is installed.
+     * <p>
+     * Called once per block-entity ticker, so it reads the installed engine without allocating the
+     * {@link Optional} of {@link RegionThreadingManager#get()}.
      */
     public static void runBlockTickTask(ServerLevel level, BlockPos pos, Runnable task) {
-        final Optional<RegionThreading> threading = RegionThreadingManager.get();
-        if (threading.isPresent() && threading.get() instanceof RegionThreadingEngine engine) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
             engine.runInBlockRegion(level, pos, task);
         } else {
             task.run();

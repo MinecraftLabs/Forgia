@@ -37,6 +37,8 @@ public final class RegionLayout {
     public static final int MAX_FIXED_REGION_CHUNK_SIZE = 32;
     /** Edge length in chunks of the default fixed layout; the default of {@code regionThreadingFixedRegionChunks}. */
     public static final int FIXED_3X3_REGION_CHUNK_SIZE = 3;
+    /** Edge length in blocks of one chunk, the unit the chunk coordinates of a position are taken in. */
+    private static final int CHUNK_BLOCK_SIZE = 16;
     public static final RegionLayout DYNAMIC = new RegionLayout(RegionPolicy.DYNAMIC, DYNAMIC_REGION_CHUNK_SIZE);
     public static final RegionLayout FIXED_3X3 = new RegionLayout(RegionPolicy.FIXED_3X3, FIXED_3X3_REGION_CHUNK_SIZE);
 
@@ -116,6 +118,19 @@ public final class RegionLayout {
     }
 
     public RegionCoordinate regionAt(ServerLevel level, BlockPos pos) {
-        return this.regionAt(level, Math.floorDiv(pos.getX(), 16), Math.floorDiv(pos.getZ(), 16));
+        return this.regionAt(level, Math.floorDiv(pos.getX(), CHUNK_BLOCK_SIZE), Math.floorDiv(pos.getZ(), CHUNK_BLOCK_SIZE));
+    }
+
+    /**
+     * {@return true when {@code pos} of {@code level} belongs to {@code coordinate}}
+     * <p>
+     * The non-allocating counterpart of {@code regionAt(level, pos).equals(coordinate)}. The per-ticker
+     * ownership check of the block-entity worker slice calls it once per ticker, so it must not create a
+     * {@link RegionCoordinate} per call.
+     */
+    public boolean isInRegion(ServerLevel level, BlockPos pos, RegionCoordinate coordinate) {
+        return coordinate.level() == level
+                && this.regionX(Math.floorDiv(pos.getX(), CHUNK_BLOCK_SIZE)) == coordinate.regionX()
+                && this.regionZ(Math.floorDiv(pos.getZ(), CHUNK_BLOCK_SIZE)) == coordinate.regionZ();
     }
 }

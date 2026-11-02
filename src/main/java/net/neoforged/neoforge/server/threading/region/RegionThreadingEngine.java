@@ -316,8 +316,22 @@ public final class RegionThreadingEngine implements RegionThreading {
             return false;
         }
 
+        final RegionState region = basicContext.regionState;
+        if (region == null || !region.isOwnedByCurrentThread()) {
+            return false;
+        }
+        // A region group holds the lease of its region for its whole body, and the regionizer refuses to
+        // merge, split or transfer a running region. The mapping of the group's own coordinate therefore
+        // cannot change while the group runs, so the coordinate comparison proves ownership without the
+        // regionizer read and the RegionCoordinate allocation that every block-entity ticker of a group
+        // would otherwise pay for. Positions outside the group's region keep the authoritative lookup.
+        if (region.coordinate().equals(basicContext.regionCoordinate)
+                && this.layout.isInRegion(level, pos, basicContext.regionCoordinate)) {
+            return true;
+        }
+
         final RegionCoordinate coordinate = this.layout.regionAt(level, pos);
-        return basicContext.regionState != null && this.regionizer.get(coordinate) == basicContext.regionState && basicContext.regionState.isOwnedByCurrentThread();
+        return this.regionizer.get(coordinate) == region;
     }
 
     @Override
