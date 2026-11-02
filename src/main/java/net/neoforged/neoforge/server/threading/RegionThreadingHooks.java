@@ -24,8 +24,8 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
-import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -47,11 +47,14 @@ public final class RegionThreadingHooks {
      * created before bridge installation retain legacy storage for their lifetime; storage is never
      * migrated by installing or removing a bridge. The normal server lifecycle installs the bridge
      * before creating levels. This choice grants no worker access to either backend.
+     * <p>
+     * The layout carries the fixed region edge length, so the physical section partitions of a level are
+     * created with the same size the installed engine ticks with.
      */
-    public static RegionPolicy entitySectionStoragePolicy() {
+    public static RegionLayout entitySectionStorageLayout() {
         return RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine
-                ? engine.regionPolicy()
-                : RegionPolicy.DYNAMIC;
+                ? engine.regionLayout()
+                : RegionLayout.DYNAMIC;
     }
 
     /**

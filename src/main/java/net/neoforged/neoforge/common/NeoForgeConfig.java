@@ -14,6 +14,7 @@ import net.neoforged.neoforge.common.ModConfigSpec.ConfigValue;
 import net.neoforged.neoforge.common.ModConfigSpec.IntValue;
 import net.neoforged.neoforge.common.ModConfigSpec.LongValue;
 import net.neoforged.neoforge.server.threading.RegionThreadingSupport;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
@@ -50,6 +51,8 @@ public class NeoForgeConfig {
         public final IntValue regionThreadingWorkerThreads;
 
         public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
+
+        public final IntValue regionThreadingFixedRegionChunks;
 
         public final ModConfigSpec.EnumValue<RegionThreadingOwnershipViolationMode> regionThreadingOwnershipViolationMode;
 
@@ -139,10 +142,16 @@ public class NeoForgeConfig {
                     .defineInRange("regionThreadingWorkerThreads", 0, 0, 512);
 
             regionThreadingMode = builder
-                    .comment("EXPERIMENTAL: Region coordinate policy. FIXED_3X3 uses a non-overlapping global 3x3-chunk grid; regions never merge, split, or change coordinates. DYNAMIC keeps the legacy 16x16-chunk grid with merge and split recalculation for compatibility.")
+                    .comment("EXPERIMENTAL: Region coordinate policy. FIXED_3X3 uses a non-overlapping global fixed-chunk grid whose edge length is regionThreadingFixedRegionChunks (3 chunks unless configured otherwise); regions never merge, split, or change coordinates. DYNAMIC keeps the legacy 16x16-chunk grid with merge and split recalculation for compatibility.")
                     .translation("neoforge.configgui.regionThreadingMode")
                     .worldRestart()
                     .defineEnum("regionThreadingMode", RegionPolicy.FIXED_3X3);
+
+            regionThreadingFixedRegionChunks = builder
+                    .comment("EXPERIMENTAL: Edge length in chunks of one fixed region, used when regionThreadingMode is FIXED_3X3. 3 reproduces the original 3x3-chunk grid, where only the center chunk of a region has all eight neighbors in the same region. Larger regions keep more neighboring chunks inside one region at the cost of coarser parallelism and longer region leases. A value outside 3..32 is clamped into that range when the config loads, and the region layout rejects it with an IllegalArgumentException.")
+                    .translation("neoforge.configgui.regionThreadingFixedRegionChunks")
+                    .worldRestart()
+                    .defineInRange("regionThreadingFixedRegionChunks", RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE, RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE);
 
             regionThreadingOwnershipViolationMode = builder
                     .comment("EXPERIMENTAL: Controls how region threading ownership assertion failures are handled.")

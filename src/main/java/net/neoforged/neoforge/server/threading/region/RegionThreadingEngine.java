@@ -240,9 +240,23 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * Creates an engine with an explicit region layout policy, every bounded tick slice and an entity
      * storage mode.
+     * <p>
+     * The policy selects the size-3 default fixed layout; production passes the configured
+     * {@link RegionLayout} instead, so the engine, its regionizer and the physical section partitions of
+     * the levels it ticks share one fixed region size.
      */
     public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionPolicy regionPolicy, RegionEntityStorageMode entityStorageMode) {
-        this.layout = RegionLayout.of(regionPolicy);
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, randomTickWorkerExecutionEnabled, RegionLayout.of(regionPolicy), entityStorageMode);
+    }
+
+    /**
+     * Creates an engine with an explicit region layout, every bounded tick slice and an entity storage mode.
+     * <p>
+     * This is the production constructor: the layout carries both the policy and the fixed region edge
+     * length, so nothing downstream has to guess the size.
+     */
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
+        this.layout = layout;
         this.regionizer = new ThreadedRegionizer(this.layout);
         this.workerPool = new RegionWorkerPool(workerThreads > 0 ? workerThreads : Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
         this.workerExecutionEnabled = workerExecutionEnabled;
@@ -256,8 +270,26 @@ public final class RegionThreadingEngine implements RegionThreading {
         RegionEntityOwnershipScope.resetCounters();
     }
 
+    /**
+     * Creates an engine with an explicit region layout and every bounded tick slice, keeping entity storage
+     * on the server thread.
+     */
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionLayout layout) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, randomTickWorkerExecutionEnabled, layout, RegionEntityStorageMode.MAIN_THREAD_ONLY);
+    }
+
     public RegionPolicy regionPolicy() {
         return this.layout.policy();
+    }
+
+    /**
+     * {@return the layout this engine maps chunks, entities and tasks with}
+     * <p>
+     * The physical entity section partitions of a level capture this layout when the level is created, so
+     * the manager partitions sections with exactly the size this engine ticks with.
+     */
+    public RegionLayout regionLayout() {
+        return this.layout;
     }
 
     @Override
@@ -2926,6 +2958,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.regionizer.maxRegionLastTickDurationNanos(),
                 this.globalRegion.cappedDrainCount() + this.regionizer.cappedDrainCount(),
                 this.layout.policy(),
+                this.layout.regionChunkSize(),
                 this.entityStorageMode,
                 this.isScheduledTickWorkerDispatchEffective(),
                 this.isRandomTickWorkerDispatchEffective(),

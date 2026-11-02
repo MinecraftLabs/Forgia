@@ -53,6 +53,7 @@ import net.neoforged.neoforge.registries.NeoForgeRegistries.Keys;
 import net.neoforged.neoforge.server.permission.PermissionAPI;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -100,7 +101,9 @@ public class ServerLifecycleHooks {
         ConfigTracker.INSTANCE.loadConfigs(ModConfig.Type.SERVER, FMLPaths.CONFIGDIR.get(), getServerConfigPath(server));
         if (NeoForgeConfig.SERVER.enableRegionThreadingBridge.get()) {
             if (RegionThreadingCompatibility.canInstallBridge()) {
-                RegionThreadingManager.install(new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.regionThreadingMode.get()));
+                // The layout carries the fixed region edge length, so the engine, its regionizer and the
+                // physical section partitions of every level created afterwards share one region size.
+                RegionThreadingManager.install(new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get())));
             } else {
                 LOGGER.warn(SERVERHOOKS, "Region threading bridge is enabled but blocked by compatibility policy {}; unsupported mods: {}", RegionThreadingCompatibility.defaultSupport(), RegionThreadingCompatibility.unsupportedMods());
             }

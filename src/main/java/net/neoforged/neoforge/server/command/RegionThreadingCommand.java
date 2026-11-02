@@ -86,6 +86,7 @@ final class RegionThreadingCommand {
                 + ", rememberedEntityTransferResults=" + diagnostics.rememberedEntityTransferResultCount()
                 + ", rejectedEntityTransferRecords=" + diagnostics.rejectedEntityTransferRecordCount()
                 + ", regionPolicy=" + diagnostics.regionPolicy()
+                + ", regionChunkSize=" + diagnostics.regionChunkSize()
                 + ", entityStorageMode=" + diagnostics.entityStorageMode()), false);
     }
 
@@ -103,6 +104,7 @@ final class RegionThreadingCommand {
                 + ", unsupportedMods=" + RegionThreadingCompatibility.unsupportedMods().size()
                 + ", requiredMods=" + RegionThreadingCompatibility.requiredMods().size()
                 + ", configuredWorkerThreads=" + NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get()
-                + ", configuredRegionPolicy=" + NeoForgeConfig.SERVER.regionThreadingMode.get()), false);
+                + ", configuredRegionPolicy=" + NeoForgeConfig.SERVER.regionThreadingMode.get()
+                + ", configuredRegionChunkSize=" + NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get()), false);
     }
 }

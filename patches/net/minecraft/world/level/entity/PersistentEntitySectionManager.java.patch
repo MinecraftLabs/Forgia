@@ -19,16 +19,16 @@
 +    public PersistentEntitySectionManager(
 +        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_
 +    ) {
-+        this(p_157503_, p_157504_, p_157505_, p_157506_, net.neoforged.neoforge.server.threading.region.RegionPolicy.DYNAMIC);
++        this(p_157503_, p_157504_, p_157505_, p_157506_, net.neoforged.neoforge.server.threading.region.RegionLayout.DYNAMIC);
 +    }
 +
 +    public PersistentEntitySectionManager(
 +        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_,
-+        net.neoforged.neoforge.server.threading.region.RegionPolicy policy
++        net.neoforged.neoforge.server.threading.region.RegionLayout layout
 +    ) {
          this.visibleEntityStorage = new EntityLookup<>();
 -        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility);
-+        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility, policy);
++        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility, layout);
          this.chunkVisibility.defaultReturnValue(Visibility.HIDDEN);
          this.chunkLoadStatuses.defaultReturnValue(PersistentEntitySectionManager.ChunkLoadStatus.FRESH);
          this.callbacks = p_157504_;

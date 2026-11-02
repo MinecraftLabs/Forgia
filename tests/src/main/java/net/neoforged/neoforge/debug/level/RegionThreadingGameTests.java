@@ -74,7 +74,7 @@ public class RegionThreadingGameTests {
 
     @GameTest(batch = "regionPhysicalEntityStorage", timeoutTicks = 200)
     @EmptyTemplate(value = "15x10x15", floor = true)
-    @TestHolder(description = "Moves a tracked item across a fixed 3x3 boundary in the real persistent section storage")
+    @TestHolder(description = "Moves a tracked item across a fixed region boundary in the real persistent section storage")
     static void physicalEntitySectionCrossing(final DynamicTest test) {
         test.onGameTest(helper -> {
             final var diagnostics = workerDiagnostics(helper);
@@ -88,9 +88,10 @@ public class RegionThreadingGameTests {
             }
             helper.assertTrue(storageField(storage, "sections") == null && storageField(storage, "sectionIds") == null,
                     "fixed server storage must not retain global authoritative containers");
-            final BlockPos interior = evidenceBlockPos(helper, RegionPolicy.FIXED_3X3, 5);
-            final int boundaryChunkX = (Math.floorDiv(SectionPos.blockToSectionCoord(interior.getX()), RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE) + 1)
-                    * RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE;
+            final int regionChunkSize = diagnostics.get().regionChunkSize();
+            final BlockPos interior = evidenceBlockPos(helper, RegionPolicy.FIXED_3X3, regionChunkSize, 5);
+            final int boundaryChunkX = (Math.floorDiv(SectionPos.blockToSectionCoord(interior.getX()), regionChunkSize) + 1)
+                    * regionChunkSize;
             final int boundaryX = boundaryChunkX * 16;
             final BlockPos source = new BlockPos(boundaryX - 1, interior.getY(), interior.getZ());
             final BlockPos target = source.offset(2, 0, 0);
@@ -155,7 +156,7 @@ public class RegionThreadingGameTests {
                 return;
             }
             final ServerLevel level = helper.getLevel();
-            final BlockPos beaconPos = evidenceBlockPos(helper, diagnostics.get().regionPolicy(), 3);
+            final BlockPos beaconPos = evidenceBlockPos(helper, diagnostics.get().regionPolicy(), diagnostics.get().regionChunkSize(), 3);
             // The beacon queries ServerPlayer entities while it applies effects, so keep a player alive.
             helper.makeTickingMockServerPlayerInCorner(GameType.SURVIVAL);
             final long fallbackBefore = diagnostics.get().fallbackBlockEntityTicks();
@@ -212,7 +213,7 @@ public class RegionThreadingGameTests {
             }
             final ServerLevel level = helper.getLevel();
             final RegionPolicy policy = diagnostics.get().regionPolicy();
-            final BlockPos furnacePos = evidenceBlockPos(helper, policy, 0);
+            final BlockPos furnacePos = evidenceBlockPos(helper, policy, diagnostics.get().regionChunkSize(), 0);
             final long workersBefore = diagnostics.get().blockEntityTicksOnWorkers();
             final long fallbackBefore = diagnostics.get().fallbackBlockEntityTicks();
             helper.addEndListener(passed -> {
@@ -297,7 +298,7 @@ public class RegionThreadingGameTests {
                 return;
             }
             final ServerLevel level = helper.getLevel();
-            final BlockPos blockPos = evidenceBlockPos(helper, diagnostics.get().regionPolicy(), 1);
+            final BlockPos blockPos = evidenceBlockPos(helper, diagnostics.get().regionPolicy(), diagnostics.get().regionChunkSize(), 1);
             final String serverThreadName = Thread.currentThread().getName();
             final long randomTicksBefore = diagnostics.get().randomTicksOnWorkers();
             final GameRules.IntegerValue randomTickSpeed = level.getGameRules().getRule(GameRules.RULE_RANDOMTICKING);
@@ -367,7 +368,7 @@ public class RegionThreadingGameTests {
             }
             final ServerLevel level = helper.getLevel();
             final RegionPolicy policy = diagnostics.get().regionPolicy();
-            final BlockPos furnacePos = evidenceBlockPos(helper, policy, 4);
+            final BlockPos furnacePos = evidenceBlockPos(helper, policy, diagnostics.get().regionChunkSize(), 4);
             final BlockPos beaconPos = furnacePos.offset(1, 0, 0);
             final long workersBefore = diagnostics.get().blockEntityTicksOnWorkers();
             helper.addEndListener(passed -> {
@@ -434,7 +435,7 @@ public class RegionThreadingGameTests {
             final int previousRandomTickSpeed = randomTickSpeed.get();
             final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
             final ServerLevel level = helper.getLevel();
-            final BlockPos icePos = evidenceBlockPos(helper, diagnostics.map(RegionThreadingDiagnostics::regionPolicy).orElse(RegionPolicy.FIXED_3X3), 2);
+            final BlockPos icePos = evidenceBlockPos(helper, diagnostics.map(RegionThreadingDiagnostics::regionPolicy).orElse(RegionPolicy.FIXED_3X3), diagnostics.map(RegionThreadingDiagnostics::regionChunkSize).orElse(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE), 2);
             helper.addEndListener(passed -> {
                 randomTickSpeed.set(previousRandomTickSpeed, level.getServer());
                 level.setBlock(icePos, Blocks.AIR.defaultBlockState(), 3);
@@ -516,17 +517,21 @@ public class RegionThreadingGameTests {
      * structure could therefore share a region with another test's block entities. Each test instead
      * uses its own slot far away from the structure grid. The slot's chunk is still made an interior
      * chunk, because the furnace family and random tick slices only leave the server thread when the
-     * eight neighboring chunks belong to the same region.
+     * neighboring chunks belong to the same region.
+     * <p>
+     * {@code fixedRegionChunkSize} is the size of the installed layout's fixed grid
+     * ({@code RegionThreadingDiagnostics.regionChunkSize()}), so the slot stays an interior chunk for any
+     * configured {@code regionThreadingFixedRegionChunks} value.
      */
-    private static BlockPos evidenceBlockPos(ExtendedGameTestHelper helper, RegionPolicy policy, int slot) {
+    private static BlockPos evidenceBlockPos(ExtendedGameTestHelper helper, RegionPolicy policy, int fixedRegionChunkSize, int slot) {
         final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
         final int baseX = origin.getX();
         final int baseZ = origin.getZ() + EVIDENCE_AREA_Z_OFFSET + slot * EVIDENCE_AREA_SPACING;
         int chunkX = Math.floorDiv(baseX, 16);
         int chunkZ = Math.floorDiv(baseZ, 16);
         if (policy == RegionPolicy.FIXED_3X3) {
-            chunkX = nearestChunkWithResidue(chunkX, RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, 1);
-            chunkZ = nearestChunkWithResidue(chunkZ, RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, 1);
+            chunkX = nearestChunkWithResidue(chunkX, fixedRegionChunkSize, 1);
+            chunkZ = nearestChunkWithResidue(chunkZ, fixedRegionChunkSize, 1);
         } else {
             chunkX = dynamicInteriorChunk(chunkX);
             chunkZ = dynamicInteriorChunk(chunkZ);

@@ -37,7 +37,7 @@
 +        // worker still unwinding after the manager was removed, are both still guarded.
 +        this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage,
 +                net.neoforged.neoforge.server.threading.RegionThreadingHooks::assertServerEntityStorageAccess,
-+                net.neoforged.neoforge.server.threading.RegionThreadingHooks.entitySectionStoragePolicy());
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.entitySectionStorageLayout());
 +        // Neo: the vanilla section/index storage stays owned by the server thread. In production this view
 +        // rejects every legacy entity query issued from a native region worker before its predicate,
 +        // consumer or result escapes. Non-worker callers, the client level and the ordinary server thread

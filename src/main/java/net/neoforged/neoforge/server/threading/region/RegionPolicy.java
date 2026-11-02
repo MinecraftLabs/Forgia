@@ -14,7 +14,11 @@ public enum RegionPolicy {
      */
     DYNAMIC,
     /**
-     * Non-overlapping global 3x3-chunk grid. Regions never merge, split, or change coordinates.
+     * Non-overlapping global fixed-chunk grid. Regions never merge, split, or change coordinates.
+     * <p>
+     * The name is the historical size-3 default: the edge length of one region is the
+     * {@code regionThreadingFixedRegionChunks} server config value, which defaults to 3. Keeping this
+     * value means an existing config file keeps the fixed policy and only the size changes.
      */
     FIXED_3X3
 }

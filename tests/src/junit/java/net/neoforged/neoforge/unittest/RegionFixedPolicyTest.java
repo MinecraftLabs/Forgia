@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
@@ -42,7 +44,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /**
- * Exercises the non-overlapping fixed 3x3-chunk region policy.
+ * Exercises the non-overlapping fixed region policy, including the configured region edge length.
  */
 @Timeout(10)
 class RegionFixedPolicyTest {
@@ -119,6 +121,78 @@ class RegionFixedPolicyTest {
     }
 
     @Test
+    void productionConfigDefaultsToTheSizeThreeFixedRegion() {
+        assertEquals(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.getDefault().intValue());
+        assertEquals(RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE, NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.getDefault().intValue());
+        // The production wiring builds one layout from the two config values and hands it to the engine.
+        final RegionLayout configured = RegionLayout.of(
+                NeoForgeConfig.SERVER.regionThreadingMode.getDefault(),
+                NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.getDefault());
+        assertSame(RegionLayout.FIXED_3X3, configured);
+        assertEquals(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, configured.regionChunkSize());
+    }
+
+    @Test
+    void fixedLayoutUsesTheConfiguredEdgeLengthAtBoundariesAndNegativeChunks() {
+        final ServerLevel level = mock(ServerLevel.class);
+        for (int size : new int[] { 3, 9, 16 }) {
+            final RegionLayout layout = RegionLayout.fixed(size);
+            assertTrue(layout.isFixed());
+            assertEquals(RegionPolicy.FIXED_3X3, layout.policy());
+            assertEquals(size, layout.regionChunkSize());
+            for (int region = -3; region <= 3; region++) {
+                final int firstChunk = region * size;
+                final int lastChunk = firstChunk + size - 1;
+                assertEquals(new RegionCoordinate(level, region, region), layout.regionAt(level, firstChunk, firstChunk),
+                        "first chunk of region " + region + " for size " + size);
+                assertEquals(new RegionCoordinate(level, region, region), layout.regionAt(level, lastChunk, lastChunk),
+                        "last chunk of region " + region + " for size " + size);
+                assertEquals(region, layout.regionX(firstChunk));
+                assertEquals(region, layout.regionZ(lastChunk));
+                assertEquals(region - 1, layout.regionX(firstChunk - 1), "the chunk before the first chunk belongs to the previous region");
+                assertEquals(region + 1, layout.regionZ(lastChunk + 1), "the chunk after the last chunk belongs to the next region");
+                // A block inside the first chunk maps to the same region as that chunk.
+                assertEquals(new RegionCoordinate(level, region, region), layout.regionAt(level, new BlockPos(firstChunk * 16, 64, firstChunk * 16)));
+            }
+        }
+    }
+
+    @Test
+    void sizeThreeReproducesTheOriginalFixedRegionCoordinates() {
+        final ServerLevel level = mock(ServerLevel.class);
+        final int[] chunks = { 0, 1, 2, 3, 4, 5, 6, 47, 48, -1, -2, -3, -4, -5, -6, -7, -48, -49 };
+        final int[] expectedRegions = { 0, 0, 0, 1, 1, 1, 2, 15, 16, -1, -1, -1, -2, -2, -2, -3, -16, -17 };
+        final RegionLayout configured = RegionLayout.of(RegionPolicy.FIXED_3X3, RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE);
+        for (int index = 0; index < chunks.length; index++) {
+            final int chunk = chunks[index];
+            final int expected = expectedRegions[index];
+            assertEquals(expected, RegionLayout.FIXED_3X3.regionX(chunk), "default fixed layout at chunk " + chunk);
+            assertEquals(expected, configured.regionX(chunk), "configured size-3 layout at chunk " + chunk);
+            assertEquals(expected, RegionLayout.of(RegionPolicy.FIXED_3X3).regionX(chunk), "policy-only layout at chunk " + chunk);
+            assertEquals(new RegionCoordinate(level, expected, expected), configured.regionAt(level, chunk, chunk));
+            assertEquals(Math.floorDiv(chunk, 3), expected, "the fixed grid stays the global floorDiv grid");
+        }
+    }
+
+    @Test
+    void fixedRegionChunkSizeIsClampedByTheConfigAndRejectedByTheLayout() {
+        // An existing config file with an out-of-range value is clamped into 3..32 when the config loads.
+        assertEquals(RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE,
+                ((Integer) NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.getSpec().correct(RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE - 1)).intValue());
+        assertEquals(RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE,
+                ((Integer) NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.getSpec().correct(RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE + 1)).intValue());
+        // The layout constructor path rejects instead of clamping, so nothing can build an engine or
+        // partition set with a size it did not ask for.
+        assertThrows(IllegalArgumentException.class, () -> RegionLayout.fixed(RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE - 1));
+        assertThrows(IllegalArgumentException.class, () -> RegionLayout.fixed(RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE + 1));
+        assertThrows(IllegalArgumentException.class, () -> RegionLayout.of(RegionPolicy.FIXED_3X3, 0));
+        assertSame(RegionLayout.FIXED_3X3, RegionLayout.fixed(RegionLayout.MIN_FIXED_REGION_CHUNK_SIZE));
+        assertEquals(RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE, RegionLayout.fixed(RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE).regionChunkSize());
+        // The dynamic grid has no configurable fixed size, so the value is ignored instead of validated.
+        assertSame(RegionLayout.DYNAMIC, RegionLayout.of(RegionPolicy.DYNAMIC, RegionLayout.MAX_FIXED_REGION_CHUNK_SIZE + 1));
+    }
+
+    @Test
     void engineDiagnosticsReportSelectedPolicy() {
         this.fixedEngine();
         assertEquals(RegionPolicy.FIXED_3X3, this.engine.diagnostics().regionPolicy());
@@ -126,6 +200,38 @@ class RegionFixedPolicyTest {
         this.engine.shutdown();
         this.engine = new RegionThreadingEngine(1, false, false);
         assertEquals(RegionPolicy.DYNAMIC, this.engine.diagnostics().regionPolicy());
+    }
+
+    @Test
+    void engineDiagnosticsReportTheConfiguredRegionChunkSize() {
+        this.engine = new RegionThreadingEngine(1, false, false, false, false, false, false, RegionLayout.fixed(9));
+        assertEquals(RegionPolicy.FIXED_3X3, this.engine.diagnostics().regionPolicy());
+        assertEquals(9, this.engine.diagnostics().regionChunkSize());
+        assertEquals(9, this.engine.regionLayout().regionChunkSize());
+
+        this.engine.shutdown();
+        this.engine = new RegionThreadingEngine(1, false, false, false, false, RegionPolicy.FIXED_3X3);
+        assertEquals(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE, this.engine.diagnostics().regionChunkSize());
+
+        this.engine.shutdown();
+        this.engine = new RegionThreadingEngine(1, false, false, false, false, RegionPolicy.DYNAMIC);
+        assertEquals(RegionLayout.DYNAMIC_REGION_CHUNK_SIZE, this.engine.diagnostics().regionChunkSize());
+    }
+
+    @Test
+    void engineMapsChunksAndSectionsWithTheConfiguredSize() {
+        this.engine = new RegionThreadingEngine(1, false, false, false, false, false, false, RegionLayout.fixed(9));
+        final ServerLevel level = mock(ServerLevel.class);
+        // Nine chunks of one edge share one region; the ninth neighbor starts the next one.
+        for (int chunkX = 0; chunkX < 9; chunkX++) {
+            this.engine.addRegionSection(level, chunkX, 0);
+        }
+        assertEquals(1, this.engine.diagnostics().regionCount());
+        assertEquals(9, this.engine.diagnostics().loadedChunkCount());
+
+        this.engine.addRegionSection(level, 9, 0);
+        assertEquals(2, this.engine.diagnostics().regionCount());
+        assertEquals(0L, this.engine.diagnostics().mergeCheckRequestCount());
     }
 
     @Test

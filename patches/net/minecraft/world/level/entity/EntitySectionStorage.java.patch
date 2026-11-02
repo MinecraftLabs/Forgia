@@ -12,12 +12,12 @@
 +    private final net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions<T> partitions;
  
      public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_) {
-+        this(p_156855_, p_156856_, net.neoforged.neoforge.server.threading.region.RegionPolicy.DYNAMIC);
++        this(p_156855_, p_156856_, net.neoforged.neoforge.server.threading.region.RegionLayout.DYNAMIC);
 +    }
 +
-+    public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_, net.neoforged.neoforge.server.threading.region.RegionPolicy policy) {
-+        this.partitions = policy == net.neoforged.neoforge.server.threading.region.RegionPolicy.FIXED_3X3
-+                ? new net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions<>() : null;
++    public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_, net.neoforged.neoforge.server.threading.region.RegionLayout layout) {
++        this.partitions = layout.isFixed()
++                ? new net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions<>(layout) : null;
 +        this.sections = this.partitions == null ? new Long2ObjectOpenHashMap<>() : null;
 +        this.sectionIds = this.partitions == null ? new LongAVLTreeSet() : null;
          this.entityClass = p_156855_;

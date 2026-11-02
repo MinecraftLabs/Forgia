@@ -22,23 +22,38 @@ import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Authoritative spatial storage for the fixed 3x3 layout. Each bucket owns its section map and ID tree;
- * there is no global section index. Buckets are indexed by region X and then region Z, so a chunk range
- * resolves one row instead of scanning every partition. All access remains on the server thread. This
+ * Authoritative spatial storage for one fixed {@link RegionLayout}. Each bucket owns its section map and ID
+ * tree; there is no global section index. Buckets are indexed by region X and then region Z, so a chunk
+ * range resolves one row instead of scanning every partition. All access remains on the server thread. This
  * does not confer region ownership of entities, UUIDs, tracking, or the lazy caches inside entity
  * sections.
+ * <p>
+ * The layout is the one the installed engine ticks with, so a manager never partitions sections into
+ * different regions than the engine that ticks them.
  */
 @ApiStatus.Internal
 public final class FixedEntitySectionPartitions<T extends EntityAccess> {
-    /** Region X to region Z to the bucket that owns that 3x3-chunk region. */
+    /** Region X to region Z to the bucket that owns that fixed region. */
     private final Long2ObjectMap<Long2ObjectMap<Bucket<T>>> partitionRows = new Long2ObjectOpenHashMap<>();
+    private final RegionLayout layout;
 
-    private static int regionX(long sectionId) {
-        return RegionLayout.FIXED_3X3.regionX(SectionPos.x(sectionId));
+    /**
+     * @param layout the fixed layout whose region edge length indexes the buckets
+     * @throws IllegalArgumentException when {@code layout} is not a fixed layout
+     */
+    public FixedEntitySectionPartitions(RegionLayout layout) {
+        if (!layout.isFixed()) {
+            throw new IllegalArgumentException("FixedEntitySectionPartitions requires a fixed region layout: " + layout.policy());
+        }
+        this.layout = layout;
     }
 
-    private static int regionZ(long sectionId) {
-        return RegionLayout.FIXED_3X3.regionZ(SectionPos.z(sectionId));
+    private int regionX(long sectionId) {
+        return this.layout.regionX(SectionPos.x(sectionId));
+    }
+
+    private int regionZ(long sectionId) {
+        return this.layout.regionZ(SectionPos.z(sectionId));
     }
 
     private static void checkAccess() {

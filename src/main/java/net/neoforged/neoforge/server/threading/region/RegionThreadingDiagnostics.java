@@ -34,6 +34,10 @@ package net.neoforged.neoforge.server.threading.region;
  * also increments {@link #ownershipViolationCount()}, because the guard still reports the operation and
  * throws before it mutates anything. A worker entity mutation without an active lease is not an ownership
  * decision: it only increments {@link #ownershipViolationCount()}.
+ * <p>
+ * {@link #regionChunkSize()} is the edge length in chunks of one region coordinate of the installed
+ * layout. For a fixed policy it is the configured fixed region size, so the status output and every
+ * diagnostic consumer read the same value the engine and the physical section partitions use.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -80,6 +84,7 @@ public record RegionThreadingDiagnostics(
         long maxRegionLastTickDurationNanos,
         long cappedDrainCount,
         RegionPolicy regionPolicy,
+        int regionChunkSize,
         RegionEntityStorageMode entityStorageMode,
         boolean scheduledTickWorkerDispatchEffective,
         boolean randomTickWorkerDispatchEffective,

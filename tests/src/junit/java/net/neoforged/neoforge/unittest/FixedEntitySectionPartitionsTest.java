@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -49,7 +50,7 @@ import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions;
-import net.neoforged.neoforge.server.threading.region.RegionPolicy;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionWorkerExecutor;
 import org.junit.jupiter.api.Test;
@@ -57,13 +58,13 @@ import org.junit.jupiter.api.Timeout;
 
 @Timeout(20)
 class FixedEntitySectionPartitionsTest {
-    private static EntitySectionStorage<TestEntity> storage(RegionPolicy policy) {
-        return new EntitySectionStorage<>(TestEntity.class, chunk -> Visibility.TICKING, policy);
+    private static EntitySectionStorage<TestEntity> storage(RegionLayout layout) {
+        return new EntitySectionStorage<>(TestEntity.class, chunk -> Visibility.TICKING, layout);
     }
 
     @Test
     void physicalBucketsOwnIndependentMapsAndTreesAndRetire() throws Exception {
-        var fixed = storage(RegionPolicy.FIXED_3X3);
+        var fixed = storage(RegionLayout.FIXED_3X3);
         assertNull(field(fixed, "sections"));
         assertNull(field(fixed, "sectionIds"));
         long[] ids = { SectionPos.asLong(-4, 0, -4), SectionPos.asLong(-3, 0, -3), SectionPos.asLong(-1, 17, -1), SectionPos.asLong(0, -7, 0), SectionPos.asLong(2, 8, 2), SectionPos.asLong(3, 0, 3) };
@@ -96,8 +97,8 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void operationsMatchLegacyAtNegativeBoundariesAndPackedCoordinateEdges() {
-        var legacy = storage(RegionPolicy.DYNAMIC);
-        var fixed = storage(RegionPolicy.FIXED_3X3);
+        var legacy = storage(RegionLayout.DYNAMIC);
+        var fixed = storage(RegionLayout.FIXED_3X3);
         int[] horizontal = { -2097152, -2097151, -4, -3, -1, 0, 2, 3, 2097150, 2097151 };
         int[] vertical = { -524288, -17, -1, 0, 1, 524287 };
         List<Long> keys = new ArrayList<>();
@@ -138,8 +139,8 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void queriesPreserveVanillaOrderVisibilityTypedCacheAndEveryAbortPrefix() {
-        var legacy = storage(RegionPolicy.DYNAMIC);
-        var fixed = storage(RegionPolicy.FIXED_3X3);
+        var legacy = storage(RegionLayout.DYNAMIC);
+        var fixed = storage(RegionLayout.FIXED_3X3);
         int id = 0;
         for (int x : new int[] { 3, -4, 0, -1, 2, -3 }) {
             for (int z : new int[] { -1, 3, -3, 0 }) {
@@ -186,8 +187,8 @@ class FixedEntitySectionPartitionsTest {
     @Test
     void expandedQueryBoundsAndSignedLongOverflowMatchLegacy() {
         for (int x : new int[] { -2097152, -4, -1, 0, 3, 2097150, 2097151 }) {
-            var legacy = storage(RegionPolicy.DYNAMIC);
-            var fixed = storage(RegionPolicy.FIXED_3X3);
+            var legacy = storage(RegionLayout.DYNAMIC);
+            var fixed = storage(RegionLayout.FIXED_3X3);
             TestEntity oversized = new TestEntity(1, new BlockPos(x * 16 + 15, -16, -16));
             oversized.bounds = new AABB(x * 16 + 15, -16, -16, x * 16 + 19, 4, 4);
             long key = SectionPos.asLong(oversized.pos);
@@ -205,7 +206,7 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void deferredChunkStreamDoesNotRetainRetiredBucketAndResolvesRecreatedSection() throws Exception {
-        var fixed = storage(RegionPolicy.FIXED_3X3);
+        var fixed = storage(RegionLayout.FIXED_3X3);
         long key = SectionPos.asLong(-3, -1, -3);
         EntitySection<TestEntity> old = fixed.getOrCreateSection(key);
         Stream<EntitySection<TestEntity>> stream = fixed.getExistingSectionsInChunk(ChunkPos.asLong(-3, -3));
@@ -221,7 +222,7 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void sectionFactoriesCannotPublishNullOrDuplicateSections() throws Exception {
-        var partitions = new FixedEntitySectionPartitions<TestEntity>();
+        var partitions = new FixedEntitySectionPartitions<TestEntity>(RegionLayout.FIXED_3X3);
         long key = SectionPos.asLong(-3, 0, -3);
         assertThrows(NullPointerException.class, () -> partitions.getOrCreate(key, ignored -> null));
         assertNull(partitions.get(key));
@@ -246,7 +247,7 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void rangeLookupUsesRegionXRowsAndRetiresEmptyRows() throws Exception {
-        var partitions = new FixedEntitySectionPartitions<TestEntity>();
+        var partitions = new FixedEntitySectionPartitions<TestEntity>(RegionLayout.FIXED_3X3);
         int[] xs = { -9, -8, -7, -1, 0, 1, 7, 8 };
         int[] zs = { -4, 0, 4 };
         for (int x : xs) {
@@ -310,18 +311,18 @@ class FixedEntitySectionPartitionsTest {
 
     @Test
     void persistentManagerMovementLoadSaveUnloadAndCallbacksMatchLegacy() throws Exception {
-        Scenario legacy = scenario(RegionPolicy.DYNAMIC);
-        Scenario fixed = scenario(RegionPolicy.FIXED_3X3);
+        Scenario legacy = scenario(RegionLayout.DYNAMIC);
+        Scenario fixed = scenario(RegionLayout.FIXED_3X3);
         assertEquals(legacy, fixed);
         assertTrue(fixed.events.contains("section:1"));
         assertTrue(fixed.events.contains("trackingEnd:1"));
         assertTrue(fixed.events.contains("destroyed:2"));
     }
 
-    private static Scenario scenario(RegionPolicy policy) throws Exception {
+    private static Scenario scenario(RegionLayout layout) throws Exception {
         List<String> events = new ArrayList<>();
         Fixture fixture = new Fixture();
-        var manager = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(events), fixture, RegionThreadingHooks::assertServerEntityStorageAccess, policy);
+        var manager = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(events), fixture, RegionThreadingHooks::assertServerEntityStorageAccess, layout);
         EntitySectionStorage<TestEntity> sections = managerStorage(manager);
         ChunkPos source = new ChunkPos(-1, -1);
         ChunkPos target = new ChunkPos(0, 0);
@@ -359,7 +360,7 @@ class FixedEntitySectionPartitionsTest {
         assertEquals(0, manager.count());
         assertFalse(manager.isLoaded(moving.uuid));
         assertFalse(manager.isLoaded(loaded.uuid));
-        if (policy == RegionPolicy.FIXED_3X3) assertTrue(buckets(sections).isEmpty());
+        if (layout.isFixed()) assertTrue(buckets(sections).isEmpty());
         manager.updateChunkStatus(target, Visibility.TICKING);
         fixture.complete(target, List.of(moving));
         manager.tick();
@@ -373,22 +374,26 @@ class FixedEntitySectionPartitionsTest {
         manager.saveAll();
         manager.close();
         assertEquals(0, sections.count());
-        if (policy == RegionPolicy.FIXED_3X3) assertTrue(buckets(sections).isEmpty());
+        if (layout.isFixed()) assertTrue(buckets(sections).isEmpty());
         return new Scenario(events, saved, fixture.stored, query);
     }
 
     @Test
-    void installedPolicyIsCapturedWithoutChangingGenericOrTransientStorage() throws Exception {
+    void installedLayoutIsCapturedWithoutChangingGenericOrTransientStorage() throws Exception {
         RegionThreadingManager.clear();
-        var early = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionThreadingHooks.entitySectionStoragePolicy());
+        var early = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionThreadingHooks.entitySectionStorageLayout());
         assertNull(field(managerStorage(early), "partitions"));
-        for (RegionPolicy policy : RegionPolicy.values()) {
-            var engine = new RegionThreadingEngine(1, false, false, false, false, policy);
+        for (RegionLayout layout : List.of(RegionLayout.DYNAMIC, RegionLayout.FIXED_3X3, RegionLayout.fixed(9))) {
+            var engine = new RegionThreadingEngine(1, false, false, false, false, false, false, layout);
             try {
                 RegionThreadingManager.install(engine);
-                assertEquals(policy, RegionThreadingHooks.entitySectionStoragePolicy());
-                var server = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionThreadingHooks.entitySectionStoragePolicy());
-                assertEquals(policy == RegionPolicy.FIXED_3X3, field(managerStorage(server), "partitions") != null);
+                assertEquals(layout, RegionThreadingHooks.entitySectionStorageLayout());
+                assertEquals(layout.regionChunkSize(), RegionThreadingHooks.entitySectionStorageLayout().regionChunkSize());
+                var server = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionThreadingHooks.entitySectionStorageLayout());
+                assertEquals(layout.isFixed(), field(managerStorage(server), "partitions") != null);
+                if (layout.isFixed()) {
+                    assertEquals(layout, field(field(managerStorage(server), "partitions"), "layout"));
+                }
                 var generic = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture());
                 assertNull(field(managerStorage(generic), "partitions"));
                 var transientManager = new TransientEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()));
@@ -396,14 +401,59 @@ class FixedEntitySectionPartitionsTest {
                 assertNull(field(managerStorage(early), "partitions"));
             } finally {
                 RegionThreadingManager.clear();
+                engine.shutdown();
             }
+        }
+    }
+
+    /**
+     * A partition bucket must be the bucket the installed engine's layout computes. With the historical
+     * hardcoded edge length of 3, chunk 3 would open a second bucket here instead of sharing the bucket of
+     * chunk 0 with the engine region (0, 0).
+     */
+    @Test
+    void partitionsIndexWithTheEngineLayoutSize() throws Exception {
+        RegionThreadingManager.clear();
+        var engine = new RegionThreadingEngine(1, false, false, false, false, false, false, RegionLayout.fixed(9));
+        try {
+            RegionThreadingManager.install(engine);
+            var manager = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionThreadingHooks.entitySectionStorageLayout());
+            var sections = managerStorage(manager);
+            var layout = engine.regionLayout();
+            long center = SectionPos.asLong(0, 0, 0);
+            long inside = SectionPos.asLong(3, 0, 3);
+            long nextRegion = SectionPos.asLong(9, 0, 0);
+            long negative = SectionPos.asLong(-9, 0, -1);
+            for (long id : new long[] { center, inside, nextRegion, negative }) {
+                sections.getOrCreateSection(id);
+            }
+
+            assertEquals(0, layout.regionX(0));
+            assertEquals(0, layout.regionX(3));
+            assertEquals(1, layout.regionX(9));
+            assertEquals(-1, layout.regionX(-9));
+            Map<Long, Object> buckets = buckets(sections);
+            assertEquals(3, buckets.size(), "chunks 0 and 3 must share the bucket of engine region (0, 0)");
+            assertNotNull(buckets.get(ChunkPos.asLong(layout.regionX(0), layout.regionZ(0))));
+            assertSame(buckets.get(ChunkPos.asLong(layout.regionX(0), layout.regionZ(0))),
+                    buckets.get(ChunkPos.asLong(layout.regionX(3), layout.regionZ(3))));
+            assertNotNull(buckets.get(ChunkPos.asLong(layout.regionX(9), layout.regionZ(0))));
+            assertNotNull(buckets.get(ChunkPos.asLong(layout.regionX(-9), layout.regionZ(-1))));
+            assertEquals(2, ((LongSortedSet) field(buckets.get(ChunkPos.asLong(0, 0)), "sectionIds")).size());
+            assertEquals(1, sections.getExistingSectionsInChunk(ChunkPos.asLong(0, 0)).count());
+            assertEquals(1, sections.getExistingSectionsInChunk(ChunkPos.asLong(3, 3)).count());
+            assertEquals(Set.of(ChunkPos.asLong(0, 0), ChunkPos.asLong(3, 3), ChunkPos.asLong(9, 0), ChunkPos.asLong(-9, -1)),
+                    sections.getAllChunksWithExistingSections());
+        } finally {
+            RegionThreadingManager.clear();
+            engine.shutdown();
         }
     }
 
     @Test
     void nativeWorkerCannotAccessPartitionsOrManagerEvenAfterBridgeRemoval() throws Exception {
-        var engine = new RegionThreadingEngine(1, true, false, false, false, RegionPolicy.FIXED_3X3);
-        var manager = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionPolicy.FIXED_3X3);
+        var engine = new RegionThreadingEngine(1, true, false, false, false, false, false, RegionLayout.FIXED_3X3);
+        var manager = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture(), RegionThreadingHooks::assertServerEntityStorageAccess, RegionLayout.FIXED_3X3);
         var sections = managerStorage(manager);
         sections.getOrCreateSection(0);
         var getter = manager.getEntityGetter();
