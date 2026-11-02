@@ -57,6 +57,8 @@ final class RegionThreadingCommand {
                 + ", deferredEntityTicks=" + diagnostics.deferredEntityTicks()
                 + ", entityMutationsAllowedByOwnership=" + diagnostics.entityMutationsAllowedByOwnership()
                 + ", entityMutationsRejectedByOwnership=" + diagnostics.entityMutationsRejectedByOwnership()
+                + ", deferredEntitySectionUpdatesApplied=" + diagnostics.deferredEntitySectionUpdatesApplied()
+                + ", droppedDeferredEntitySectionUpdates=" + diagnostics.droppedDeferredEntitySectionUpdates()
                 + ", blockEntityTicksOnWorkers=" + diagnostics.blockEntityTicksOnWorkers()
                 + ", skippedBlockEntityTicks=" + diagnostics.skippedBlockEntityTicks()
                 + ", fallbackBlockEntityTicks=" + diagnostics.fallbackBlockEntityTicks()

@@ -15,6 +15,7 @@ import java.util.Set;
 import java.util.function.Function;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.entity.EntityInLevelCallback;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -31,6 +32,11 @@ import org.jetbrains.annotations.Nullable;
  * current tick and no new region work can start for the entity before the handoff. Each deferred update
  * carries the destination region that the deferring thread observed, so the handoff is published to that
  * destination instead of one re-derived from the entity's live position at the barrier.
+ * <p>
+ * A worker that moves an entity added to its level cannot run the level effects of that move: the
+ * {@link EntityInLevelCallback#onMove()} publication of the entity section and the target chunk
+ * acquisition are server-owned storage. The worker records one deferred section update per move instead,
+ * and the barrier applies both effects on the server thread from the entity's final position.
  */
 @ApiStatus.Internal
 final class RegionEntityTickBatch extends RegionTickBatch {
@@ -38,6 +44,9 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<Entity> fallbackEntities = new ArrayList<>();
     private final List<DeferredEntityUpdate> deferredUpdates = Collections.synchronizedList(new ArrayList<>());
+    private final List<DeferredSectionUpdate> deferredSectionUpdates = Collections.synchronizedList(new ArrayList<>());
+    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredSectionUpdates}. */
+    private volatile boolean sectionUpdateSeamClosed;
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level) {
@@ -139,6 +148,77 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     }
 
     /**
+     * {@return true when the barrier of this batch will still apply deferred section updates}
+     * <p>
+     * The section publication and the target chunk acquisition of a worker entity move are server-owned
+     * storage, so they may only be deferred to a barrier that still runs. A batch that already completed its
+     * barrier, or whose seam was closed because the engine shut down, cannot defer them and keeps the
+     * storage refusal instead.
+     */
+    boolean acceptsDeferredSectionUpdates() {
+        return !this.isSectionUpdateSeamClosed() && !this.isComplete();
+    }
+
+    /**
+     * {@return true when this batch no longer accepts or applies deferred section updates}
+     */
+    boolean isSectionUpdateSeamClosed() {
+        return this.sectionUpdateSeamClosed;
+    }
+
+    /**
+     * Stops accepting deferred section updates and releases the ones that already wait.
+     * <p>
+     * Called when the engine shuts down: the barrier of this batch will never publish a section again, so a
+     * worker that still ticks must be refused instead of granted, and the released updates must not keep an
+     * entity reference alive.
+     *
+     * @return the number of released updates, which the caller counts as dropped
+     */
+    int closeDeferredSectionUpdates() {
+        synchronized (this.deferredSectionUpdates) {
+            this.sectionUpdateSeamClosed = true;
+            final int released = this.deferredSectionUpdates.size();
+            this.deferredSectionUpdates.clear();
+            return released;
+        }
+    }
+
+    /**
+     * Records the level effects of one entity move that a worker deferred to the barrier.
+     * <p>
+     * Every move is recorded: the section publication of the barrier is idempotent because it reconciles
+     * the membership with the entity's final position, while the target chunk acquisition of each move
+     * still runs, exactly like the inline vanilla call the worker skipped.
+     *
+     * @param entity        the moved entity
+     * @param callback      the level callback the inline move would have invoked
+     * @param targetSection the section of the position this move reached, captured on the worker
+     * @return {@code false} when the seam was closed or the barrier already completed, so the move can never
+     *         be published and the caller has to refuse it before it mutates the entity
+     */
+    boolean deferSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {
+        synchronized (this.deferredSectionUpdates) {
+            if (this.sectionUpdateSeamClosed || this.isComplete()) {
+                return false;
+            }
+            this.deferredSectionUpdates.add(new DeferredSectionUpdate(entity, callback, targetSection));
+            return true;
+        }
+    }
+
+    /**
+     * Takes the deferred section updates that wait for the end of the batch.
+     */
+    List<DeferredSectionUpdate> drainDeferredSectionUpdates() {
+        synchronized (this.deferredSectionUpdates) {
+            final List<DeferredSectionUpdate> updates = List.copyOf(this.deferredSectionUpdates);
+            this.deferredSectionUpdates.clear();
+            return updates;
+        }
+    }
+
+    /**
      * Queues work that a worker is not allowed to run inline; it executes on the server thread after the
      * batch completed.
      */
@@ -185,6 +265,13 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * observed. The destination is captured once and never re-derived at the batch barrier.
      */
     record DeferredEntityUpdate(Entity entity, @Nullable RegionCoordinate destination) {}
+
+    /**
+     * One deferred section update: the moved entity, the level callback the inline move would have invoked
+     * and the section of the position the move reached. The section carries the target chunk acquisition as
+     * well, because a section coordinate is a chunk coordinate.
+     */
+    record DeferredSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {}
 
     /**
      * One region's share of the batch: the region lease, the entities it ticks, and the snapshot members

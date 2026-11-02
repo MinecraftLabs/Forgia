@@ -7,11 +7,13 @@ package net.neoforged.neoforge.unittest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -30,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
-import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
@@ -38,12 +40,10 @@ import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.MoverType;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.entity.EntityPersistentStorage;
 import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
@@ -68,10 +68,13 @@ import org.junit.jupiter.api.Timeout;
  * {@code guardEntityTick} and {@code tickNonPassenger} are the production bodies. The lease is only
  * installed for the worker tick loop, so the same mutation is rejected again once the loop finished.
  * <p>
- * Only an entity that is not added to a level can be granted: an added entity keeps today's rejection,
- * because its position change would reach the server-owned section-manager {@code onMove} and the caveat
- * of its chunk load after the mutation. The {@code addedEntity...} test admits an entity to a real
- * {@link PersistentEntitySectionManager} to prove that the rejection happens before any state change.
+ * A position change of an entity that is not added to a level is granted as a plain field mutation. The
+ * position change of an entity that is added to a level is granted only because the lease defers its two
+ * server-owned level effects - the section-manager {@code onMove} publication and the target chunk
+ * acquisition - to the entity batch barrier; the {@code addedEntity...} test admits an entity to a real
+ * {@link PersistentEntitySectionManager} and proves that the worker publishes nothing before the barrier
+ * and that the barrier publishes the section of the final position. Removal and the cross-level teleport
+ * stay rejected before any mutation, for an added entity as well.
  */
 @Timeout(30)
 class RegionEntityOwnershipTest {
@@ -211,18 +214,28 @@ class RegionEntityOwnershipTest {
     }
 
     @Test
-    void addedEntityKeepsTheRejectionAndIsNeverPartiallyMutated() throws ReflectiveOperationException {
+    void addedEntityMovesThroughTheDeferredSectionSeamWhileTheTeleportStaysRejected() throws ReflectiveOperationException {
         this.installEngine(1, true);
         final ServerLevel level = mockLevel();
         final PersistentEntitySectionManager<Entity> manager = newGuardedManager();
-        final List<String> attempts = new CopyOnWriteArrayList<>();
+        final List<Throwable> grantedFailures = new CopyOnWriteArrayList<>();
+        final List<Long> sectionsOnWorker = new CopyOnWriteArrayList<>();
+        final List<String> teleportAttempts = new CopyOnWriteArrayList<>();
         final TestEntity entity = new TestEntity(level, self -> {
-            recordAttempt(attempts, () -> self.setPosRaw(4096.0, 64.0, 0.0));
-            recordAttempt(attempts, () -> self.move(MoverType.SELF, new Vec3(1.0, 0.0, 0.0)));
-            recordAttempt(attempts, () -> self.absMoveTo(200.0, 70.0, 200.0));
-            recordAttempt(attempts, () -> self.moveTo(300.0, 72.0, 300.0, 45.0F, 10.0F));
-            recordAttempt(attempts, () -> self.teleportTo(level, 400.0, 74.0, 400.0, Set.of(), 0.0F, 0.0F));
+            try {
+                self.setPosRaw(40.0, 64.0, 40.0);
+                self.absMoveTo(50.0, 65.0, 50.0);
+                self.moveTo(60.0, 66.0, 60.0, 45.0F, 10.0F);
+                self.move(MoverType.SELF, new Vec3(1.0, 0.0, 0.0));
+            } catch (Throwable throwable) {
+                grantedFailures.add(throwable);
+            }
+            sectionsOnWorker.add(sectionKey(self));
+            // Entity.teleportTo is the cross-level teleport: it changes level, identity and storage.
+            recordAttempt(teleportAttempts, () -> self.teleportTo(level, 400.0, 74.0, 400.0, Set.of(), 0.0F, 0.0F));
         });
+        // The lease covers the entity fields, not the collision query of Entity.move.
+        entity.noPhysics = true;
         entity.setPos(1.0, 64.0, 1.0);
         assertTrue(manager.addNewEntityWithoutEvent(entity), "the entity must be admitted to the section manager");
         // ServerLevel#addEntity marks the admitted entity as added to the level right after the admission.
@@ -230,35 +243,34 @@ class RegionEntityOwnershipTest {
         assertTrue(entity.isAddedToLevel());
         assertEquals("net.minecraft.world.level.entity.PersistentEntitySectionManager$Callback",
                 getField(Entity.class, entity, "levelCallback").getClass().getName(),
-                "a position change of an added entity must be rejected before it reaches the real section-manager callback");
-
-        final Vec3 position = entity.position();
-        final AABB bounds = entity.getBoundingBox();
-        final BlockPos blockPosition = entity.blockPosition();
-        final ChunkPos chunkPosition = entity.chunkPosition();
-        final long sectionKey = sectionKey(entity);
+                "the deferred section publication must reach the real section-manager callback");
+        final long sourceSection = sectionKey(entity);
 
         final RegionEntityTickPlan plan = plan(level);
         assertTrue(plan.accept(entity));
         plan.executeAndAwait();
 
-        assertEquals(5, attempts.size());
-        assertTrue(attempts.get(0).contains("Entity.setPosRaw"), attempts.toString());
-        assertTrue(attempts.get(1).contains("Entity.move"), attempts.toString());
-        assertTrue(attempts.get(2).contains("Entity.absMoveTo"), attempts.toString());
-        assertTrue(attempts.get(3).contains("Entity.moveTo"), attempts.toString());
-        assertTrue(attempts.get(4).contains("Entity.teleportTo"), attempts.toString());
-        assertEquals(position, entity.position(), "a rejected mutation must not move the entity");
-        assertEquals(bounds, entity.getBoundingBox(), "a rejected mutation must not resize the bounds");
-        assertEquals(blockPosition, entity.blockPosition());
-        assertEquals(chunkPosition, entity.chunkPosition(), "a rejected mutation must not change the section key");
-        assertEquals(sectionKey, sectionKey(entity), "a rejected mutation must not change the section membership");
+        assertEquals(List.of(), grantedFailures, () -> "an owned field mutation was rejected: " + grantedFailures);
+        assertEquals(new Vec3(61.0, 66.0, 60.0), entity.position());
+        assertEquals(45.0F, entity.getYRot());
+        assertEquals(List.of(sourceSection), sectionsOnWorker,
+                "the section membership must stay the source section until the barrier");
+        assertEquals(SectionPos.of(entity.blockPosition()).asLong(), sectionKey(entity),
+                "the barrier must publish the section of the final position");
+        assertNotEquals(sourceSection, sectionKey(entity), "the final position must be in another section");
+        assertEquals(1, teleportAttempts.size());
+        assertTrue(teleportAttempts.get(0).contains("Entity.teleportTo"), teleportAttempts.toString());
         assertTrue(manager.isLoaded(entity.getUUID()), "the entity must stay admitted to the section manager");
         assertEquals(1L, this.engine.diagnostics().entityTicksOnWorkers());
-        assertEquals(0L, this.engine.diagnostics().entityMutationsAllowedByOwnership());
-        assertEquals(5L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
-        assertEquals(5L, this.engine.diagnostics().ownershipViolationCount(),
-                "every lease refusal is reported by the storage guard as well");
+        assertEquals(1L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
+        assertEquals(1L, this.engine.diagnostics().ownershipViolationCount());
+        assertTrue(this.engine.diagnostics().deferredEntitySectionUpdatesApplied() >= 1L,
+                () -> "the deferred section publication must run at the barrier, got: "
+                        + this.engine.diagnostics().deferredEntitySectionUpdatesApplied());
+        // Every granted guard site of the four field mutations is one allowance; a vanilla call can enter
+        // several of them (for example moveTo reaches setPosRaw twice).
+        assertTrue(this.engine.diagnostics().entityMutationsAllowedByOwnership() >= 4L,
+                () -> "all four field mutations must be granted, got: " + this.engine.diagnostics().entityMutationsAllowedByOwnership());
     }
 
     @Test
@@ -471,6 +483,8 @@ class RegionEntityOwnershipTest {
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
         // Region coordinates are part of worker task descriptions, which must not call into the level.
         doReturn("test-level").when(level).toString();
+        // The target chunk acquisition of a deferred section update is server-owned storage.
+        doAnswer(invocation -> null).when(level).getChunk(anyInt(), anyInt());
         return level;
     }
 
@@ -495,12 +509,16 @@ class RegionEntityOwnershipTest {
      *
      * @throws IllegalStateException when the entity has no section-manager callback
      */
-    private static long sectionKey(Entity entity) throws ReflectiveOperationException {
-        final Object callback = getField(Entity.class, entity, "levelCallback");
-        if (callback == null) {
-            throw new IllegalStateException("the entity has no level callback");
+    private static long sectionKey(Entity entity) {
+        try {
+            final Object callback = getField(Entity.class, entity, "levelCallback");
+            if (callback == null) {
+                throw new IllegalStateException("the entity has no level callback");
+            }
+            return (long) getField(callback.getClass(), callback, "currentSectionKey");
+        } catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException(exception);
         }
-        return (long) getField(callback.getClass(), callback, "currentSectionKey");
     }
 
     @SuppressWarnings({ "unchecked", "rawtypes" })

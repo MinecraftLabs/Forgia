@@ -13,6 +13,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
@@ -146,11 +147,13 @@ public final class RegionThreadingHooks {
      * <p>
      * The lease exception is narrow: it is decided by
      * {@link RegionEntityOwnershipScope#grantsEntityMutation(ServerLevel, Entity, String)} and covers only
-     * the vanilla entity mutations a group may own, and only for an entity that is not added to a level.
-     * Removal, level admission, the cross-level teleport, subclass mutations with extra side effects, the
-     * position change of an added entity and every operation without an entity argument still reach
-     * {@link #assertServerEntityStorageAccess(String)}, which never consults a lease. Every non-worker caller
-     * is unaffected and keeps the vanilla behavior.
+     * the vanilla entity mutations a group may own. Removal, level admission, the cross-level teleport,
+     * subclass mutations with extra side effects and every operation without an entity argument still reach
+     * {@link #assertServerEntityStorageAccess(String)}, which never consults a lease. The position change of
+     * an entity that is added to a level is granted only when the lease can defer its section publication
+     * and its target chunk acquisition to the batch barrier, which is the job of
+     * {@link #deferEntitySectionUpdate(Entity, EntityInLevelCallback, double, double, double)}. Every
+     * non-worker caller is unaffected and keeps the vanilla behavior.
      */
     public static void assertServerEntityStorageAccess(Entity entity, String operation) {
         if (!(entity.level() instanceof ServerLevel level)) {
@@ -163,6 +166,32 @@ public final class RegionThreadingHooks {
             return;
         }
         RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
+     * Defers the server-owned level effects of a worker entity move to the entity batch barrier.
+     * <p>
+     * {@code Entity.setPosRaw} of an entity that is added to a level reaches two server-owned level effects
+     * after it wrote the position and bounds: the {@link EntityInLevelCallback#onMove()} publication of the
+     * entity section and the acquisition of the target chunk. A native region worker must run neither, so
+     * this hook records both for the barrier of the worker's entity batch, which applies them on the server
+     * thread from the entity's final position. The caller then skips the two inline effects.
+     * <p>
+     * Only a native region worker whose active lease owns {@code entity}, whose entity is added to a level
+     * and whose batch still accepts deferred section updates defers anything. The server thread, the client,
+     * every ordinary thread, a foreign entity and a lease that outlived its batch answer {@code false} and
+     * keep the inline vanilla effect.
+     *
+     * @param entity   the entity whose position changed
+     * @param callback the level callback the inline move would have invoked
+     * @param x        the x coordinate the move reached
+     * @param y        the y coordinate the move reached
+     * @param z        the z coordinate the move reached
+     * @return {@code true} when the caller must skip the section publication and the target chunk
+     *         acquisition, because the barrier applies them instead
+     */
+    public static boolean deferEntitySectionUpdate(Entity entity, EntityInLevelCallback callback, double x, double y, double z) {
+        return RegionEntityOwnershipScope.deferEntitySectionUpdate(entity, callback, x, y, z);
     }
 
     /**

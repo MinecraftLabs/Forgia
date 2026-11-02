@@ -18,6 +18,14 @@ package net.neoforged.neoforge.server.threading.region;
  * reports the handoffs the transaction refused and that were therefore published from the live position
  * like before, and the retried count reports the handoffs a busy region delayed to a later barrier.
  * <p>
+ * The two section counters report the level effects of a worker entity move that the batch barrier applied
+ * or dropped. An applied count is one entity section publication plus its target chunk acquisition, both
+ * run on the server thread. A dropped count is one update that did not complete: the engine shut down
+ * (including the updates a shut-down batch releases without applying), the level identity closed, the
+ * entity was removed or left the level, or the publication or the chunk acquisition threw. A dropped
+ * update never leaves a section publication behind, and a failing update never costs the updates queued
+ * behind it.
+ * <p>
  * The two ownership counters report the entity tick lease of a region worker group. An allowance counts
  * one grant of a vanilla entity mutation the lease may own: it is the lease decision, not a completed
  * mutation, so one vanilla call can record several allowances when it enters several granted guard sites.
@@ -79,4 +87,6 @@ public record RegionThreadingDiagnostics(
         int rememberedEntityTransferResultCount,
         long rejectedEntityTransferRecordCount,
         long legacyDeferredEntityMoveCount,
-        long retriedDeferredEntityMoveCount) {}
+        long retriedDeferredEntityMoveCount,
+        long deferredEntitySectionUpdatesApplied,
+        long droppedDeferredEntitySectionUpdates) {}

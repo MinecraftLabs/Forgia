@@ -23,6 +23,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
@@ -159,6 +160,8 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final List<DeferredEntityMove> pendingDeferredEntityMoves = new ArrayList<>();
     private final AtomicLong legacyDeferredEntityMoveCount = new AtomicLong();
     private final AtomicLong retriedDeferredEntityMoveCount = new AtomicLong();
+    private final AtomicLong appliedDeferredSectionUpdateCount = new AtomicLong();
+    private final AtomicLong droppedDeferredSectionUpdateCount = new AtomicLong();
     /**
      * Serializes region drain activation with lifecycle cleanup. A drain holds the read lock only while
      * it checks the lifecycle state and marks the lease or worker submission; shutdown and level clear
@@ -1005,6 +1008,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
             }
         } finally {
+            // The section publication and the target chunk acquisition of a worker entity move are the
+            // vanilla effects of the move itself, so they run before any other server-thread work observes
+            // the entity and before the ownership handoff of the batch commits a new region.
+            failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
             failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
             failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
             failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
@@ -2260,6 +2267,84 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Applies the section publications and target chunk acquisitions of a finished entity batch.
+     * <p>
+     * A worker that moves an entity added to its level cannot publish the entity section or acquire the
+     * target chunk, because both are server-owned storage. It records the level callback the inline vanilla
+     * move would have invoked and the section of the position the move reached, and this barrier runs both
+     * effects on the server thread. The publication reconciles the section membership with the entity's
+     * final position, so several moves of one tick each invoke it but only the first one moves the
+     * membership; the chunk acquisition of every recorded move still runs, exactly like the inline calls
+     * the worker skipped.
+     * <p>
+     * Every entry is applied on its own: a publication or chunk acquisition that throws - a modded
+     * {@code EntityEvent.EnteringSection} listener or a level callback of the level - drops and counts that
+     * one entry and leaves the entries behind it untouched, because their entities carry the same moved
+     * position. The first failure is rethrown afterwards, so the batch reports it through the same
+     * completion path as every other server-thread step.
+     * <p>
+     * An update that cannot be applied is dropped without touching storage and counted in
+     * {@link RegionThreadingDiagnostics#droppedDeferredEntitySectionUpdates()}: the engine shut down, the
+     * level identity closed, the batch closed its section seam, the entity was removed or left the level
+     * between the move and the barrier, or its publication threw. The barrier runs before the ownership
+     * handoff of the same batch, so a section update is always published before a transfer commit can move
+     * the entity to another region.
+     */
+    private void applyDeferredEntitySectionUpdates(RegionEntityTickBatch batch) {
+        final List<RegionEntityTickBatch.DeferredSectionUpdate> updates = batch.drainDeferredSectionUpdates();
+        if (updates.isEmpty()) {
+            return;
+        }
+        final ServerLevel level = batch.level();
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isSectionUpdateSeamClosed()) {
+            this.droppedDeferredSectionUpdateCount.addAndGet(updates.size());
+            return;
+        }
+        Throwable failure = null;
+        for (final RegionEntityTickBatch.DeferredSectionUpdate update : updates) {
+            final Entity entity = update.entity();
+            if (entity.isRemoved() || entity.level() != level || !entity.isAddedToLevel()) {
+                this.droppedDeferredSectionUpdateCount.incrementAndGet();
+                continue;
+            }
+            try {
+                update.callback().onMove();
+                level.getChunk(SectionPos.x(update.targetSection()), SectionPos.z(update.targetSection()));
+                this.appliedDeferredSectionUpdateCount.incrementAndGet();
+            } catch (Throwable throwable) {
+                // The entry did not complete, so it is dropped and counted; the remaining entries still run
+                // because their entities were moved by the same batch and must not keep an unpublished
+                // section. The first failure is reported once the whole batch was served.
+                this.droppedDeferredSectionUpdateCount.incrementAndGet();
+                if (failure == null) {
+                    failure = throwable;
+                } else {
+                    failure.addSuppressed(throwable);
+                }
+            }
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /**
+     * Closes the deferred section seam of every active entity batch when shutdown starts.
+     * <p>
+     * A shut-down engine never runs a barrier again, so a batch that still ticks must not accept another
+     * section update: the next worker move is refused by the storage guard instead of being granted and
+     * dropped. The updates that already wait are released and counted, so no entity reference stays
+     * reachable from the batch and nothing is applied after the shutdown.
+     */
+    private void closeDeferredSectionSeams() {
+        for (final RegionTickBatch active : this.activeTickBatches) {
+            if (active instanceof RegionEntityTickBatch entityBatch) {
+                this.droppedDeferredSectionUpdateCount.addAndGet(entityBatch.closeDeferredSectionUpdates());
+            }
+        }
+    }
+
+    /**
      * Applies one deferred ownership change at the entity batch barrier.
      * <p>
      * The destination was captured by the deferring thread and is committed through the recorded transfer
@@ -2848,7 +2933,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.entityTransferJournal.rememberedCount(),
                 this.entityTransferJournal.rejectedRecordCount(),
                 this.legacyDeferredEntityMoveCount.get(),
-                this.retriedDeferredEntityMoveCount.get());
+                this.retriedDeferredEntityMoveCount.get(),
+                this.appliedDeferredSectionUpdateCount.get(),
+                this.droppedDeferredSectionUpdateCount.get());
     }
 
     /**
@@ -2887,6 +2974,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.entityTransferJournal.clear();
                     this.pendingDeferredEntityMoves.clear();
                 }
+                // Close the section seam before waiting for the batches: a worker of a batch that still runs
+                // must be refused from now on, and the updates that already wait are released.
+                this.closeDeferredSectionSeams();
                 this.awaitActiveTickBatches(null);
                 this.awaitSubmittedRegionTasks(null);
                 // Drain work whose worker submission was rejected while the pool was closing. No new worker

@@ -64,12 +64,13 @@ class RegionEntityOwnershipLeaseTest {
     }
 
     @Test
-    void leaseNeverGrantsAnEntityThatIsAddedToALevel() throws ReflectiveOperationException {
+    void leaseOfANonWorkerThreadNeverGrantsAnEntityThatIsAddedToALevel() throws ReflectiveOperationException {
         final Entity added = mock(Entity.class);
         when(added.isAddedToLevel()).thenReturn(true);
         try (RegionEntityOwnershipScope lease = openLease(added)) {
-            // The section-manager onMove and the target chunk load of an added entity stay server-owned, so
-            // granting it would mutate the fields before the storage guard rejects the nested call.
+            // The position change of an added entity is only granted because a native region worker defers
+            // its section publication and its target chunk acquisition to the batch barrier. This lease is
+            // opened on the test thread, which defers nothing, so the storage refusal stands.
             assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, SET_POS_RAW));
             assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "Entity.move"));
         }

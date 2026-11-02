@@ -520,19 +520,26 @@
          return this.fluidHeight.getDouble(p_204037_);
      }
  
-@@ -3308,6 +_,7 @@
+@@ -3308,6 +_,11 @@
      }
  
      public final void setPosRaw(double p_20344_, double p_20345_, double p_20346_) {
 +        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setPosRaw");
++        // Neo: a region worker defers the two server-owned level effects of this move - the section publication
++        // and the target chunk acquisition - to the barrier of its entity batch, which applies them on the
++        // server thread from the final position. The worker must run neither, so both inline effects are skipped.
++        final boolean deferredSectionUpdate = net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferEntitySectionUpdate(this, this.levelCallback, p_20344_, p_20345_, p_20346_);
          if (this.position.x != p_20344_ || this.position.y != p_20345_ || this.position.z != p_20346_) {
              this.position = new Vec3(p_20344_, p_20345_, p_20346_);
              int i = Mth.floor(p_20344_);
-@@ -3323,6 +_,7 @@
+@@ -3321,8 +_,9 @@
+                 }
+             }
  
-             this.levelCallback.onMove();
+-            this.levelCallback.onMove();
++            if (!deferredSectionUpdate) this.levelCallback.onMove();
          }
-+        if (this.isAddedToLevel() && !this.level.isClientSide && !this.isRemoved()) this.level.getChunk((int) Math.floor(p_20344_) >> 4, (int) Math.floor(p_20346_) >> 4); // Forge - ensure target chunk is loaded.
++        if (!deferredSectionUpdate && this.isAddedToLevel() && !this.level.isClientSide && !this.isRemoved()) this.level.getChunk((int) Math.floor(p_20344_) >> 4, (int) Math.floor(p_20346_) >> 4); // Forge - ensure target chunk is loaded.
      }
  
      public void checkDespawn() {
