@@ -1272,26 +1272,45 @@ public final class RegionThreadingEngine implements RegionThreading {
         // This thread owns the batch until it finished; a shutdown or unload requested from inside it
         // (fallback work included) cannot wait for a batch that only this thread can complete.
         batch.markExecutingOnCurrentThread();
+        // The opt-in attribution is decided once per batch, never per ticker: a disabled attribution only
+        // costs this one volatile read and takes no timestamp.
+        final boolean attribution = RegionBlockEntityTickAttribution.isEnabled();
         Throwable failure = null;
         try {
+            final long leaseStart = attribution ? System.nanoTime() : 0L;
             try {
                 this.leaseBlockEntityTickGroups(batch, tickers, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
-                try {
-                    batch.submitAndAwait(this.workerPool, barrier);
-                } catch (Throwable throwable) {
-                    if (failure == null) {
-                        failure = throwable;
-                    }
+                if (attribution) {
+                    RegionBlockEntityTickAttribution.recordLease(System.nanoTime() - leaseStart);
+                }
+            }
+            final long awaitStart = attribution ? System.nanoTime() : 0L;
+            try {
+                batch.submitAndAwait(this.workerPool, barrier);
+            } catch (Throwable throwable) {
+                if (failure == null) {
+                    failure = throwable;
+                }
+            } finally {
+                if (attribution) {
+                    RegionBlockEntityTickAttribution.recordAwait(System.nanoTime() - awaitStart);
                 }
             }
         } finally {
-            failure = runBatchCompletion(failure, () -> this.tickFallbackBlockEntities(batch));
-            batch.finish();
-            this.activeTickBatches.remove(batch);
-            batch.clearExecutingOnCurrentThread();
+            final long handoffStart = attribution ? System.nanoTime() : 0L;
+            try {
+                failure = runBatchCompletion(failure, () -> this.tickFallbackBlockEntities(batch));
+                batch.finish();
+                this.activeTickBatches.remove(batch);
+                batch.clearExecutingOnCurrentThread();
+            } finally {
+                if (attribution) {
+                    RegionBlockEntityTickAttribution.recordHandoff(System.nanoTime() - handoffStart);
+                }
+            }
         }
 
         if (failure != null) {

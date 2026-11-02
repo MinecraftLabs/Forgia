@@ -17,6 +17,7 @@ import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
@@ -334,12 +335,17 @@ public final class RegionThreadingHooks {
     /**
      * Starts collecting the block-entity tickers of the current level tick that should tick on region
      * workers.
+     * <p>
+     * The call opens the slice of the opt-in block-entity tick attribution, which is closed by
+     * {@link #runBlockEntityTickPlan(RegionBlockEntityTickPlan)} and stays disabled unless a diagnostics
+     * run enables it.
      *
      * @param barrier waits for the submitted region work on the server thread
      * @return the plan to fill, or {@code null} when block-entity ticks have to stay on the server thread
      */
     @Nullable
     public static RegionBlockEntityTickPlan beginBlockEntityTickPlan(ServerLevel level, RegionTickBarrier barrier) {
+        RegionBlockEntityTickAttribution.beginSlice();
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine) {
             return engine.beginBlockEntityTickPlan(level, barrier);
@@ -351,8 +357,14 @@ public final class RegionThreadingHooks {
      * Ticks the block-entity tickers collected by {@code plan} on region workers and waits for the batch.
      */
     public static void runBlockEntityTickPlan(@Nullable RegionBlockEntityTickPlan plan) {
-        if (plan != null) {
-            plan.executeAndAwait();
+        try {
+            if (plan != null) {
+                plan.executeAndAwait();
+            }
+        } finally {
+            // The slice covers the whole ticker pass, including a failing batch: the attribution only
+            // measures, so it must not lose the slice of a tick that threw.
+            RegionBlockEntityTickAttribution.endSlice();
         }
     }
 

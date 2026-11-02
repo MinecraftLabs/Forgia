@@ -35,6 +35,7 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.testframework.DynamicTest;
 import net.neoforged.testframework.annotation.ForEachTest;
@@ -50,6 +51,12 @@ import net.neoforged.testframework.gametest.ExtendedGameTestHelper;
  * {@link ServerTickEvent.Pre} to {@link ServerTickEvent.Post}. The reported values are the average and the
  * nearest-rank p50, p95 and p99 of those samples; the counters are the deltas of
  * {@link RegionThreadingHooks#diagnostics()} over the same window.
+ * <p>
+ * The furnace test also enables {@link RegionBlockEntityTickAttribution} for its window and reports the
+ * per-tick wall time of the server-thread block-entity slice segments: the plan collection, the region lease
+ * acquisition, the wait for the worker batch, the deferred work after the barrier and the whole slice. The
+ * attribution is disabled again when the window ends, so the entity test and every other batch stay
+ * uninstrumented.
  * <p>
  * The furnace workload places {@value #FURNACE_COUNT} lit furnaces that smelt and burn for the whole
  * window, so every furnace ticks every tick. The furnaces sit in region-interior chunks so the
@@ -101,7 +108,7 @@ public class ServerLoadBenchmarkGameTests {
     /** Radius of the entity-ticking chunk ticket of the forced grid. */
     private static final int ENTITY_TICKING_TICKET_RADIUS = 2;
 
-    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations";
+    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -119,11 +126,16 @@ public class ServerLoadBenchmarkGameTests {
             final List<ChunkPos> grid = gridChunks(origin);
             final List<BlockPos> furnaces = furnacePositions(origin);
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
+            // The attribution is reported per measured tick, so it is reset when the warmup ends and the
+            // warmup itself stays unmeasured.
+            sampler.onMeasuredWindowStart(RegionBlockEntityTickAttribution::reset);
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<RegionBlockEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionBlockEntityTickAttribution.snapshot());
             final AtomicBoolean cleaned = new AtomicBoolean();
             helper.addEndListener(passed -> {
                 if (cleaned.compareAndSet(false, true)) {
                     NeoForge.EVENT_BUS.unregister(sampler);
+                    RegionBlockEntityTickAttribution.setEnabled(false);
                     removeFurnaces(level, furnaces);
                     releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
                 }
@@ -139,6 +151,8 @@ public class ServerLoadBenchmarkGameTests {
                     .thenExecute(() -> placeFurnaces(level, furnaces, helper))
                     .thenExecute(() -> {
                         before.set(RegionThreadingHooks.diagnostics());
+                        RegionBlockEntityTickAttribution.setEnabled(true);
+                        attributionBefore.set(RegionBlockEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
                     })
@@ -150,7 +164,9 @@ public class ServerLoadBenchmarkGameTests {
                     // afterwards would unforce those chunks again and stall the next batch forever.
                     .thenExecute(() -> {
                         NeoForge.EVENT_BUS.unregister(sampler);
-                        reportFurnaces(helper, sampler, before.get(), furnaces.size(), grid.size());
+                        final RegionBlockEntityTickAttribution.Snapshot attributionAfter = RegionBlockEntityTickAttribution.snapshot();
+                        RegionBlockEntityTickAttribution.setEnabled(false);
+                        reportFurnaces(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, furnaces.size(), grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             removeFurnaces(level, furnaces);
                             releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
@@ -443,15 +459,21 @@ public class ServerLoadBenchmarkGameTests {
      * <p>
      * {@code leasedRegions} is the delta of {@link RegionThreadingDiagnostics#totalRegionTickCount()},
      * which records one region lease per leased region and tick.
+     * <p>
+     * The five attribution columns are the deltas of {@link RegionBlockEntityTickAttribution} over the same
+     * window, divided by the number of measured slices (the {@code sliceSamples} column), so each one is the
+     * per-tick wall time of that segment of the server-thread block-entity slice. A segment that never ran in
+     * the window reports {@code 0}, and a window without slices reports {@code -1}.
      */
-    private static void reportFurnaces(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, int furnaces, int chunks) {
+    private static void reportFurnaces(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionBlockEntityTickAttribution.Snapshot attributionBefore, RegionBlockEntityTickAttribution.Snapshot attributionAfter, int furnaces, int chunks) {
         final long[] sorted = sampler.sortedSamples();
         helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
         final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
         final String profile = profileName(after);
-        System.out.println(sampler.note(profile, after));
+        final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
+        System.out.println(sampler.note(profile, after) + " blockEntityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_FURNACE_HEADER " + FURNACE_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_FURNACE_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_FURNACE_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -464,7 +486,21 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::blockEntityTicksOnWorkers),
                 delta(before, after, RegionThreadingDiagnostics::fallbackBlockEntityTicks),
                 delta(before, after, RegionThreadingDiagnostics::totalRegionTickCount),
-                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount));
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
+                millisPerSlice(attributionAfter.planNanos() - attributionBefore.planNanos(), slices),
+                millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
+                millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
+                millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
+                slices);
+    }
+
+    /**
+     * {@return the per-tick average of {@code nanos} over {@code slices} in milliseconds, or {@code -1} when
+     * the window recorded no slice}
+     */
+    private static double millisPerSlice(long nanos, long slices) {
+        return slices <= 0L ? -1.0 : nanos / (double) slices / 1_000_000.0;
     }
 
     private static void reportEntities(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, EntityChurn churn, int chunks) {
@@ -588,6 +624,7 @@ public class ServerLoadBenchmarkGameTests {
         private long windowEndNanos = -1L;
         private long firstGameTime = -1L;
         private long lastGameTime = -1L;
+        private Runnable measuredWindowStart;
 
         TickSampler(int warmupTicks, int measuredTicks, Runnable perTickWork) {
             this.warmupTicks = warmupTicks;
@@ -600,8 +637,19 @@ public class ServerLoadBenchmarkGameTests {
             this.firstGameTime = gameTime;
         }
 
+        /**
+         * Runs {@code action} once, at the start of the first measured tick, so a measurement that must
+         * cover the measured window only starts from zero when the warmup ended.
+         */
+        void onMeasuredWindowStart(Runnable action) {
+            this.measuredWindowStart = action;
+        }
+
         @SubscribeEvent
         public void onTickPre(ServerTickEvent.Pre event) {
+            if (this.measuredWindowStart != null && this.tickIndex == this.warmupTicks) {
+                this.measuredWindowStart.run();
+            }
             if (this.perTickWork != null) {
                 this.perTickWork.run();
             }
