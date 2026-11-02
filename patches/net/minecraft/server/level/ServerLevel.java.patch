@@ -395,12 +395,39 @@
              } else {
                  this.blockEventsToReschedule.add(blockeventdata);
              }
-@@ -1600,7 +_,7 @@
+@@ -1600,7 +_,34 @@
  
      @Override
      public LevelEntityGetter<Entity> getEntities() {
 -        return this.entityManager.getEntityGetter();
 +        return this.regionAwareEntityGetter;
++    }
++
++    /**
++     * Neo: {@return the edge length in chunks of the level's physical entity section partitions, or
++     * {@code 0} when the level keeps the shared section storage}
++     * <p>
++     * This is the storage-policy probe of the region-scoped entity query. It exposes no storage and performs
++     * no storage access, so it is safe to call while deciding whether a leased worker may query entities.
++     */
++    @org.jetbrains.annotations.ApiStatus.Internal
++    public int entitySectionRegionChunkSize() {
++        return this.entityManager.entitySectionRegionChunkSize();
++    }
++
++    /**
++     * Neo: iterates the accessible, non-empty sections of exactly one physical region bucket for a native
++     * worker that owns that region's entity tick lease.
++     * <p>
++     * The requested region is validated against the lease of the current thread before any section is read,
++     * so a worker cannot use this accessor to read a neighbouring region's storage. The shared section
++     * storage is never consulted: this method only reaches the physical per-region bucket of the fixed
++     * layout the level was created with.
++     */
++    @org.jetbrains.annotations.ApiStatus.Internal
++    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, AABB box, AbortableIterationConsumer<net.minecraft.world.level.entity.EntitySection<Entity>> consumer) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertLeasedEntityQuery(this, regionX, regionZ);
++        this.entityManager.forEachAccessibleNonEmptySectionInRegion(regionX, regionZ, box, consumer);
      }
  
      public void addLegacyChunkEntities(Stream<Entity> p_143312_) {

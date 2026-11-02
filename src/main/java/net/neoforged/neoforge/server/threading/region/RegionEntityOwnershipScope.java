@@ -31,7 +31,9 @@ import org.jetbrains.annotations.Nullable;
  * vanilla mutations listed in {@link #GRANTABLE_OPERATIONS} are granted; removal, level admission,
  * subclass mutations that run additional side effects and every guard without an entity argument stay
  * rejected. The lease makes no atomicity claim about entity storage, tracking, cross-region reads, chunk
- * state or the vanilla section index: those keep their server-thread handoff and their storage guard.
+ * state or the vanilla section index: those keep their server-thread handoff and their storage guard. The
+ * only storage read the lease adds is the region-scoped range query of its own physical bucket; see
+ * {@link RegionScopedEntityQuery}.
  * <p>
  * A position change of an entity that is <em>added to a level</em> also reaches two server-owned level
  * effects after it wrote the position and bounds: {@code EntityInLevelCallback#onMove} - for a real entity
@@ -69,6 +71,9 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     private static final AtomicLong NEXT_LEASE_ID = new AtomicLong();
     private static final AtomicLong ALLOWED_MUTATION_COUNT = new AtomicLong();
     private static final AtomicLong REJECTED_MUTATION_COUNT = new AtomicLong();
+    private static final AtomicLong ALLOWED_QUERY_COUNT = new AtomicLong();
+    private static final AtomicLong TRUNCATED_QUERY_COUNT = new AtomicLong();
+    private static final AtomicLong REJECTED_QUERY_COUNT = new AtomicLong();
 
     private final RegionCoordinate coordinate;
     private final RegionEntityTickBatch.Group group;
@@ -128,6 +133,55 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         }
         REJECTED_MUTATION_COUNT.incrementAndGet();
         return false;
+    }
+
+    /**
+     * {@return the coordinate of the region whose entity storage the current thread may query, or
+     * {@code null} when the current thread holds no active lease for {@code level}}
+     * <p>
+     * The check is the query half of the lease: a native region worker, the newest lease of the thread, and
+     * the leased level. Whether the level actually has physical region buckets is decided by
+     * {@link RegionScopedEntityQuery}, which also applies the out-of-region clamp and records the counters.
+     */
+    @Nullable
+    static RegionCoordinate queryCoordinate(ServerLevel level) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null
+                || !scope.isActive()
+                || !RegionWorkerScope.isNativeWorkerThread()
+                || scope.coordinate.level() != level) {
+            return null;
+        }
+        return scope.coordinate;
+    }
+
+    /**
+     * {@return true when the active lease of the current thread owns exactly the region
+     * {@code regionX}/{@code regionZ} of {@code level}}
+     * <p>
+     * The level calls this before it reads the physical bucket of the requested region, so a worker cannot
+     * use the internal region-scoped section accessor to read a neighbouring region's storage.
+     */
+    public static boolean ownsQueryRegion(ServerLevel level, int regionX, int regionZ) {
+        final RegionCoordinate coordinate = queryCoordinate(level);
+        return coordinate != null && coordinate.regionX() == regionX && coordinate.regionZ() == regionZ;
+    }
+
+    static void recordAllowedQuery() {
+        ALLOWED_QUERY_COUNT.incrementAndGet();
+    }
+
+    static void recordTruncatedQuery() {
+        TRUNCATED_QUERY_COUNT.incrementAndGet();
+    }
+
+    /**
+     * Counts a legacy entity query that the storage guard rejected on a native worker. Called by
+     * {@code RegionThreadingHooks.rejectLegacyEntityQuery} before it throws, so the rejection is observable
+     * next to the ownership counters.
+     */
+    public static void recordRejectedQuery() {
+        REJECTED_QUERY_COUNT.incrementAndGet();
     }
 
     /**
@@ -249,8 +303,23 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         return REJECTED_MUTATION_COUNT.get();
     }
 
+    static long allowedQueryCount() {
+        return ALLOWED_QUERY_COUNT.get();
+    }
+
+    static long truncatedQueryCount() {
+        return TRUNCATED_QUERY_COUNT.get();
+    }
+
+    static long rejectedQueryCount() {
+        return REJECTED_QUERY_COUNT.get();
+    }
+
     static void resetCounters() {
         ALLOWED_MUTATION_COUNT.set(0L);
         REJECTED_MUTATION_COUNT.set(0L);
+        ALLOWED_QUERY_COUNT.set(0L);
+        TRUNCATED_QUERY_COUNT.set(0L);
+        REJECTED_QUERY_COUNT.set(0L);
     }
 }

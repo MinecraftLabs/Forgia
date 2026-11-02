@@ -275,10 +275,19 @@
      }
  
      public boolean isLoaded(BlockPos p_46750_) {
-@@ -796,6 +_,22 @@
+@@ -796,6 +_,31 @@
  
      @Override
      public List<Entity> getEntities(@Nullable Entity p_46536_, AABB p_46537_, Predicate<? super Entity> p_46538_) {
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel) {
++            // Neo: a native worker that owns the entity tick lease of a region queries only that region's
++            // physical section bucket. A box that extends outside the lease is clamped and counted, never
++            // silently truncated and never served from another region's storage.
++            final List<Entity> leased = net.neoforged.neoforge.server.threading.RegionThreadingHooks.queryEntitiesInLeasedRegion(serverLevel, p_46536_, p_46537_, p_46538_);
++            if (leased != null) {
++                return leased;
++            }
++        }
 +        if (this instanceof net.minecraft.server.level.ServerLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
 +            // Neo: production region workers never receive live entity storage or run the caller predicate.
@@ -318,10 +327,17 @@
          return list;
      }
  
-@@ -828,6 +_,27 @@
+@@ -828,6 +_,34 @@
      public <T extends Entity> void getEntities(
          EntityTypeTest<Entity, T> p_261885_, AABB p_262086_, Predicate<? super T> p_261688_, List<? super T> p_262071_, int p_261858_
      ) {
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.queryEntitiesInLeasedRegion(
++                        serverLevel, p_261885_, p_262086_, p_261688_, p_262071_, p_261858_)) {
++            // Neo: region-scoped entity query of a leased native worker; the caller's list receives the
++            // entities of the leased region only, with the same predicate/abort semantics.
++            return;
++        }
 +        if (this instanceof net.minecraft.server.level.ServerLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
 +            // Neo: production region workers never receive live entity storage or run the caller predicate.

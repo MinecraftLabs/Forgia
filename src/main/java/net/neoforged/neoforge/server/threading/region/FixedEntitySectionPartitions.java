@@ -8,15 +8,18 @@ package net.neoforged.neoforge.server.threading.region;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongAVLTreeSet;
+import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
 import java.util.Objects;
 import java.util.function.LongFunction;
 import net.minecraft.core.SectionPos;
+import net.minecraft.util.AbortableIterationConsumer;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.entity.EntityAccess;
 import net.minecraft.world.level.entity.EntitySection;
+import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
@@ -24,9 +27,11 @@ import org.jetbrains.annotations.Nullable;
 /**
  * Authoritative spatial storage for one fixed {@link RegionLayout}. Each bucket owns its section map and ID
  * tree; there is no global section index. Buckets are indexed by region X and then region Z, so a chunk
- * range resolves one row instead of scanning every partition. All access remains on the server thread. This
- * does not confer region ownership of entities, UUIDs, tracking, or the lazy caches inside entity
- * sections.
+ * range resolves one row instead of scanning every partition. All mutation and all multi-bucket access stays
+ * on the server thread. The only worker read is
+ * {@link #forEachAccessibleNonEmptySectionInRegion(int, int, AABB, AbortableIterationConsumer)}, which reads
+ * one bucket for a worker that owns that region's entity tick lease. This does not confer region ownership
+ * of entities, UUIDs, tracking, or the lazy caches inside entity sections.
  * <p>
  * The layout is the one the installed engine ticks with, so a manager never partitions sections into
  * different regions than the engine that ticks them.
@@ -36,6 +41,12 @@ public final class FixedEntitySectionPartitions<T extends EntityAccess> {
     /** Region X to region Z to the bucket that owns that fixed region. */
     private final Long2ObjectMap<Long2ObjectMap<Bucket<T>>> partitionRows = new Long2ObjectOpenHashMap<>();
     private final RegionLayout layout;
+    /**
+     * Diagnostics-only observer of every bucket lookup. Production leaves it {@code null}; the region-scoped
+     * query tests install one to prove that a leased query never consults a neighbouring region's bucket.
+     */
+    @Nullable
+    private volatile BucketAccessObserver bucketAccessObserver;
 
     /**
      * @param layout the fixed layout whose region edge length indexes the buckets
@@ -62,8 +73,30 @@ public final class FixedEntitySectionPartitions<T extends EntityAccess> {
 
     @Nullable
     private Bucket<T> bucket(int regionX, int regionZ) {
+        final BucketAccessObserver observer = this.bucketAccessObserver;
+        if (observer != null) {
+            observer.onBucketAccess(regionX, regionZ);
+        }
         Long2ObjectMap<Bucket<T>> row = this.partitionRows.get(regionX);
         return row == null ? null : row.get(regionZ);
+    }
+
+    /**
+     * {@return the edge length in chunks of one bucket}
+     */
+    public int regionChunkSize() {
+        return this.layout.regionChunkSize();
+    }
+
+    /**
+     * Installs a diagnostics-only observer of every bucket lookup, or removes it with {@code null}.
+     * <p>
+     * Only the region-scoped entity query tests use this. It lets a test assert that a leased query consulted
+     * exactly the leased region's bucket and never a neighbour's, without changing the production path.
+     */
+    @ApiStatus.Internal
+    public void setBucketAccessObserverForTesting(@Nullable BucketAccessObserver observer) {
+        this.bucketAccessObserver = observer;
     }
 
     @Nullable
@@ -186,8 +219,71 @@ public final class FixedEntitySectionPartitions<T extends EntityAccess> {
         return count;
     }
 
+    /**
+     * Iterates the accessible, non-empty sections of exactly one region bucket that intersect {@code box}.
+     * <p>
+     * This is the region-scoped counterpart of
+     * {@link net.minecraft.world.level.entity.EntitySectionStorage#forEachAccessibleNonEmptySection(AABB, AbortableIterationConsumer)}.
+     * It reads the bucket of {@code regionX}/{@code regionZ} only: the section range is clipped to the
+     * region's own chunk columns before the bucket's section-ID tree is queried, so a query that spans a
+     * region boundary never reads a neighbouring bucket, its section map or its ID tree.
+     * <p>
+     * The caller must already own the region lease; this method performs no ownership check of its own.
+     * The section order is the signed packed-ID order of the bucket, which is the order the vanilla
+     * section scan produces for the same region.
+     */
+    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, AABB box, AbortableIterationConsumer<EntitySection<T>> consumer) {
+        final Bucket<T> bucket = this.bucket(regionX, regionZ);
+        if (bucket == null) {
+            return;
+        }
+        final int regionChunkSize = this.layout.regionChunkSize();
+        final int minChunkX = regionX * regionChunkSize;
+        final int minChunkZ = regionZ * regionChunkSize;
+        final int maxChunkX = minChunkX + regionChunkSize - 1;
+        final int maxChunkZ = minChunkZ + regionChunkSize - 1;
+        final int minSectionX = Math.max(SectionPos.posToSectionCoord(box.minX - 2.0), minChunkX);
+        final int minSectionY = SectionPos.posToSectionCoord(box.minY - 4.0);
+        final int minSectionZ = Math.max(SectionPos.posToSectionCoord(box.minZ - 2.0), minChunkZ);
+        final int maxSectionX = Math.min(SectionPos.posToSectionCoord(box.maxX + 2.0), maxChunkX);
+        final int maxSectionY = SectionPos.posToSectionCoord(box.maxY + 0.0);
+        final int maxSectionZ = Math.min(SectionPos.posToSectionCoord(box.maxZ + 2.0), maxChunkZ);
+        if (minSectionX > maxSectionX || minSectionZ > maxSectionZ) {
+            return;
+        }
+        for (int sectionX = minSectionX; sectionX <= maxSectionX; sectionX++) {
+            final long from = SectionPos.asLong(sectionX, 0, 0);
+            final long to = SectionPos.asLong(sectionX, -1, -1);
+            final LongIterator iterator = bucket.sectionIds.subSet(from, to + 1L).iterator();
+            while (iterator.hasNext()) {
+                final long sectionId = iterator.nextLong();
+                final int sectionY = SectionPos.y(sectionId);
+                final int sectionZ = SectionPos.z(sectionId);
+                if (sectionY < minSectionY || sectionY > maxSectionY || sectionZ < minSectionZ || sectionZ > maxSectionZ) {
+                    continue;
+                }
+                final EntitySection<T> section = bucket.sections.get(sectionId);
+                if (section != null
+                        && !section.isEmpty()
+                        && section.getStatus().isAccessible()
+                        && consumer.accept(section).shouldAbort()) {
+                    return;
+                }
+            }
+        }
+    }
+
     private static final class Bucket<T extends EntityAccess> {
         private final Long2ObjectMap<EntitySection<T>> sections = new Long2ObjectOpenHashMap<>();
         private final LongSortedSet sectionIds = new LongAVLTreeSet();
+    }
+
+    /**
+     * Diagnostics-only observer of one bucket lookup.
+     */
+    @FunctionalInterface
+    @ApiStatus.Internal
+    public interface BucketAccessObserver {
+        void onBucketAccess(int regionX, int regionZ);
     }
 }

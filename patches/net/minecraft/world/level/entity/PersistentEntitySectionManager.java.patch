@@ -205,7 +205,7 @@
          LongSet longset = this.getAllChunksToSave();
  
          while (!longset.isEmpty()) {
-@@ -280,31 +_,42 @@
+@@ -280,31 +_,65 @@
  
      @Override
      public void close() throws IOException {
@@ -227,6 +227,29 @@
 -        return this.entityGetter;
 +        this.checkStorageAccess("PersistentEntitySectionManager.getEntityGetter");
 +        return this.guardedEntityGetter;
++    }
++
++    /**
++     * Neo: {@return the edge length in chunks of the physical section partitions, or {@code 0} when the
++     * level keeps the shared section storage}
++     * <p>
++     * This is the storage-policy probe of the region-scoped entity query. A non-zero value means the level
++     * was created with a fixed {@code RegionLayout}, so a leased worker query has physical per-region
++     * buckets to read. It exposes no storage and performs no storage access.
++     */
++    public int entitySectionRegionChunkSize() {
++        return this.sectionStorage.entitySectionRegionChunkSize();
++    }
++
++    /**
++     * Neo: iterates the sections of exactly one physical region bucket for the region-scoped entity query
++     * of a native worker that owns that region's lease.
++     * <p>
++     * The caller is the level, which validates the lease against the requested region before delegating
++     * here. This method never touches the global section map or a neighbouring region's bucket.
++     */
++    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, net.minecraft.world.phys.AABB box, net.minecraft.util.AbortableIterationConsumer<EntitySection<T>> consumer) {
++        this.sectionStorage.forEachAccessibleNonEmptySectionInRegion(regionX, regionZ, box, consumer);
      }
  
      public boolean canPositionTick(BlockPos p_202168_) {

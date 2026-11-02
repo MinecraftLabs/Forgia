@@ -29,9 +29,10 @@ public enum RegionEntityStorageMode {
     MAIN_THREAD_ONLY,
     /**
      * Internal mechanics-test assumption only: the entity tick worker plan may be created so the batch
-     * mechanics stay covered. Physical section partitions remain server-owned and no production
-     * constructor selects this mode, so this is not a working storage mode and does not make worker
-     * entity ticks safe.
+     * mechanics stay covered. A worker that owns a region lease may read only that region's physical
+     * section bucket through the region-scoped range query; every other partition access remains
+     * server-owned. No production constructor selects this mode, so this is not a working storage mode and
+     * does not make worker entity ticks safe.
      */
     REGION_OWNED
 }

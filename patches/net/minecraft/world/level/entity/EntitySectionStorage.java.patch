@@ -86,7 +86,34 @@
          LongSet longset = new LongOpenHashSet();
          this.sections.keySet().forEach(p_156886_ -> longset.add(getChunkKeyFromSectionKey(p_156886_)));
          return longset;
-@@ -120,12 +_,16 @@
+@@ -115,17 +_,43 @@
+         this.forEachAccessibleNonEmptySection(p_261820_, p_261459_ -> p_261459_.getEntities(p_261820_, p_261992_));
+     }
+ 
++    /**
++     * Neo: {@return the edge length in chunks of the physical section partitions, or {@code 0} when this
++     * storage is not partitioned}
++     */
++    public int entitySectionRegionChunkSize() {
++        return this.partitions == null ? 0 : this.partitions.regionChunkSize();
++    }
++
++    /**
++     * Neo: iterates the accessible, non-empty sections of exactly one physical region bucket.
++     * <p>
++     * The caller is the region-scoped entity query of a native worker that owns the region lease. The
++     * physical partition accessor reads only that region's bucket; it never falls back to the global
++     * section map, which is {@code null} for a partitioned storage.
++     */
++    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, AABB box, AbortableIterationConsumer<EntitySection<T>> consumer) {
++        if (this.partitions == null) {
++            throw new IllegalStateException("Entity section storage is not partitioned");
++        }
++        this.partitions.forEachAccessibleNonEmptySectionInRegion(regionX, regionZ, box, consumer);
++    }
++
+     public <U extends T> void getEntities(EntityTypeTest<T, U> p_261630_, AABB p_261843_, AbortableIterationConsumer<U> p_261742_) {
+         this.forEachAccessibleNonEmptySection(p_261843_, p_261463_ -> p_261463_.getEntities(p_261630_, p_261843_, p_261742_));
      }
  
      public void remove(long p_156898_) {

@@ -140,7 +140,7 @@ public class ServerLoadBenchmarkGameTests {
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -771,12 +771,15 @@ public class ServerLoadBenchmarkGameTests {
         }
         System.out.println(sampler.note(profile, after)
                 + " entityStorageMode=" + after.map(RegionThreadingDiagnostics::entityStorageMode).map(Object::toString).orElse("NONE")
+                + " entityQueriesAllowed=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesAllowedByLease)
+                + " entityQueriesTruncated=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesTruncatedByLease)
+                + " entityQueriesRejected=" + delta(before, after, RegionThreadingDiagnostics::entityQueriesRejected)
                 + " zombieSurvivors=" + survivors + "/" + zombies.size()
                 + " regionMismatches=" + mismatches
                 + " entityTickFailures=" + blockers.failureCount()
                 + " distinctBlockers=" + blockers.blockerCount());
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -792,6 +795,9 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::deferredEntityTicks),
                 delta(before, after, RegionThreadingDiagnostics::entityMutationsAllowedByOwnership),
                 delta(before, after, RegionThreadingDiagnostics::entityMutationsRejectedByOwnership),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesAllowedByLease),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesTruncatedByLease),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesRejected),
                 delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
                 delta(before, after, RegionThreadingDiagnostics::deferredEntitySectionUpdatesApplied),
                 delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntitySectionUpdates),

@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.server.threading;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
@@ -14,7 +15,9 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
+import net.minecraft.world.level.entity.EntityTypeTest;
 import net.minecraft.world.level.entity.LevelEntityGetter;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
@@ -28,6 +31,7 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
 import net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan;
+import net.neoforged.neoforge.server.threading.region.RegionScopedEntityQuery;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
@@ -133,8 +137,10 @@ public final class RegionThreadingHooks {
      * so the check is evaluated there.
      * <p>
      * This overload carries no entity, so it never consults an entity tick lease: it is the storage-level
-     * guard, and a worker that reaches level storage, entity admission or an entity query is rejected by it
-     * even while a lease owns the entities it ticks.
+     * guard, and a worker that reaches level storage, entity admission or the legacy entity query surface is
+     * rejected by it even while a lease owns the entities it ticks. The region-scoped range query of a leased
+     * worker does not reach this guard; it reads only the leased region's physical bucket through
+     * {@link #queryEntitiesInLeasedRegion(ServerLevel, Entity, AABB, Predicate)}.
      */
     public static void assertServerEntityStorageAccess(String operation) {
         if (RegionWorkerScope.isNativeWorkerThread()) {
@@ -247,7 +253,48 @@ public final class RegionThreadingHooks {
      * Rejects a legacy entity query before it runs a predicate, a consumer or returns a live reference.
      */
     public static void rejectLegacyEntityQuery(String operation) {
+        RegionEntityOwnershipScope.recordRejectedQuery();
         RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
+     * Runs an entity range query against the entity tick lease of the current native region worker.
+     * <p>
+     * The contract is clamp and count: the query sees only the entities stored in the leased region, a box
+     * that extends past the region edge is clamped to the lease, and the truncated counter increments. Only
+     * the physical bucket of the lease is read; another region's storage is never consulted.
+     *
+     * @return the region-scoped result, or {@code null} when the current thread may not run a region-scoped
+     *         query and the caller has to keep the legacy guard
+     */
+    @Nullable
+    public static List<Entity> queryEntitiesInLeasedRegion(ServerLevel level, @Nullable Entity excluded, AABB box, Predicate<? super Entity> predicate) {
+        return RegionScopedEntityQuery.tryQuery(level, excluded, box, predicate);
+    }
+
+    /**
+     * Runs a typed entity range query against the entity tick lease of the current native region worker and
+     * appends to {@code result}. See
+     * {@link #queryEntitiesInLeasedRegion(ServerLevel, Entity, AABB, Predicate)} for the contract.
+     *
+     * @return {@code true} when the query ran region-scoped, {@code false} when the caller has to keep the
+     *         legacy guard
+     */
+    public static <T extends Entity> boolean queryEntitiesInLeasedRegion(
+            ServerLevel level, EntityTypeTest<Entity, T> typeTest, AABB box, Predicate<? super T> predicate, List<? super T> result, int max) {
+        return RegionScopedEntityQuery.tryQuery(level, typeTest, box, predicate, result, max);
+    }
+
+    /**
+     * Rejects a region-scoped section access that does not match the active lease of the current thread.
+     * <p>
+     * The level calls this before it reads the physical bucket of the requested region, so the internal
+     * region-scoped section accessor cannot be used by a worker to read a neighbouring region.
+     */
+    public static void assertLeasedEntityQuery(ServerLevel level, int regionX, int regionZ) {
+        if (!RegionEntityOwnershipScope.ownsQueryRegion(level, regionX, regionZ)) {
+            RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess("ServerLevel.forEachAccessibleNonEmptySectionInRegion");
+        }
     }
 
     /**

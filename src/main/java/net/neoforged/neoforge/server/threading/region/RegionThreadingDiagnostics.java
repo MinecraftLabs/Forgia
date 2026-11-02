@@ -35,6 +35,14 @@ package net.neoforged.neoforge.server.threading.region;
  * throws before it mutates anything. A worker entity mutation without an active lease is not an ownership
  * decision: it only increments {@link #ownershipViolationCount()}.
  * <p>
+ * The three query counters report the region-scoped entity query of a leased native worker. An allowed
+ * query is one {@code Level.getEntities} call that ran against the lease instead of the legacy guard, a
+ * truncated query is one allowed query whose box extended past the leased region and was clamped to it, and
+ * a rejected query is one legacy query the storage guard refused on a native worker. A rejected query is
+ * always counted with {@link #ownershipViolationCount()} as well, because the guard reports the operation and
+ * throws. The counters make the clamp-and-count contract observable: a truncated query never silently loses
+ * the entities outside the lease.
+ * <p>
  * {@link #regionChunkSize()} is the edge length in chunks of one region coordinate of the installed
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
  * diagnostic consumer read the same value the engine and the physical section partitions use.
@@ -64,6 +72,9 @@ public record RegionThreadingDiagnostics(
         long deferredEntityTicks,
         long entityMutationsAllowedByOwnership,
         long entityMutationsRejectedByOwnership,
+        long entityQueriesAllowedByLease,
+        long entityQueriesTruncatedByLease,
+        long entityQueriesRejected,
         long blockEntityTicksOnWorkers,
         long skippedBlockEntityTicks,
         long fallbackBlockEntityTicks,

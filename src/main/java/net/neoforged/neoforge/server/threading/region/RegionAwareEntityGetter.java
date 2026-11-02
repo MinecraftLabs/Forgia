@@ -34,6 +34,12 @@ import org.jetbrains.annotations.Nullable;
  * {@link #getAll()}, the iteration) on the server thread and returns the finished result. Production
  * never enables that seam.
  * <p>
+ * The AABB queries of {@code Level.getEntities(...)} have one additional production path: a native worker
+ * that owns a region entity tick lease runs them against the physical bucket of that region through
+ * {@link RegionScopedEntityQuery}. That path is entered before this getter, so it does not appear here. A
+ * direct call to this getter - including its AABB overloads - stays on the legacy rejection because the
+ * by-id/by-uuid/all view is not partitioned.
+ * <p>
  * On the server thread and on every non-worker caller the call runs inline and keeps the vanilla
  * semantics.
  */
