@@ -49,7 +49,21 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * from the worker threads, so it is synchronized.
      */
     private final List<Entity> chunkFallbackEntities = Collections.synchronizedList(new ArrayList<>());
-    private final List<DeferredEntityUpdate> deferredUpdates = Collections.synchronizedList(new ArrayList<>());
+    /**
+     * Ownership changes that a worker deferred to the barrier, keyed by entity identity.
+     * <p>
+     * The entity is its own key, so recording a deferral is one hash insert instead of a scan of every
+     * deferral already recorded in the tick: a later observation of the same entity replaces the entry it
+     * finds (the newest observation wins) and a first observation adds one. The map is guarded by its own
+     * monitor, is only filled from workers, and is drained and cleared once per tick by the barrier, so it
+     * stays bounded by the entities deferred in the current tick.
+     * <p>
+     * The drain order is the iteration order of an identity hash map, which is unspecified, and no longer
+     * the first-defer order of the previous list. Every entry is an independent per-entity decision, so the
+     * barrier publishes the same set of updates either way; only the order among distinct entities can
+     * differ, and that order is not relied upon. Within one entity, newest wins is preserved.
+     */
+    private final IdentityHashMap<Entity, DeferredEntityUpdate> deferredUpdates = new IdentityHashMap<>();
     private final List<DeferredSectionUpdate> deferredSectionUpdates = Collections.synchronizedList(new ArrayList<>());
     /** Set when the engine shuts down; guarded by the monitor of {@link #deferredSectionUpdates}. */
     private volatile boolean sectionUpdateSeamClosed;
@@ -141,14 +155,8 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     void deferEntityUpdate(Entity entity, @Nullable RegionCoordinate destination) {
         final DeferredEntityUpdate update = new DeferredEntityUpdate(entity, destination);
         synchronized (this.deferredUpdates) {
-            for (int index = 0; index < this.deferredUpdates.size(); index++) {
-                if (this.deferredUpdates.get(index).entity() == entity) {
-                    // The entity is published once; the later observation of it is the newer decision.
-                    this.deferredUpdates.set(index, update);
-                    return;
-                }
-            }
-            this.deferredUpdates.add(update);
+            // The entity is published once; the later observation of it is the newer decision.
+            this.deferredUpdates.put(entity, update);
         }
     }
 
@@ -163,10 +171,12 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * remains unaffected.
      */
     void discardDeferredUpdates(Collection<Entity> entities) {
-        final Set<Entity> discarded = Collections.newSetFromMap(new IdentityHashMap<>());
-        discarded.addAll(entities);
         synchronized (this.deferredUpdates) {
-            this.deferredUpdates.removeIf(update -> discarded.contains(update.entity()));
+            // An identity map matches the recorded key by reference, so no lookup set has to be built and the
+            // discard costs one hash removal per named entity instead of a scan of every deferred update.
+            for (final Entity entity : entities) {
+                this.deferredUpdates.remove(entity);
+            }
         }
     }
 
@@ -268,7 +278,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      */
     List<DeferredEntityUpdate> drainDeferredUpdates() {
         synchronized (this.deferredUpdates) {
-            final List<DeferredEntityUpdate> updates = List.copyOf(this.deferredUpdates);
+            final List<DeferredEntityUpdate> updates = List.copyOf(this.deferredUpdates.values());
             this.deferredUpdates.clear();
             return updates;
         }

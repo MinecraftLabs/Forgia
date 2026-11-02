@@ -21,7 +21,7 @@ import static org.mockito.Mockito.when;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -32,7 +32,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -908,11 +907,11 @@ class RegionEntityTransferTest {
         final AtomicInteger maintenanceAttempts = new AtomicInteger();
         try {
             // The engine discards the deferred ownership handoff of the committed entity after the region
-            // mapping was written. Replacing that batch's deferred list with one that refuses the discard
+            // mapping was written. Replacing that batch's deferred-update map with one that refuses the discard
             // makes the real maintenance step throw at its real call point.
-            setDeferredUpdates(batch, new ArrayList<Object>(List.of(entity)) {
+            setDeferredUpdates(batch, new IdentityHashMap<Object, Object>() {
                 @Override
-                public boolean removeIf(Predicate<? super Object> filter) {
+                public Object remove(Object key) {
                     maintenanceAttempts.incrementAndGet();
                     throw new IllegalStateException("injected deferred-update discard failure after the region write");
                 }
@@ -1357,8 +1356,8 @@ class RegionEntityTransferTest {
         return batch;
     }
 
-    /** Replaces the deferred-update list of a published batch with an injected failing dependency. */
-    private static void setDeferredUpdates(Object batch, List<?> updates) throws ReflectiveOperationException {
+    /** Replaces the deferred-update map of a published batch with an injected failing dependency. */
+    private static void setDeferredUpdates(Object batch, Map<?, ?> updates) throws ReflectiveOperationException {
         final Field field = batch.getClass().getDeclaredField("deferredUpdates");
         field.setAccessible(true);
         field.set(batch, updates);
