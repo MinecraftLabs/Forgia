@@ -19,6 +19,7 @@ import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
+import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
@@ -125,6 +126,10 @@ public final class RegionThreadingHooks {
      * thread - passes through and keeps the vanilla behavior. The mechanics-only query handoff on
      * {@link RegionThreadingEngine} is not a way past this check: it runs the query on the server thread,
      * so the check is evaluated there.
+     * <p>
+     * This overload carries no entity, so it never consults an entity tick lease: it is the storage-level
+     * guard, and a worker that reaches level storage, entity admission or an entity query is rejected by it
+     * even while a lease owns the entities it ticks.
      */
     public static void assertServerEntityStorageAccess(String operation) {
         if (RegionWorkerScope.isNativeWorkerThread()) {
@@ -134,15 +139,30 @@ public final class RegionThreadingHooks {
 
     /**
      * Rejects server-owned entity storage access of a server-level entity issued from a native region
-     * worker.
+     * worker, unless the entity tick lease of the current thread grants this mutation of this entity.
      * <p>
      * The entity's level, not {@code isAddedToLevel()}, decides whether its storage is server owned. An
      * entity that has not been registered yet is still backed by the server level's storage.
+     * <p>
+     * The lease exception is narrow: it is decided by
+     * {@link RegionEntityOwnershipScope#grantsEntityMutation(ServerLevel, Entity, String)} and covers only
+     * the vanilla entity mutations a group may own, and only for an entity that is not added to a level.
+     * Removal, level admission, the cross-level teleport, subclass mutations with extra side effects, the
+     * position change of an added entity and every operation without an entity argument still reach
+     * {@link #assertServerEntityStorageAccess(String)}, which never consults a lease. Every non-worker caller
+     * is unaffected and keeps the vanilla behavior.
      */
     public static void assertServerEntityStorageAccess(Entity entity, String operation) {
-        if (entity.level() instanceof ServerLevel) {
-            assertServerEntityStorageAccess(operation);
+        if (!(entity.level() instanceof ServerLevel level)) {
+            return;
         }
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return;
+        }
+        if (RegionEntityOwnershipScope.grantsEntityMutation(level, entity, operation)) {
+            return;
+        }
+        RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
     }
 
     /**

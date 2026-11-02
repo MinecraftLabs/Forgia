@@ -250,6 +250,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.randomTickWorkerExecutionEnabled = randomTickWorkerExecutionEnabled;
         this.entityStorageMode = entityStorageMode;
         RegionOwnershipViolationHandler.reset();
+        RegionEntityOwnershipScope.resetCounters();
     }
 
     public RegionPolicy regionPolicy() {
@@ -1133,19 +1134,26 @@ public final class RegionThreadingEngine implements RegionThreading {
             final int[] ticked = { 0 };
             try {
                 region.beginOwnership();
-                this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
-                    for (final Entity entity : entities) {
-                        if (entity.isRemoved()) {
-                            continue;
+                // The entity ownership lease covers exactly this worker tick loop: it is opened after the
+                // region lease and closed before it, so a worker task outside the loop never sees it.
+                final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                try {
+                    this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
+                        for (final Entity entity : entities) {
+                            if (entity.isRemoved()) {
+                                continue;
+                            }
+                            entity.checkDespawn();
+                            if (entity.isRemoved()) {
+                                continue;
+                            }
+                            level.guardEntityTick(level::tickNonPassenger, entity);
+                            ++ticked[0];
                         }
-                        entity.checkDespawn();
-                        if (entity.isRemoved()) {
-                            continue;
-                        }
-                        level.guardEntityTick(level::tickNonPassenger, entity);
-                        ++ticked[0];
-                    }
-                });
+                    });
+                } finally {
+                    ownership.close();
+                }
             } finally {
                 region.endOwnership();
                 region.clearRunning();
@@ -2811,6 +2819,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.skippedEntityTicks.get(),
                 this.fallbackEntityTicks.get(),
                 this.deferredEntityTicks.get(),
+                RegionEntityOwnershipScope.allowedMutationCount(),
+                RegionEntityOwnershipScope.rejectedMutationCount(),
                 this.blockEntityTicksOnWorkers.get(),
                 this.skippedBlockEntityTicks.get(),
                 this.fallbackBlockEntityTicks.get(),

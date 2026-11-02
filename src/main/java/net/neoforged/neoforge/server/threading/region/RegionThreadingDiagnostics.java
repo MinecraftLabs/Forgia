@@ -17,6 +17,15 @@ package net.neoforged.neoforge.server.threading.region;
  * destination was captured at defer time is committed through the recorded transaction; the legacy count
  * reports the handoffs the transaction refused and that were therefore published from the live position
  * like before, and the retried count reports the handoffs a busy region delayed to a later barrier.
+ * <p>
+ * The two ownership counters report the entity tick lease of a region worker group. An allowance counts
+ * one grant of a vanilla entity mutation the lease may own: it is the lease decision, not a completed
+ * mutation, so one vanilla call can record several allowances when it enters several granted guard sites.
+ * An ownership rejection counts one worker entity mutation the active lease refused, including the removal
+ * operations and the position changes of an entity that is already added to a level. Every such refusal
+ * also increments {@link #ownershipViolationCount()}, because the guard still reports the operation and
+ * throws before it mutates anything. A worker entity mutation without an active lease is not an ownership
+ * decision: it only increments {@link #ownershipViolationCount()}.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -41,6 +50,8 @@ public record RegionThreadingDiagnostics(
         long skippedEntityTicks,
         long fallbackEntityTicks,
         long deferredEntityTicks,
+        long entityMutationsAllowedByOwnership,
+        long entityMutationsRejectedByOwnership,
         long blockEntityTicksOnWorkers,
         long skippedBlockEntityTicks,
         long fallbackBlockEntityTicks,
