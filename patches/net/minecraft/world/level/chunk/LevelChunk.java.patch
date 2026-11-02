@@ -126,7 +126,7 @@
          this.blockEntities.values().forEach(p_187988_ -> {
              if (this.level instanceof ServerLevel serverlevel) {
                  this.addGameEventListener(p_187988_, serverlevel);
-@@ -662,6 +_,30 @@
+@@ -662,27 +_,63 @@
          return new LevelChunk.BoundTickingBlockEntity<>(p_156376_, p_156377_);
      }
  
@@ -157,7 +157,12 @@
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {
          private final T blockEntity;
          private final BlockEntityTicker<T> ticker;
-@@ -672,17 +_,27 @@
+         private boolean loggedInvalidBlockState;
++        /** Cached {@link #getType()}; the type of a block entity instance never changes. */
++        private String typeName;
+ 
+         BoundTickingBlockEntity(T p_156433_, BlockEntityTicker<T> p_156434_) {
+             this.blockEntity = p_156433_;
              this.ticker = p_156434_;
          }
  
@@ -203,6 +208,25 @@
                      }
                  }
              }
+@@ -718,7 +_,17 @@
+ 
+         @Override
+         public String getType() {
+-            return BlockEntityType.getKey(this.blockEntity.getType()).toString();
++            // The registry key of a block entity type is immutable, so the name is derived once instead of on
++            // every call. The per-tick staleness check of the region block-entity tick scope compares the
++            // captured type name twice per ticker, and deriving it there took the registry lookup and
++            // allocated the name String on every block entity tick. Racing derivations compute the same
++            // content, and the check compares content, not identity.
++            String name = this.typeName;
++            if (name == null) {
++                name = BlockEntityType.getKey(this.blockEntity.getType()).toString();
++                this.typeName = name;
++            }
++            return name;
+         }
+ 
+         @Override
 @@ -740,6 +_,7 @@
  
      class RebindableTickingBlockEntityWrapper implements TickingBlockEntity {
