@@ -12,6 +12,11 @@ package net.neoforged.neoforge.server.threading.region;
  * still wait for a commit, the terminal results kept for idempotent replays, and the recordings the journal
  * bound refused. A refused recording leaves the caller on the vanilla path, so a growing rejection count is
  * the only observable sign that the pending bound of the journal is exhausted.
+ * <p>
+ * The deferred counters report the ownership handoffs of a finished entity batch. A deferred move whose
+ * destination was captured at defer time is committed through the recorded transaction; the legacy count
+ * reports the handoffs the transaction refused and that were therefore published from the live position
+ * like before, and the retried count reports the handoffs a busy region delayed to a later barrier.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -61,4 +66,6 @@ public record RegionThreadingDiagnostics(
         boolean randomTickWorkerDispatchEffective,
         int pendingEntityTransferCount,
         int rememberedEntityTransferResultCount,
-        long rejectedEntityTransferRecordCount) {}
+        long rejectedEntityTransferRecordCount,
+        long legacyDeferredEntityMoveCount,
+        long retriedDeferredEntityMoveCount) {}

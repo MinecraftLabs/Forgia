@@ -28,14 +28,16 @@ import org.jetbrains.annotations.Nullable;
  * <p>
  * Ownership changes that happen while a batch owns an entity are recorded as deferred updates and
  * published after the batch finished, so the snapshot region stays authoritative for the duration of the
- * current tick and no new region work can start for the entity before the handoff.
+ * current tick and no new region work can start for the entity before the handoff. Each deferred update
+ * carries the destination region that the deferring thread observed, so the handoff is published to that
+ * destination instead of one re-derived from the entity's live position at the barrier.
  */
 @ApiStatus.Internal
 final class RegionEntityTickBatch extends RegionTickBatch {
     private final List<Group> groups = new ArrayList<>();
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<Entity> fallbackEntities = new ArrayList<>();
-    private final List<Entity> deferredUpdates = Collections.synchronizedList(new ArrayList<>());
+    private final List<DeferredEntityUpdate> deferredUpdates = Collections.synchronizedList(new ArrayList<>());
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level) {
@@ -100,12 +102,21 @@ final class RegionEntityTickBatch extends RegionTickBatch {
 
     /**
      * Records an ownership change of {@code entity} that must be published after the batch finished.
+     *
+     * @param destination the destination region the deferring thread observed, or {@code null} when the
+     *                    entity had already left the server side; the barrier never re-derives it
      */
-    void deferEntityUpdate(Entity entity) {
+    void deferEntityUpdate(Entity entity, @Nullable RegionCoordinate destination) {
+        final DeferredEntityUpdate update = new DeferredEntityUpdate(entity, destination);
         synchronized (this.deferredUpdates) {
-            if (!this.deferredUpdates.contains(entity)) {
-                this.deferredUpdates.add(entity);
+            for (int index = 0; index < this.deferredUpdates.size(); index++) {
+                if (this.deferredUpdates.get(index).entity() == entity) {
+                    // The entity is published once; the later observation of it is the newer decision.
+                    this.deferredUpdates.set(index, update);
+                    return;
+                }
             }
+            this.deferredUpdates.add(update);
         }
     }
 
@@ -116,13 +127,14 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * A recorded transfer commits the authoritative region mapping of the entity while the batch is still
      * running its server-thread post-processing. Publishing the older, deferred update afterwards would
      * overwrite that committed destination with the region of the live position, so the committed decision
-     * wins and the pending entry is dropped. A later {@link #deferEntityUpdate(Entity)} remains unaffected.
+     * wins and the pending entry is dropped. A later {@link #deferEntityUpdate(Entity, RegionCoordinate)}
+     * remains unaffected.
      */
     void discardDeferredUpdates(Collection<Entity> entities) {
         final Set<Entity> discarded = Collections.newSetFromMap(new IdentityHashMap<>());
         discarded.addAll(entities);
         synchronized (this.deferredUpdates) {
-            this.deferredUpdates.removeIf(discarded::contains);
+            this.deferredUpdates.removeIf(update -> discarded.contains(update.entity()));
         }
     }
 
@@ -149,20 +161,13 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     }
 
     /**
-     * Publishes the deferred ownership handoffs after the batch finished.
+     * Takes the deferred ownership handoffs that wait for the end of the batch.
      */
-    void applyDeferredEntityUpdates(RegionThreadingEngine engine) {
-        final List<Entity> updates;
+    List<DeferredEntityUpdate> drainDeferredUpdates() {
         synchronized (this.deferredUpdates) {
-            updates = new ArrayList<>(this.deferredUpdates);
+            final List<DeferredEntityUpdate> updates = List.copyOf(this.deferredUpdates);
             this.deferredUpdates.clear();
-        }
-        for (final Entity entity : updates) {
-            if (entity.isRemoved() || !(entity.level() instanceof ServerLevel)) {
-                engine.publishEntityRemoval(entity);
-            } else {
-                engine.publishEntityMove(entity);
-            }
+            return updates;
         }
     }
 
@@ -174,6 +179,12 @@ final class RegionEntityTickBatch extends RegionTickBatch {
             addMembers(members, passenger);
         }
     }
+
+    /**
+     * One deferred ownership change: the entity and the destination region that the deferring thread
+     * observed. The destination is captured once and never re-derived at the batch barrier.
+     */
+    record DeferredEntityUpdate(Entity entity, @Nullable RegionCoordinate destination) {}
 
     /**
      * One region's share of the batch: the region lease, the entities it ticks, and the snapshot members

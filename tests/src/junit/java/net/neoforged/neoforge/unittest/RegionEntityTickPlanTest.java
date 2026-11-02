@@ -24,6 +24,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -33,6 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.util.profiling.ProfilerFiller;
@@ -41,9 +43,11 @@ import net.minecraft.world.level.entity.EntityTickList;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.ScheduledRegionTask;
+import net.neoforged.neoforge.server.threading.region.EntityIdentityLedger;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
@@ -70,6 +74,7 @@ class RegionEntityTickPlanTest {
     };
 
     private RegionThreadingEngine engine;
+    private final AtomicInteger nextEntityId = new AtomicInteger(1);
 
     @AfterEach
     void shutdownEngine() {
@@ -878,6 +883,48 @@ class RegionEntityTickPlanTest {
     }
 
     @Test
+    void deferredWorkerMoveCommitsTheDestinationCapturedDuringTheTick() throws ReflectiveOperationException {
+        this.installEngine(true);
+        final EntityIdentityLedger ledger = new EntityIdentityLedger();
+        final ServerLevel level = transferLevel(ledger);
+        final AtomicReference<BlockPos> position = new AtomicReference<>(new BlockPos(1, 64, 1));
+        final Entity entity = trackedEntity(level, ledger, position);
+        // A regionized level has a live region at the destination because its chunks are loaded there.
+        this.engine.addRegionSection(level, 256, 0);
+        final List<Throwable> workerRecordAttempts = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            position.set(new BlockPos(4096, 64, 0));
+            this.engine.moveRegionEntity(entity);
+            try {
+                RegionThreadingHooks.recordEntityRegionTransfer(entity, RegionLayout.DYNAMIC.regionAt(level, position.get()));
+                workerRecordAttempts.add(new AssertionError("a region worker recorded the transfer itself"));
+            } catch (IllegalStateException rejected) {
+                workerRecordAttempts.add(rejected);
+            }
+            // The entity moves on before the barrier; the handoff must keep the captured destination.
+            position.set(new BlockPos(8192, 64, 0));
+            return null;
+        }).when(entity).tick();
+
+        final RegionEntityTickPlan plan = plan(level);
+        assertTrue(plan.accept(entity));
+        plan.executeAndAwait();
+
+        assertEquals(1, workerRecordAttempts.size());
+        assertTrue(workerRecordAttempts.get(0) instanceof IllegalStateException,
+                () -> "the recording guard must reject a region worker, got: " + workerRecordAttempts.get(0));
+        assertTrue(workerRecordAttempts.get(0).getMessage().contains("RegionThreadingEngine.recordEntityRegionTransfer"),
+                () -> "the rejection must name the recording operation, got: " + workerRecordAttempts.get(0).getMessage());
+        assertEquals(1L, this.engine.diagnostics().entityTicksOnWorkers(), "the entity must tick on a region worker");
+        assertEquals(16, regionX(this.engine, entity), "the barrier must commit the destination captured in the tick");
+        assertEquals(0L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                "the recorded handoff must not fall back to the live position");
+        assertEquals(1, this.engine.diagnostics().rememberedEntityTransferResultCount(),
+                "exactly one transfer is committed, and it is committed at the barrier");
+        assertEquals(0, this.engine.diagnostics().pendingEntityTransferCount());
+    }
+
+    @Test
     void shutdownWaitsForTheBatchWhileItAcquiresTheRegionLease() throws InterruptedException {
         this.installEngine(true, true);
         final ServerLevel level = mockLevel();
@@ -1108,6 +1155,36 @@ class RegionEntityTickPlanTest {
         // Region coordinates are part of worker task descriptions, which must not call into the level.
         doReturn("test-level").when(level).toString();
         return level;
+    }
+
+    /**
+     * Creates a level that owns an entity identity ledger and a server whose {@code isSameThread()} answers
+     * for the thread that drives the batch, so a recorded transfer accepts the barrier and rejects a worker.
+     */
+    private ServerLevel transferLevel(EntityIdentityLedger ledger) {
+        final ServerLevel level = mockLevel();
+        doReturn(ledger).when(level).entityIdentityLedger();
+        final Thread ownerThread = Thread.currentThread();
+        final MinecraftServer server = mock(MinecraftServer.class);
+        when(server.isSameThread()).thenAnswer(invocation -> Thread.currentThread() == ownerThread);
+        doReturn(server).when(level).getServer();
+        return level;
+    }
+
+    /** Registers {@code entity} in the level's identity ledger and in the regionizer like a spawned entity. */
+    private Entity trackedEntity(ServerLevel level, EntityIdentityLedger ledger, AtomicReference<BlockPos> position) {
+        final Entity entity = mock(Entity.class);
+        when(entity.level()).thenReturn(level);
+        when(entity.blockPosition()).thenAnswer(invocation -> position.get());
+        when(entity.getUUID()).thenReturn(UUID.randomUUID());
+        when(entity.getId()).thenReturn(nextEntityId.getAndIncrement());
+        when(entity.getPassengers()).thenReturn(List.of());
+        when(entity.isRemoved()).thenReturn(false);
+        assertEquals(EntityIdentityLedger.Admission.ADMITTED, ledger.admit(entity));
+        ledger.publishAdmitted(entity);
+        ledger.publishTracked(entity);
+        this.engine.addRegionEntity(entity);
+        return entity;
     }
 
     private static Entity mockEntity(ServerLevel level, BlockPos pos) {

@@ -23,6 +23,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
@@ -51,6 +52,12 @@ import org.jetbrains.annotations.Nullable;
 public final class RegionThreadingEngine implements RegionThreading {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int MAX_REGION_LEASE_ATTEMPTS = 4;
+    /**
+     * Number of entity batch barriers a deferred entity move waits for a busy region before it is published
+     * through the legacy path. Every attempt happens at a barrier on the server thread, so the bound is
+     * counted in barriers and never in a spin.
+     */
+    private static final int MAX_DEFERRED_ENTITY_MOVE_ATTEMPTS = 3;
     private static final java.util.concurrent.atomic.AtomicLong DIAG_LAST = new java.util.concurrent.atomic.AtomicLong();
     private static final BasicRegionThreadingContext NONE_CONTEXT = new BasicRegionThreadingContext(RegionThreadingContext.Kind.NONE, null, null, null, null);
     private static final ThreadLocal<RegionThreadingContext> CURRENT_CONTEXT = ThreadLocal.withInitial(() -> NONE_CONTEXT);
@@ -142,6 +149,16 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final RegionEntityTransferJournal entityTransferJournal = new RegionEntityTransferJournal();
     private final AtomicLong nextEntityTransferTokenId = new AtomicLong();
+    /**
+     * Deferred entity moves whose recorded commit answered {@link RegionEntityTransferResult#REGION_BUSY}.
+     * Every entry keeps the destination captured when the move was deferred and is applied again at the next
+     * entity batch barrier, so a busy region delays the handoff instead of dropping it or replacing its
+     * destination with one re-derived from the live position. Guarded by {@link #admissionLock}, so a level
+     * clear and a shutdown drop the entries of their level together with the journal.
+     */
+    private final List<DeferredEntityMove> pendingDeferredEntityMoves = new ArrayList<>();
+    private final AtomicLong legacyDeferredEntityMoveCount = new AtomicLong();
+    private final AtomicLong retriedDeferredEntityMoveCount = new AtomicLong();
     /**
      * Serializes region drain activation with lifecycle cleanup. A drain holds the read lock only while
      * it checks the lifecycle state and marks the lease or worker submission; shutdown and level clear
@@ -989,7 +1006,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         } finally {
             failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
             failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
-            failure = runBatchCompletion(failure, () -> batch.applyDeferredEntityUpdates(this));
+            failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
             batch.finish();
             this.activeTickBatches.remove(batch);
             batch.clearExecutingOnCurrentThread();
@@ -2087,6 +2104,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // A pending decision that touches the closing level becomes terminal here. A later
                     // commit therefore cannot write a region mapping after the clear below.
                     this.entityTransferJournal.clearPendingFor(level);
+                    this.pendingDeferredEntityMoves.removeIf(move -> move.destination().level() == level);
                     this.regionizer.clearLevel(level);
                     for (final EntityRegionScheduledTask task : List.copyOf(this.entityTasks)) {
                         if (task.isOwnedBy(level)) {
@@ -2142,7 +2160,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     public void removeRegionEntity(Entity entity) {
         final RegionEntityTickBatch.Group group = this.currentEntityTickGroup();
         if (group != null) {
-            group.batch().deferEntityUpdate(entity);
+            group.batch().deferEntityUpdate(entity, this.deferredEntityDestination(entity));
             return;
         }
         synchronized (this.admissionLock) {
@@ -2164,7 +2182,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     public void moveRegionEntity(Entity entity) {
         final RegionEntityTickBatch.Group group = this.currentEntityTickGroup();
         if (group != null) {
-            group.batch().deferEntityUpdate(entity);
+            group.batch().deferEntityUpdate(entity, this.deferredEntityDestination(entity));
             return;
         }
         synchronized (this.admissionLock) {
@@ -2173,6 +2191,21 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             this.publishEntityMove(entity);
         }
+    }
+
+    /**
+     * {@return the destination region of a deferred ownership change, captured on the deferring thread}
+     * <p>
+     * Inside an entity tick batch the position read here is the one the deferring worker already observed
+     * while it ticked the entity. The destination is stored with the deferred update and committed at the
+     * barrier, so a position the entity reaches in between cannot redirect the handoff.
+     */
+    @Nullable
+    private RegionCoordinate deferredEntityDestination(Entity entity) {
+        if (!(entity.level() instanceof ServerLevel level)) {
+            return null;
+        }
+        return this.layout.regionAt(level, entity.blockPosition());
     }
 
     void publishEntityMove(Entity entity) {
@@ -2192,6 +2225,144 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
         this.notifyEntityMoved(entity);
     }
+
+    /**
+     * Applies the deferred ownership handoffs of a finished entity batch on the server thread.
+     * <p>
+     * Every handoff carries the destination region its deferring worker captured, so nothing here reads the
+     * entity's live position to decide where the mapping goes.
+     * <p>
+     * The batch's own captures are applied before the moves that a busy region left pending at an earlier
+     * barrier, because a capture of this batch is the newer observation of the entity. Committing the newer
+     * capture prunes the pending entry of the same entity, so the stale queued destination is not applied and
+     * the newest observation wins instead of the mapping lagging a tick behind. The pending entries are claimed
+     * one by one after the batch ran, so a move that this barrier queues for a still busy region waits for the
+     * next barrier instead of being attempted twice in a row.
+     */
+    private void applyDeferredEntityUpdates(RegionEntityTickBatch batch) {
+        final List<DeferredEntityMove> waiting = this.pendingDeferredEntityMovesSnapshot();
+        for (final RegionEntityTickBatch.DeferredEntityUpdate update : batch.drainDeferredUpdates()) {
+            this.applyDeferredEntityUpdate(update.entity(), update.destination(), 0);
+        }
+        for (final DeferredEntityMove move : waiting) {
+            if (this.claimPendingDeferredEntityMove(move)) {
+                this.applyDeferredEntityUpdate(move.entity(), move.destination(), move.attempts());
+            }
+        }
+    }
+
+    /**
+     * Applies one deferred ownership change at the entity batch barrier.
+     * <p>
+     * The destination was captured by the deferring thread and is committed through the recorded transfer
+     * transaction, so the barrier decides it exactly once. The transaction is a bookmark, not a new
+     * atomicity claim: only the region-index mapping moves, and the vanilla section, identity, tracking and
+     * network side effects stay caller-owned.
+     * <p>
+     * Every outcome that cannot use the transaction keeps the previous behavior of publishing the deferred
+     * move from the live position and is counted in {@link RegionThreadingDiagnostics#legacyDeferredEntityMoveCount()}:
+     * a removed or cross-level entity, a shut-down engine, a level the current thread does not own, a refused
+     * recording (an untracked entity, a riding graph that spans levels or lost its identity epoch, a closed
+     * level, a full journal) and any other terminal commit result. None of them is retried with a destination
+     * derived a second time. An update that names the region the entity is already mapped to is the no-op
+     * case of the per-tick move hook: it is published the same way but is not counted as a fallback.
+     * <p>
+     * {@link RegionEntityTransferResult#REGION_BUSY} is the one transient answer: the same captured
+     * destination is applied again at the next barrier, at most {@link #MAX_DEFERRED_ENTITY_MOVE_ATTEMPTS}
+     * times, so a leased region delays the handoff instead of dropping it. Once the bound is reached the move
+     * is published through the legacy path as well, which keeps the pre-transaction behavior for a region
+     * that stays busy.
+     */
+    private void applyDeferredEntityUpdate(Entity entity, @Nullable RegionCoordinate destination, int attempts) {
+        if (entity.isRemoved() || !(entity.level() instanceof ServerLevel level)) {
+            this.publishEntityRemoval(entity);
+            return;
+        }
+        if (!this.canRecordDeferredEntityMove(level, destination)) {
+            this.publishLegacyDeferredEntityMove(entity);
+            return;
+        }
+        final RegionState source = this.regionizer.regionFor(entity);
+        if (source == null || source.coordinate().equals(destination)) {
+            // The deferred update names the region the entity is already mapped to. That is the common case of
+            // the per-tick move hook, which defers on every entity tick; publishing it keeps the
+            // pre-transaction behavior, including the scheduled-task notification, without booking a transfer
+            // that changes nothing.
+            this.publishEntityMove(entity);
+            return;
+        }
+        final RegionEntityTransferToken token = this.recordEntityRegionTransfer(entity, destination);
+        if (token == null) {
+            this.publishLegacyDeferredEntityMove(entity);
+            return;
+        }
+        final RegionEntityTransferResult result = this.commitEntityRegionTransfer(token);
+        if (result == RegionEntityTransferResult.COMMITTED) {
+            return;
+        }
+        if (result == RegionEntityTransferResult.REGION_BUSY && attempts < MAX_DEFERRED_ENTITY_MOVE_ATTEMPTS) {
+            this.retriedDeferredEntityMoveCount.incrementAndGet();
+            synchronized (this.admissionLock) {
+                this.pendingDeferredEntityMoves.add(new DeferredEntityMove(entity, destination, attempts + 1));
+            }
+            return;
+        }
+        this.publishLegacyDeferredEntityMove(entity);
+    }
+
+    /**
+     * {@return true when the barrier can book the deferred move of an entity in {@code level}}
+     * <p>
+     * The recorded API rejects a caller it cannot trust with an exception, so the barrier checks the same
+     * preconditions first: the engine is running, the destination was captured in the entity's level, and the
+     * current thread is the server thread owning that level. A level without an owning server, or a batch
+     * driven from another thread, therefore keeps the pre-transaction publish instead of failing the whole
+     * batch for a handoff that simply cannot be booked.
+     */
+    private boolean canRecordDeferredEntityMove(ServerLevel level, @Nullable RegionCoordinate destination) {
+        if (this.shutdown || destination == null || destination.level() != level) {
+            return false;
+        }
+        final MinecraftServer server = level.getServer();
+        return server != null && server.isSameThread();
+    }
+
+    /**
+     * {@return a snapshot of the deferred entity moves that wait for a busy region}
+     */
+    private List<DeferredEntityMove> pendingDeferredEntityMovesSnapshot() {
+        synchronized (this.admissionLock) {
+            return List.copyOf(this.pendingDeferredEntityMoves);
+        }
+    }
+
+    /**
+     * Removes {@code move} from the pending list so it is attempted exactly once per barrier.
+     *
+     * @return true when the move was still waiting, i.e. no newer capture of its entity pruned it
+     */
+    private boolean claimPendingDeferredEntityMove(DeferredEntityMove move) {
+        synchronized (this.admissionLock) {
+            return this.pendingDeferredEntityMoves.remove(move);
+        }
+    }
+
+    /**
+     * Publishes a deferred move that the recorded transfer transaction could not carry, exactly like before
+     * the transaction existed, and counts it so a transaction that refuses handoffs stays observable.
+     */
+    private void publishLegacyDeferredEntityMove(Entity entity) {
+        this.legacyDeferredEntityMoveCount.incrementAndGet();
+        this.publishEntityMove(entity);
+    }
+
+    /**
+     * One deferred entity move that waits for its busy source or destination region.
+     *
+     * @param destination the region captured when the move was deferred; it is never re-derived
+     * @param attempts    the number of barriers this move was already retried at
+     */
+    private record DeferredEntityMove(Entity entity, RegionCoordinate destination, int attempts) {}
 
     /**
      * Records a cross-region entity transfer decision without mutating any index.
@@ -2467,6 +2638,13 @@ public final class RegionThreadingEngine implements RegionThreading {
                 entityBatch.discardDeferredUpdates(entities);
             }
         }
+        // A move that waits for a busy region carries the destination of the older decision too, so the
+        // committed transfer has to drop it as well; otherwise the retry would overwrite the commit.
+        final Set<Entity> discarded = Collections.newSetFromMap(new IdentityHashMap<>());
+        discarded.addAll(entities);
+        synchronized (this.admissionLock) {
+            this.pendingDeferredEntityMoves.removeIf(move -> discarded.contains(move.entity()));
+        }
     }
 
     /**
@@ -2658,7 +2836,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.isRandomTickWorkerDispatchEffective(),
                 this.entityTransferJournal.pendingCount(),
                 this.entityTransferJournal.rememberedCount(),
-                this.entityTransferJournal.rejectedRecordCount());
+                this.entityTransferJournal.rejectedRecordCount(),
+                this.legacyDeferredEntityMoveCount.get(),
+                this.retriedDeferredEntityMoveCount.get());
     }
 
     /**
@@ -2695,6 +2875,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                     }
                     this.shutdown = true;
                     this.entityTransferJournal.clear();
+                    this.pendingDeferredEntityMoves.clear();
                 }
                 this.awaitActiveTickBatches(null);
                 this.awaitSubmittedRegionTasks(null);

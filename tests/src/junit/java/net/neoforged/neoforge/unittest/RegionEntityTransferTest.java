@@ -634,7 +634,9 @@ class RegionEntityTransferTest {
         final RegionCoordinate source = trackedCoordinate(this.engine, entity);
         final BlockPos destinationPosition = new BlockPos(4096, 64, 0);
         final RegionCoordinate destination = activeDestination(destinationPosition);
-        final Object batch = publishedEntityBatch(this.engine, this.level, entity);
+        // The batch deferred its handoff after the entity already reached the third region, so the captured
+        // destination is the one that must lose against the committed transfer.
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, regionAt(new BlockPos(8192, 64, 0)));
         try {
             // The live position keeps moving after the batch deferred its handoff. Publishing that
             // deferred update would move the entity to the third region instead of the committed one.
@@ -652,6 +654,224 @@ class RegionEntityTransferTest {
         } finally {
             discardPublishedBatch(this.engine, batch);
         }
+    }
+
+    @Test
+    void deferredMoveCommitsTheDestinationCapturedAtDeferTime() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, destination);
+        try {
+            // The worker observed the destination while it ticked the entity; the live position keeps moving
+            // until the barrier runs.
+            when(entity.blockPosition()).thenReturn(new BlockPos(8192, 64, 0));
+
+            applyDeferredEntityUpdates(batch, this.engine);
+
+            assertEquals(destination, trackedCoordinate(this.engine, entity),
+                    "the barrier must commit the destination captured at defer time");
+            assertEquals(0, this.engine.pendingEntityTransferCount());
+            assertEquals(1, this.engine.rememberedEntityTransferResultCount());
+            assertEquals(0L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                    "a recorded handoff must not fall back to the live position");
+        } finally {
+            discardPublishedBatch(this.engine, batch);
+        }
+    }
+
+    @Test
+    void aRefusedRecordingKeepsTheLegacyDeferredPublish() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate source = trackedCoordinate(this.engine, entity);
+        final ServerLevel otherLevel = mock(ServerLevel.class);
+        // A cross-level destination is outside the recorded transaction, so the update has no decision.
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, new RegionCoordinate(otherLevel, 1, 1));
+        try {
+            when(entity.blockPosition()).thenReturn(new BlockPos(4096, 64, 0));
+
+            applyDeferredEntityUpdates(batch, this.engine);
+
+            assertEquals(regionAt(new BlockPos(4096, 64, 0)), trackedCoordinate(this.engine, entity),
+                    "a refused recording must publish the deferred move from the live position like before");
+            assertNotEquals(source, trackedCoordinate(this.engine, entity));
+            assertEquals(0, this.engine.pendingEntityTransferCount(), "a refused recording leaves no decision behind");
+            assertEquals(0, this.engine.rememberedEntityTransferResultCount());
+            assertEquals(1L, this.engine.diagnostics().legacyDeferredEntityMoveCount());
+        } finally {
+            discardPublishedBatch(this.engine, batch);
+        }
+    }
+
+    @Test
+    void aBusyDestinationDelaysTheCapturedMoveToTheNextBarrier() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate source = trackedCoordinate(this.engine, entity);
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object destinationRegion = region(this.engine, destination);
+        final Object firstBatch = publishedEntityBatch(this.engine, this.level, entity, destination);
+        final Object nextBatch = publishedEntityBatch(this.engine, this.level, entity, destination);
+        try {
+            when(entity.blockPosition()).thenReturn(new BlockPos(8192, 64, 0));
+
+            beginRegionLease(destinationRegion);
+            try {
+                applyDeferredEntityUpdates(firstBatch, this.engine);
+                assertEquals(source, trackedCoordinate(this.engine, entity),
+                        "a busy destination must neither drop nor redirect the deferred move");
+                assertEquals(0L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                        "a busy destination must not fall back to the live position");
+                assertEquals(1L, this.engine.diagnostics().retriedDeferredEntityMoveCount());
+            } finally {
+                endRegionLease(destinationRegion);
+            }
+
+            // The next entity batch barrier applies the same captured destination.
+            applyDeferredEntityUpdates(nextBatch, this.engine);
+
+            assertEquals(destination, trackedCoordinate(this.engine, entity),
+                    "the retried move must keep the destination captured at defer time");
+            assertEquals(0L, this.engine.diagnostics().legacyDeferredEntityMoveCount());
+            assertEquals(0, this.engine.pendingEntityTransferCount());
+        } finally {
+            discardPublishedBatch(this.engine, firstBatch);
+            discardPublishedBatch(this.engine, nextBatch);
+        }
+    }
+
+    @Test
+    void aNewerCaptureAtTheNextBarrierSupersedesAPendingBusyRetry() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate source = trackedCoordinate(this.engine, entity);
+        final RegionCoordinate olderDestination = activeDestination(new BlockPos(4096, 64, 0));
+        final RegionCoordinate newerDestination = activeDestination(new BlockPos(8192, 64, 0));
+        final Object olderDestinationRegion = region(this.engine, olderDestination);
+        final Object firstBatch = publishedEntityBatch(this.engine, this.level, entity, olderDestination);
+        try {
+            when(entity.blockPosition()).thenReturn(new BlockPos(8192, 64, 0));
+
+            // Barrier N: the older capture is queued because its destination region is leased.
+            beginRegionLease(olderDestinationRegion);
+            try {
+                applyDeferredEntityUpdates(firstBatch, this.engine);
+            } finally {
+                endRegionLease(olderDestinationRegion);
+            }
+            assertEquals(source, trackedCoordinate(this.engine, entity));
+            assertEquals(1, pendingDeferredEntityMoves(this.engine).size(),
+                    "the busy destination must wait for the next barrier");
+
+            // Barrier N+1: the same entity is deferred again, now with a newer destination.
+            final Object nextBatch = publishedEntityBatch(this.engine, this.level, entity, newerDestination);
+            try {
+                final long legacyBefore = this.engine.diagnostics().legacyDeferredEntityMoveCount();
+
+                applyDeferredEntityUpdates(nextBatch, this.engine);
+
+                assertEquals(newerDestination, trackedCoordinate(this.engine, entity),
+                        "the newer capture of the batch must win over the queued older destination");
+                assertEquals(0, pendingDeferredEntityMoves(this.engine).size(),
+                        "committing the newer capture must prune the stale queued retry");
+                assertEquals(legacyBefore, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                        "the newer capture must not fall back to the live position");
+            } finally {
+                discardPublishedBatch(this.engine, nextBatch);
+            }
+        } finally {
+            discardPublishedBatch(this.engine, firstBatch);
+        }
+    }
+
+    @Test
+    void aRegionThatStaysBusyEndsOnTheLegacyPublishAfterTheRetryBound() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object destinationRegion = region(this.engine, destination);
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, destination);
+        try {
+            when(entity.blockPosition()).thenReturn(new BlockPos(8192, 64, 0));
+
+            beginRegionLease(destinationRegion);
+            try {
+                applyDeferredEntityUpdates(batch, this.engine);
+                applyDeferredEntityUpdates(batch, this.engine);
+                assertEquals(0L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                        "the move waits for the busy region instead of being published from the live position");
+
+                // The retry bound is finite, so a region that never becomes idle cannot keep the entry alive.
+                for (int barrier = 0; barrier < 16 && this.engine.diagnostics().legacyDeferredEntityMoveCount() == 0L; barrier++) {
+                    applyDeferredEntityUpdates(batch, this.engine);
+                }
+                assertEquals(1L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                        "a region that stays busy must end on the pre-transaction publish");
+                assertEquals(regionAt(new BlockPos(8192, 64, 0)), trackedCoordinate(this.engine, entity));
+            } finally {
+                endRegionLease(destinationRegion);
+            }
+
+            applyDeferredEntityUpdates(batch, this.engine);
+            assertEquals(1L, this.engine.diagnostics().legacyDeferredEntityMoveCount(),
+                    "an exhausted retry must not be queued again");
+        } finally {
+            discardPublishedBatch(this.engine, batch);
+        }
+    }
+
+    @Test
+    void aCommittedTransferDropsAPendingBusyRetry() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate busyDestination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object destinationRegion = region(this.engine, busyDestination);
+        final RegionCoordinate committedDestination = activeDestination(new BlockPos(8192, 64, 0));
+        final Object firstBatch = publishedEntityBatch(this.engine, this.level, entity, busyDestination);
+        final Object nextBatch = publishedEntityBatch(this.engine, this.level, entity, busyDestination);
+        try {
+            when(entity.blockPosition()).thenReturn(new BlockPos(8192, 64, 0));
+
+            beginRegionLease(destinationRegion);
+            try {
+                applyDeferredEntityUpdates(firstBatch, this.engine);
+                assertEquals(1L, this.engine.diagnostics().retriedDeferredEntityMoveCount());
+            } finally {
+                endRegionLease(destinationRegion);
+            }
+
+            final RegionEntityTransferToken token = this.engine.recordEntityRegionTransfer(entity, committedDestination);
+            assertNotNull(token);
+            assertEquals(RegionEntityTransferResult.COMMITTED, this.engine.commitEntityRegionTransfer(token));
+            assertEquals(committedDestination, trackedCoordinate(this.engine, entity));
+
+            // The waiting retry carries the older decision, so the commit has to drop it.
+            applyDeferredEntityUpdates(nextBatch, this.engine);
+            assertEquals(committedDestination, trackedCoordinate(this.engine, entity),
+                    "a committed transfer must win over a pending retry of an older destination");
+        } finally {
+            discardPublishedBatch(this.engine, firstBatch);
+            discardPublishedBatch(this.engine, nextBatch);
+        }
+    }
+
+    @Test
+    void aShutDownEngineKeepsTheLegacyDeferredPublish() throws ReflectiveOperationException {
+        this.installEngine();
+        final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
+        final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, destination);
+        // A mechanics batch is never submitted, so it must not stay registered as an active batch: shutdown
+        // waits for every published batch to complete its barrier, and this one never will.
+        discardPublishedBatch(this.engine, batch);
+
+        this.engine.shutdown();
+        applyDeferredEntityUpdates(batch, this.engine);
+
+        assertEquals(0, this.engine.pendingEntityTransferCount(), "a shut-down engine records nothing");
+        assertEquals(0, this.engine.rememberedEntityTransferResultCount());
+        assertEquals(1L, this.engine.diagnostics().legacyDeferredEntityMoveCount());
     }
 
     @Test
@@ -684,15 +904,15 @@ class RegionEntityTransferTest {
         this.installEngine();
         final Entity entity = registeredEntity(new BlockPos(0, 64, 0));
         final RegionCoordinate destination = activeDestination(new BlockPos(4096, 64, 0));
-        final Object batch = publishedEntityBatch(this.engine, this.level, entity);
+        final Object batch = publishedEntityBatch(this.engine, this.level, entity, destination);
         final AtomicInteger maintenanceAttempts = new AtomicInteger();
         try {
             // The engine discards the deferred ownership handoff of the committed entity after the region
             // mapping was written. Replacing that batch's deferred list with one that refuses the discard
             // makes the real maintenance step throw at its real call point.
-            setDeferredUpdates(batch, new ArrayList<Entity>(List.of(entity)) {
+            setDeferredUpdates(batch, new ArrayList<Object>(List.of(entity)) {
                 @Override
-                public boolean removeIf(Predicate<? super Entity> filter) {
+                public boolean removeIf(Predicate<? super Object> filter) {
                     maintenanceAttempts.incrementAndGet();
                     throw new IllegalStateException("injected deferred-update discard failure after the region write");
                 }
@@ -902,6 +1122,9 @@ class RegionEntityTransferTest {
         when(entity.level()).thenReturn(mockLevel);
 
         assertFalse(RegionThreadingManager.isInstalled());
+        RegionThreadingHooks.addRegionEntity(entity);
+        RegionThreadingHooks.moveRegionEntity(entity);
+        RegionThreadingHooks.removeRegionEntity(entity);
         assertNull(RegionThreadingHooks.recordEntityRegionTransfer(entity, new RegionCoordinate(mockLevel, 0, 0)));
         assertEquals(RegionEntityTransferResult.DISABLED, RegionThreadingHooks.commitEntityRegionTransfer(null));
         assertEquals(RegionEntityTransferResult.DISABLED, RegionThreadingHooks.abortEntityRegionTransfer(null));
@@ -1041,6 +1264,16 @@ class RegionEntityTransferTest {
         return trackedEntities(engine).get(entity);
     }
 
+    /** {@return the live region state at {@code coordinate}, or {@code null} when none exists there} */
+    private static Object region(RegionThreadingEngine engine, RegionCoordinate coordinate) throws ReflectiveOperationException {
+        final Field regionizerField = RegionThreadingEngine.class.getDeclaredField("regionizer");
+        regionizerField.setAccessible(true);
+        final Object regionizer = regionizerField.get(engine);
+        final Method get = regionizer.getClass().getDeclaredMethod("get", RegionCoordinate.class);
+        get.setAccessible(true);
+        return get.invoke(regionizer, coordinate);
+    }
+
     private static Map<?, ?> trackedEntities(RegionThreadingEngine engine) throws ReflectiveOperationException {
         final Field regionizerField = RegionThreadingEngine.class.getDeclaredField("regionizer");
         regionizerField.setAccessible(true);
@@ -1113,28 +1346,28 @@ class RegionEntityTransferTest {
                 List.of(new RegionEntityTransferToken.Member(entity, uuid, identityEpoch)));
     }
 
-    private static Object publishedEntityBatch(RegionThreadingEngine engine, ServerLevel batchLevel, Entity deferred) throws ReflectiveOperationException {
+    private static Object publishedEntityBatch(RegionThreadingEngine engine, ServerLevel batchLevel, Entity deferred, RegionCoordinate destination) throws ReflectiveOperationException {
         final Constructor<?> constructor = Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class);
         constructor.setAccessible(true);
         final Object batch = constructor.newInstance(batchLevel);
         activeTickBatches(engine).add(batch);
-        final Method deferEntityUpdate = batch.getClass().getDeclaredMethod("deferEntityUpdate", Entity.class);
+        final Method deferEntityUpdate = batch.getClass().getDeclaredMethod("deferEntityUpdate", Entity.class, RegionCoordinate.class);
         deferEntityUpdate.setAccessible(true);
-        deferEntityUpdate.invoke(batch, deferred);
+        deferEntityUpdate.invoke(batch, deferred, destination);
         return batch;
     }
 
     /** Replaces the deferred-update list of a published batch with an injected failing dependency. */
-    private static void setDeferredUpdates(Object batch, List<Entity> updates) throws ReflectiveOperationException {
+    private static void setDeferredUpdates(Object batch, List<?> updates) throws ReflectiveOperationException {
         final Field field = batch.getClass().getDeclaredField("deferredUpdates");
         field.setAccessible(true);
         field.set(batch, updates);
     }
 
     private static void applyDeferredEntityUpdates(Object batch, RegionThreadingEngine engine) throws ReflectiveOperationException {
-        final Method apply = batch.getClass().getDeclaredMethod("applyDeferredEntityUpdates", RegionThreadingEngine.class);
+        final Method apply = RegionThreadingEngine.class.getDeclaredMethod("applyDeferredEntityUpdates", Class.forName(ENTITY_BATCH_TYPE));
         apply.setAccessible(true);
-        apply.invoke(batch, engine);
+        apply.invoke(engine, batch);
     }
 
     private static void discardPublishedBatch(RegionThreadingEngine engine, Object batch) throws ReflectiveOperationException {
@@ -1147,5 +1380,12 @@ class RegionEntityTransferTest {
         @SuppressWarnings("unchecked")
         final Set<Object> batches = (Set<Object>) field.get(engine);
         return batches;
+    }
+
+    /** {@return the deferred entity moves that wait for a busy region at the next barrier} */
+    private static List<?> pendingDeferredEntityMoves(RegionThreadingEngine engine) throws ReflectiveOperationException {
+        final Field field = RegionThreadingEngine.class.getDeclaredField("pendingDeferredEntityMoves");
+        field.setAccessible(true);
+        return (List<?>) field.get(engine);
     }
 }
