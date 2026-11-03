@@ -38,13 +38,14 @@ import org.jetbrains.annotations.VisibleForTesting;
  * Every other chunk spawns on the server thread at the point vanilla spawns it and is counted by reason: the gate
  * refused, a neighbor is not loaded, or the batch had no room left.
  * <p>
- * The mob cap of a region is built from the region's own chunks and entities (see
- * {@link #regionState(RegionState)}), and a chunk's spawn body draws from a random source derived from the world
- * seed, the dimension, the game time, the region and the chunk (see
- * {@link RegionSpawnChunk#spawnSeed}), so a region's spawn sequence depends neither on the other regions nor on
- * the worker that runs it. The chunks the plan keeps on the server thread spawn from the vanilla level-wide state,
- * exactly like vanilla, and that state is created on demand: a tick that hands every spawnable chunk to a worker
- * never builds it.
+ * The mob cap of a region is the level-wide cap of the tick: {@link LevelSpawnCapCounter} counts the level's mobs
+ * per category on the server thread at plan start, exactly like the vanilla spawn state counts them, and every
+ * region's state reserves its slot there (see {@link #buildRegionState(RegionState, List)}). A chunk's spawn body
+ * draws from a random source derived from the world seed, the dimension, the game time, the region and the chunk
+ * (see {@link RegionSpawnChunk#spawnSeed}), so a region's spawn sequence depends neither on the other regions nor
+ * on the worker that runs it. The chunks the plan keeps on the server thread spawn from the vanilla level-wide
+ * state, exactly like vanilla, and that state is created on demand: a tick that hands every spawnable chunk to a
+ * worker never builds it, but it shares the level-wide count of the tick.
  */
 @ApiStatus.Internal
 public final class RegionSpawnPlan {
@@ -69,6 +70,15 @@ public final class RegionSpawnPlan {
      */
     @Nullable
     private NaturalSpawner.SpawnState fallbackState;
+    /**
+     * The level-wide mob count per category of this tick, shared by every spawn body of the level.
+     * <p>
+     * It is counted here, on the server thread, at the point where vanilla builds its own level-wide state, and it
+     * is what makes the mob cap of a region the cap of the level: a region's state asks it for the count of a
+     * category and reserves its slot there, so a mob that walks into the neighbouring region still holds its slot
+     * and no region can take the last slot of the level twice.
+     */
+    private final LevelSpawnCapCounter capCounter;
     private boolean executed;
 
     RegionSpawnPlan(RegionThreadingEngine engine, ServerLevel level, RegionSpawnSource source, boolean spawnFriendlies,
@@ -80,6 +90,7 @@ public final class RegionSpawnPlan {
         this.spawnEnemies = spawnEnemies;
         this.spawnPersistent = spawnPersistent;
         this.barrier = barrier;
+        this.capCounter = LevelSpawnCapCounter.count(level, source);
     }
 
     /**
@@ -170,7 +181,9 @@ public final class RegionSpawnPlan {
      * <p>
      * It is exactly the state {@code ServerChunkCache.tickChunks} builds for the vanilla path: the level's
      * natural spawn chunk count, every entity of the level and the level's own full-chunk getter. The per-player
-     * cap reads the chunk map directly, because this state only ever runs on the thread that owns it.
+     * cap reads the chunk map directly, because this state only ever runs on the thread that owns it. It shares the
+     * level-wide mob count of the tick with the region states, so a chunk that spawns inline and a chunk that spawns
+     * on a worker are bounded by the same cap.
      */
     private NaturalSpawner.SpawnState fallbackState() {
         if (this.fallbackState == null) {
@@ -178,17 +191,26 @@ public final class RegionSpawnPlan {
                     this.source.naturalSpawnChunkCount().getAsInt(),
                     this.level.getAllEntities(),
                     this.source.chunkGetter(),
-                    new RegionLocalMobCapCalculator(this.source.playersNearForSpawning()));
+                    new RegionLocalMobCapCalculator(this.source.playersNearForSpawning()),
+                    this.capCounter);
         }
         return this.fallbackState;
     }
 
     /**
+     * {@return the level-wide mob count of this tick that every region's spawn state shares}
+     */
+    @VisibleForTesting
+    public LevelSpawnCapCounter capCounter() {
+        return this.capCounter;
+    }
+
+    /**
      * {@return the spawn state of one region and the answers its bodies read, built on the server thread}
      * <p>
-     * The state counts the entities the region owns and uses the region's own spawnable chunk count as the area
-     * term of its mob cap; see {@link RegionSpawnState} for the exact semantics and for the two differences
-     * against the level-wide state of vanilla.
+     * The state counts the entities the region owns for its spawn potential and its per-player cap, and it applies
+     * the level-wide mob cap of {@link #capCounter()} to them; see {@link RegionSpawnState} for the exact semantics
+     * and for the two differences against the level-wide state of vanilla.
      *
      * @param regionChunks the chunks this tick hands to the region's worker
      */
@@ -201,7 +223,7 @@ public final class RegionSpawnPlan {
         for (final RegionSpawnChunk chunk : regionChunks) {
             handed.add(chunk.chunkKey());
         }
-        return RegionSpawnState.build(this.level, this.source, region.loadedChunkKeys(), entities, handed);
+        return RegionSpawnState.build(this.level, this.source, region.loadedChunkKeys(), entities, handed, this.capCounter);
     }
 
     /**

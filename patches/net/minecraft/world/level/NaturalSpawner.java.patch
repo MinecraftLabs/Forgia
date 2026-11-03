@@ -8,6 +8,33 @@
  public final class NaturalSpawner {
      private static final Logger LOGGER = LogUtils.getLogger();
      private static final int MIN_SPAWN_DISTANCE = 24;
+@@ -61,6 +_,26 @@
+     public static NaturalSpawner.SpawnState createState(
+         int p_186525_, Iterable<Entity> p_186526_, NaturalSpawner.ChunkGetter p_186527_, LocalMobCapCalculator p_186528_
+     ) {
++        return createState(p_186525_, p_186526_, p_186527_, p_186528_, null);
++    }
++
++    /**
++     * Neo: {@return the spawn state of one region of a level tick, whose mob cap is the level-wide cap of
++     * {@code p_186529_}}
++     * <p>
++     * The state is still built from the entities the caller owns - they are its spawn potential and its per-player
++     * cap - but its category cap is the level-wide one: {@code canSpawnForCategory} asks the shared counter and
++     * {@code afterSpawn} counts the mob it spawned there, so the cap of the level decides and a mob that walks into
++     * the neighbouring region keeps the slot it holds. {@code null} builds the vanilla state, whose cap is its own
++     * entity count.
++     */
++    public static NaturalSpawner.SpawnState createState(
++        int p_186525_,
++        Iterable<Entity> p_186526_,
++        NaturalSpawner.ChunkGetter p_186527_,
++        LocalMobCapCalculator p_186528_,
++        @Nullable net.neoforged.neoforge.server.threading.region.LevelSpawnCapCounter p_186529_
++    ) {
+         PotentialCalculator potentialcalculator = new PotentialCalculator();
+         Object2IntOpenHashMap<MobCategory> object2intopenhashmap = new Object2IntOpenHashMap<>();
+ 
 @@ -69,7 +_,7 @@
                  continue;
              }
@@ -17,7 +44,16 @@
              if (mobcategory != MobCategory.MISC) {
                  BlockPos blockpos = entity.blockPosition();
                  p_186527_.query(
-@@ -107,9 +_,15 @@
+@@ -92,7 +_,7 @@
+             }
+         }
+ 
+-        return new NaturalSpawner.SpawnState(p_186525_, object2intopenhashmap, potentialcalculator, p_186528_);
++        return new NaturalSpawner.SpawnState(p_186525_, object2intopenhashmap, potentialcalculator, p_186528_, p_186529_);
+     }
+ 
+     static Biome getRoughBiome(BlockPos p_47096_, ChunkAccess p_47097_) {
+@@ -107,9 +_,21 @@
          for (MobCategory mobcategory : SPAWNING_CATEGORIES) {
              if ((p_47033_ || !mobcategory.isFriendly())
                  && (p_47034_ || mobcategory.isFriendly())
@@ -29,7 +65,13 @@
 +                // refusal is observable instead of looking like a chunk that had nothing to spawn. The gate
 +                // above keeps the vanilla short-circuit order; only the cap test is separated from it.
 +                if (p_47032_.canSpawnForCategory(mobcategory, p_47031_.getPos())) {
-+                    spawnCategoryForChunk(mobcategory, p_47030_, p_47031_, p_47032_::canSpawn, p_47032_::afterSpawn);
++                    try {
++                        spawnCategoryForChunk(mobcategory, p_47030_, p_47031_, p_47032_::canSpawn, p_47032_::afterSpawn);
++                    } finally {
++                        // Neo: the slot the cap test reserved stands only for the body it admitted. Every mob the
++                        // body spawned counted itself in, so the reservation is released either way.
++                        p_47032_.releaseCategoryReservation();
++                    }
 +                } else {
 +                    net.neoforged.neoforge.server.threading.RegionThreadingHooks.countSpawnCapRefusal();
 +                }
@@ -112,3 +154,94 @@
                                      spawngroupdata = mob.finalizeSpawn(
                                          p_220451_, p_220451_.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.CHUNK_GENERATION, spawngroupdata
                                      );
+@@ -454,6 +_,16 @@
+         private final PotentialCalculator spawnPotential;
+         private final Object2IntMap<MobCategory> unmodifiableMobCategoryCounts;
+         private final LocalMobCapCalculator localMobCapCalculator;
++        /**
++         * Neo: the level-wide count of the tick, or {@code null} for a state whose own count is its cap.
++         */
++        @Nullable
++        private final net.neoforged.neoforge.server.threading.region.LevelSpawnCapCounter sharedCapCounter;
++        /**
++         * Neo: the category whose slot the current spawn body reserved in {@link #sharedCapCounter}, or {@code null}.
++         */
++        @Nullable
++        private MobCategory reservedCategory;
+         @Nullable
+         private BlockPos lastCheckedPos;
+         @Nullable
+@@ -461,10 +_,21 @@
+         private double lastCharge;
+ 
+         SpawnState(int p_186544_, Object2IntOpenHashMap<MobCategory> p_186545_, PotentialCalculator p_186546_, LocalMobCapCalculator p_186547_) {
++            this(p_186544_, p_186545_, p_186546_, p_186547_, null);
++        }
++
++        SpawnState(
++            int p_186544_,
++            Object2IntOpenHashMap<MobCategory> p_186545_,
++            PotentialCalculator p_186546_,
++            LocalMobCapCalculator p_186547_,
++            @Nullable net.neoforged.neoforge.server.threading.region.LevelSpawnCapCounter p_186548_
++        ) {
+             this.spawnableChunkCount = p_186544_;
+             this.mobCategoryCounts = p_186545_;
+             this.spawnPotential = p_186546_;
+             this.localMobCapCalculator = p_186547_;
++            this.sharedCapCounter = p_186548_;
+             this.unmodifiableMobCategoryCounts = Object2IntMaps.unmodifiable(p_186545_);
+         }
+ 
+@@ -505,6 +_,11 @@
+             this.spawnPotential.addCharge(blockpos, d0);
+             MobCategory mobcategory = entitytype.getCategory();
+             this.mobCategoryCounts.addTo(mobcategory, 1);
++            // Neo: the level-wide count has to see this mob before the next region decides, so a slot the body
++            // reserved is now held by the mob itself.
++            if (this.sharedCapCounter != null) {
++                this.sharedCapCounter.recordSpawn(mobcategory);
++            }
+             this.localMobCapCalculator.addMob(new ChunkPos(blockpos), mobcategory);
+         }
+ 
+@@ -517,8 +_,37 @@
+         }
+ 
+         boolean canSpawnForCategory(MobCategory p_186549_, ChunkPos p_186550_) {
+-            int i = p_186549_.getMaxInstancesPerChunk() * this.spawnableChunkCount / NaturalSpawner.MAGIC_NUMBER;
+-            return this.mobCategoryCounts.getInt(p_186549_) >= i ? false : this.localMobCapCalculator.canSpawn(p_186549_, p_186550_);
++            if (this.sharedCapCounter != null) {
++                // Neo: the cap is the level-wide one, and passing it reserves the slot for the body that follows, so
++                // two regions cannot both take the last slot of the level in the same tick.
++                if (!this.sharedCapCounter.tryReserve(p_186549_)) {
++                    return false;
++                }
++                this.reservedCategory = p_186549_;
++            } else {
++                int i = p_186549_.getMaxInstancesPerChunk() * this.spawnableChunkCount / NaturalSpawner.MAGIC_NUMBER;
++                if (this.mobCategoryCounts.getInt(p_186549_) >= i) {
++                    return false;
++                }
++            }
++            if (!this.localMobCapCalculator.canSpawn(p_186549_, p_186550_)) {
++                this.releaseCategoryReservation();
++                return false;
++            }
++            return true;
++        }
++
++        /**
++         * Neo: releases the slot {@link #canSpawnForCategory} reserved for the body that just ended.
++         * <p>
++         * The reservation stands for the mobs the body has not spawned yet; once the body returned, every mob it
++         * spawned counts itself in, so the slot is released and the counter holds the level's population again.
++         */
++        void releaseCategoryReservation() {
++            if (this.reservedCategory != null) {
++                this.sharedCapCounter.release(this.reservedCategory);
++                this.reservedCategory = null;
++            }
+         }
+     }
+ }

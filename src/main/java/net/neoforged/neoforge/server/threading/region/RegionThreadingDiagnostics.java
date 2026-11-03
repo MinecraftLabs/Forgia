@@ -117,7 +117,7 @@ import java.util.List;
  * is dropped: every chunk that keeps the server thread spawns there, from the vanilla level-wide state.
  * {@link #truncatedSpawnChunks()} counts chunks whose worker body a chunk source refusal truncated after it had
  * already spawned: the spawns it recorded are admitted, the rest of the attempt is lost. {@link #capRefusedSpawns()}
- * counts the mob categories a region's spawn state refused because the region's own cap was reached, and
+ * counts the mob categories a region's spawn state refused because the level-wide cap was reached, and
  * {@link #refusedSpawnAdditions()} counts spawn attempts that could not be recorded for the barrier at all, so no
  * entity was created.
  * <p>

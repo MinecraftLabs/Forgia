@@ -31,8 +31,8 @@ import org.jetbrains.annotations.ApiStatus;
  * The difference from the vanilla calculator is the scope of the player list, not the arithmetic: a region's
  * state sees the players close to the chunks the plan recorded for that region, so the per-player cap counts the
  * mobs of that region instead of the mobs of the level. A player near two regions can therefore hold a cap of
- * each of them; the per-region category cap of the spawn state is the bound that keeps the total population of
- * a region at the vanilla density.
+ * each of them; the level-wide category cap of the {@link LevelSpawnCapCounter} is the bound that keeps the total
+ * population of the level at the vanilla density.
  * <p>
  * The player lists come from the caller: the region slice reads them from a {@link RegionSpawnNeighborhood} that
  * was recorded on the server thread, and the server-thread fallback state reads them straight from the chunk map,

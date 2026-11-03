@@ -266,8 +266,8 @@ public final class RegionThreadingEngine implements RegionThreading {
     /** Chunks a closed level identity kept out of the batch, so they never spawned. */
     private final AtomicLong skippedSpawnChunks = new AtomicLong();
     /**
-     * Mob categories a region's spawn state refused because the region's own mob cap was reached. Counted on the
-     * worker for the region that owns the chunk, so it measures cap refusals, not missing spawn attempts.
+     * Mob categories a spawn state refused because the level-wide mob cap was reached. Counted on the worker for
+     * the region that owns the chunk, so it measures cap refusals, not missing spawn attempts.
      */
     private final AtomicLong capRefusedSpawns = new AtomicLong();
     /**
@@ -3514,8 +3514,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 leasedAny = true;
                 batchedChunks += regionChunks.size();
                 this.addLeasedGroup(region, () -> {
-                    // The cap of the region is built from the region's own chunks and entities, on the server
-                    // thread, from the same full-chunk getter the vanilla state uses.
+                    // The state of the region is built from the region's own entities, on the server thread, from
+                    // the same full-chunk getter the vanilla state uses; its cap is the level-wide counter of the
+                    // tick, which the plan counted before any worker ran.
                     final RegionSpawnState.Built built = plan.buildRegionState(region, regionChunks);
                     batch.addGroup(region, regionChunks, built.state(), built.neighborhood(), this::spawnGroup);
                 });
@@ -4047,11 +4048,11 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Counts one mob category a region's spawn state refused because the region's own mob cap was reached.
+     * Counts one mob category a spawn state refused because the level-wide mob cap was reached.
      * <p>
      * Called from the vanilla spawn loop of a spawn worker through the region threading hook. On the server
-     * thread - the inline path of a refused chunk - nothing is counted: that path enforces the vanilla
-     * level-wide cap, which the vanilla diagnostics already report.
+     * thread - the inline path of a refused chunk - nothing is counted: that path is the vanilla body, which the
+     * vanilla diagnostics already report.
      */
     public void countSpawnCapRefusal() {
         if (this.currentSpawnNeighborhood.get() != null) {

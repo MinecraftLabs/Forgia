@@ -32,7 +32,9 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import net.minecraft.core.BlockPos;
@@ -61,6 +63,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.neoforged.neoforge.server.threading.RegionAwareRandomSource;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.LevelSpawnCapCounter;
 import net.neoforged.neoforge.server.threading.region.RegionChunkTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
@@ -73,6 +76,7 @@ import net.neoforged.neoforge.server.threading.region.RegionSpawnState;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
 import net.neoforged.neoforge.server.threading.region.RegionTickSlice;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -81,11 +85,11 @@ import org.junit.jupiter.api.Timeout;
  * Exercises the regionized natural spawning against the real engine, the real {@link RegionSpawnPlan}, the real
  * {@link RegionSpawnState} and the real vanilla spawn state.
  * <p>
- * The region spawn state is built from what a region owns, so the cap semantics are tested against
- * {@link NaturalSpawner#createState} itself: the same values vanilla would count, restricted to the region. Only
- * the level, its chunks, the mobs and the per-chunk spawning answers are mocks; the plan decision, the region
- * leases, the batch barrier, the per-chunk random source, the deferred admission and the server-thread fallback all
- * run for real.
+ * The region spawn state is built from what a region owns, and its mob cap is the level-wide count of the tick
+ * ({@link LevelSpawnCapCounter}), so the counting is tested against {@link NaturalSpawner#createState} itself and
+ * the cap against the real spawn bodies of two regions that share one counter. Only the level, its chunks, the mobs
+ * and the per-chunk spawning answers are mocks; the plan decision, the region leases, the batch barrier, the
+ * per-chunk random source, the deferred admission and the server-thread fallback all run for real.
  * <p>
  * Vanilla cannot be spawned end to end here - a real spawn body needs the vanilla entity registry, the spawn
  * placements and the biome spawn lists of a bootstrapped level - so a spawn body is made observable where it must
@@ -104,6 +108,16 @@ class RegionSpawnTest {
     private static final ResourceKey<Level> OVERWORLD = ResourceKey.create(
             net.minecraft.core.registries.Registries.DIMENSION, ResourceLocation.parse("minecraft:overworld"));
     private static final int REGION_CHUNK_SIZE = 3;
+    /**
+     * A level-wide natural spawn chunk count that caps monsters at one mob and every other category at none.
+     * <p>
+     * The vanilla formula is {@code maxInstancesPerChunk * chunks / 289}: five chunks give the monster category
+     * ({@code maxInstancesPerChunk} 70) one slot, and the largest other category ({@code WATER_AMBIENT}, 20) zero,
+     * so a test that drives a spawn body sees exactly the monster category pass the cap.
+     */
+    private static final int ONE_MONSTER_SLOT_CHUNKS = 5;
+    /** The bottom of the test level, below the heightmap the spawn position search draws from. */
+    private static final int SPAWN_BODY_MIN_BUILD_HEIGHT = 60;
 
     private RegionThreadingEngine engine;
 
@@ -157,7 +171,7 @@ class RegionSpawnTest {
                     secondRegionMobs.add(mob);
                 }
             }
-            final ServerLevel level = this.mockLevel(Set.copyOf(spawnable.keySet()));
+            final ServerLevel level = this.mockLevel(Set.copyOf(spawnable.keySet()), 20L, mobs);
             final Set<Long> spawnableChunks = new HashSet<>();
             spawnable.forEach((chunkKey, isSpawnable) -> {
                 if (isSpawnable) {
@@ -165,8 +179,11 @@ class RegionSpawnTest {
                 }
             });
             final RegionSpawnSource source = source(level, chunkKeys(allChunks), spawnableChunks, allChunks.size());
-            final RegionSpawnState.Built first = RegionSpawnState.build(level, source, firstChunks, firstRegionMobs, List.of());
-            final RegionSpawnState.Built second = RegionSpawnState.build(level, source, secondChunks, secondRegionMobs, List.of());
+            final LevelSpawnCapCounter counter = LevelSpawnCapCounter.count(level, source);
+            final RegionSpawnState.Built first = RegionSpawnState.build(level, source, firstChunks, firstRegionMobs,
+                    List.of(), counter);
+            final RegionSpawnState.Built second = RegionSpawnState.build(level, source, secondChunks, secondRegionMobs,
+                    List.of(), counter);
             final NaturalSpawner.SpawnState vanilla = NaturalSpawner.createState(allChunks.size(), mobs,
                     fullChunkGetter(level, chunkKeys(allChunks)), noPlayerCap());
 
@@ -188,27 +205,233 @@ class RegionSpawnTest {
     }
 
     /**
-     * The mob cap of a region is the vanilla formula over the region's own spawnable chunks.
+     * The shared counter counts the level's mobs per category with the predicates of
+     * {@code NaturalSpawner.createState}, and the plan publishes it at plan start.
+     * <p>
+     * The comparison is against the vanilla state of the same level: a persistent mob, a mob of the {@code MISC}
+     * category and a mob whose chunk the full-chunk getter does not answer are skipped by both, and every other mob
+     * counts in the category the vanilla state counts it in.
      */
     @Test
-    void regionCapIsTheVanillaFormulaOverTheRegionsOwnChunks() {
-        final ServerLevel level = this.mockLevel(Set.of());
-        final List<ChunkPos> chunks = chunks(0, 0, REGION_CHUNK_SIZE);
-        final Set<Long> spawnable = new HashSet<>();
-        for (final ChunkPos chunk : chunks) {
-            spawnable.add(chunk.toLong());
+    void sharedCounterEqualsTheLevelsMobsAndTheVanillaSpawnState() {
+        this.installEngine(true);
+        final List<ChunkPos> knownChunks = chunks(0, 0, 4);
+        final Set<Long> known = new HashSet<>(chunkKeys(knownChunks));
+        final List<Entity> mobs = new ArrayList<>();
+        // Nine counted monsters, one persistent monster, one creature and one ambient mob.
+        for (int index = 0; index < 9; index++) {
+            mobs.add(mockMob(positionIn(knownChunks.get(index % knownChunks.size()))));
         }
-        final RegionSpawnState.Built built = RegionSpawnState.build(level, source(level, spawnable, spawnable, 289),
-                spawnable, List.of(), List.of());
+        mobs.add(mockMob(positionIn(knownChunks.get(0)), MobCategory.MONSTER, true));
+        mobs.add(mockMob(positionIn(knownChunks.get(1)), MobCategory.CREATURE, false));
+        mobs.add(mockMob(positionIn(knownChunks.get(2)), MobCategory.AMBIENT, false));
+        // A mob of the MISC category, and one whose chunk the full-chunk getter never answers.
+        mobs.add(mockMob(positionIn(knownChunks.get(3)), MobCategory.MISC, false));
+        mobs.add(mockMob(new BlockPos(100 * 16 + 8, 64, 100 * 16 + 8)));
 
-        assertEquals(spawnable.size(), built.spawnableChunks(), "a 3x3-chunk region has nine spawnable chunks");
-        // The vanilla cap of NaturalSpawner.SpawnState.canSpawnForCategory: maxInstancesPerChunk * chunks / 289,
-        // where 289 is the 17x17 square of the spawn distance in chunks (NaturalSpawner.MAGIC_NUMBER).
-        assertEquals(MobCategory.MONSTER.getMaxInstancesPerChunk() * spawnable.size() / (17 * 17),
-                MobCategory.MONSTER.getMaxInstancesPerChunk() * built.spawnableChunks() / (17 * 17),
-                "the region cap has to apply the vanilla formula to the region's own chunk count");
-        assertTrue(MobCategory.MONSTER.getMaxInstancesPerChunk() * built.spawnableChunks() / (17 * 17) < MobCategory.MONSTER.getMaxInstancesPerChunk() * 289 / (17 * 17),
-                "the region cap has to be a fraction of the level-wide cap, so mob farms are bounded per region");
+        final ServerLevel level = this.mockLevel(known, 20L, mobs);
+        final RegionSpawnSource source = source(level, known, known, 289);
+        final RegionSpawnPlan plan = this.engine.beginSpawnPlan(level, source, true, true, false, PARKING_BARRIER);
+        assertNotNull(plan, "natural spawning worker execution must be enabled");
+        final LevelSpawnCapCounter counter = plan.capCounter();
+        final NaturalSpawner.SpawnState vanilla = NaturalSpawner.createState(289, mobs,
+                fullChunkGetter(level, known), noPlayerCap());
+
+        assertEquals(289, counter.spawnableChunkCount(), "the area term of the cap is the level's spawnable chunks");
+        for (final MobCategory category : MobCategory.values()) {
+            assertEquals(vanilla.getMobCategoryCounts().getInt(category), counter.count(category),
+                    "the shared counter has to count the level like the vanilla spawn state: " + category);
+        }
+        assertEquals(9, counter.count(MobCategory.MONSTER),
+                "a persistent monster and a monster of an unloaded chunk must not be counted");
+        assertEquals(1, counter.count(MobCategory.CREATURE), "a creature counts in its own category");
+        assertEquals(1, counter.count(MobCategory.AMBIENT), "an ambient mob counts in its own category");
+        assertEquals(0, counter.count(MobCategory.MISC), "a mob of the MISC category is never counted");
+        // The vanilla formula over the level-wide chunk count, not a share of it.
+        assertEquals(MobCategory.MONSTER.getMaxInstancesPerChunk() * 289 / (17 * 17), counter.limit(MobCategory.MONSTER),
+                "the cap of a category has to be the vanilla formula over the level's spawnable chunks");
+    }
+
+    /**
+     * Two regions racing for the last slot of a category spawn exactly one mob.
+     * <p>
+     * Both regions spawn for their own chunk against their own spawn state, and both states share the level-wide
+     * counter whose monster cap is one. The body of the first region is held after it passed the cap, while the
+     * second region runs its whole body: the reservation the first body took is what refuses the second one, so the
+     * level ends up with one mob and not two.
+     */
+    @Test
+    void twoRegionsRacingForTheLastSlotSpawnExactlyOneMob() throws Exception {
+        final List<ChunkPos> chunks = chunks(0, 0, 2 * REGION_CHUNK_SIZE);
+        final Set<Long> known = new HashSet<>(chunkKeys(chunks));
+        final ServerLevel level = this.mockLevel(known);
+        final RegionSpawnSource source = source(level, known, known, ONE_MONSTER_SLOT_CHUNKS, List.of(mockPlayer()));
+        final LevelSpawnCapCounter counter = LevelSpawnCapCounter.count(level, source);
+        assertEquals(1, counter.limit(MobCategory.MONSTER), "the monster cap of this level is one");
+        assertEquals(0, counter.limit(MobCategory.CREATURE), "every other category is capped at zero");
+
+        // One region on each side of the layout, each with its own spawn state over the shared counter.
+        final Set<Long> firstRegion = new HashSet<>();
+        final Set<Long> secondRegion = new HashSet<>();
+        for (final ChunkPos chunk : chunks) {
+            (RegionLayout.FIXED_3X3.regionX(chunk.x) == 0 ? firstRegion : secondRegion).add(chunk.toLong());
+        }
+        final RegionSpawnState.Built first = RegionSpawnState.build(level, source, firstRegion, List.of(), firstRegion, counter);
+        final RegionSpawnState.Built second = RegionSpawnState.build(level, source, secondRegion, List.of(), secondRegion, counter);
+
+        final AtomicInteger firstReads = new AtomicInteger();
+        final AtomicInteger secondReads = new AtomicInteger();
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch released = new CountDownLatch(1);
+        final LevelChunk firstChunk = this.conductorChunk(new ChunkPos(1, 1), firstReads, entered, released);
+        final LevelChunk secondChunk = this.conductorChunk(new ChunkPos(REGION_CHUNK_SIZE + 1, 1), secondReads);
+
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final Thread firstRegionWorker = new Thread(() -> {
+            try {
+                NaturalSpawner.spawnForChunk(level, firstChunk, first.state(), true, true, false);
+            } catch (Throwable throwable) {
+                failure.set(throwable);
+            }
+        }, "NeoForge Region Worker test-race-0");
+        firstRegionWorker.start();
+        assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS),
+                "the first region never reached its spawn body");
+        assertEquals(1, counter.count(MobCategory.MONSTER),
+                "the slot the first region took has to be visible before it spawns its mob");
+
+        // The second region runs its whole body while the last slot is taken.
+        NaturalSpawner.spawnForChunk(level, secondChunk, second.state(), true, true, false);
+        assertEquals(0, secondReads.get(), "the second region must not reach its spawn body for the last slot");
+
+        released.countDown();
+        firstRegionWorker.join();
+        if (failure.get() != null) {
+            throw new AssertionError("the first region's spawn body failed", failure.get());
+        }
+        assertEquals(1, firstReads.get(), "the first region reached its body once, for the monster category");
+        assertEquals(0, counter.count(MobCategory.MONSTER),
+                "the reservation of a body that spawned nothing is released when the body ends");
+
+        // The body of the winning region spawns its mob there and then; a real spawn body needs the bootstrapped
+        // spawn placements, so the test records the one mob the body would have admitted, exactly as afterSpawn
+        // does, and with it the level is at its cap of one.
+        counter.recordSpawn(MobCategory.MONSTER);
+        assertEquals(1, counter.count(MobCategory.MONSTER), "the level spawned exactly one mob");
+        assertFalse(counter.tryReserve(MobCategory.MONSTER), "a cap of one refuses a second mob");
+    }
+
+    /**
+     * A mob that walks into another region still counts against the level cap.
+     * <p>
+     * The region it left owns no mob any more, so a cap computed from the region's own entities would let that
+     * region spawn again - that is the path that spawned 58% more monsters than vanilla. The level-wide counter is
+     * unchanged by the move, and the region that lost the mob is refused while the level is at its cap and passes
+     * only once the mob is gone from the level.
+     */
+    @Test
+    void aMobThatWalksIntoAnotherRegionStillCountsAgainstTheLevelCap() {
+        final List<ChunkPos> chunks = chunks(0, 0, 2 * REGION_CHUNK_SIZE);
+        final Set<Long> known = new HashSet<>(chunkKeys(chunks));
+        final Set<Long> firstRegion = new HashSet<>();
+        for (final ChunkPos chunk : chunks) {
+            if (RegionLayout.FIXED_3X3.regionX(chunk.x) == 0) {
+                firstRegion.add(chunk.toLong());
+            }
+        }
+        final Mob walking = mockMob(positionIn(new ChunkPos(1, 1)));
+        final List<Entity> mobs = new ArrayList<>(List.of(walking));
+        final ServerLevel level = this.mockLevel(known, 20L, mobs);
+        final RegionSpawnSource source = source(level, known, known, ONE_MONSTER_SLOT_CHUNKS, List.of(mockPlayer()));
+
+        assertEquals(1, LevelSpawnCapCounter.count(level, source).count(MobCategory.MONSTER),
+                "the level counts the mob where it stands");
+        // The mob walks into the neighbouring region: the region that stores it changes, the level does not.
+        when(walking.blockPosition()).thenReturn(positionIn(new ChunkPos(REGION_CHUNK_SIZE + 1, 1)));
+        final LevelSpawnCapCounter atCap = LevelSpawnCapCounter.count(level, source);
+        assertEquals(1, atCap.count(MobCategory.MONSTER),
+                "a mob that walked into another region still counts against the level cap");
+
+        final RegionSpawnState.Built emptiedRegion = RegionSpawnState.build(level, source, firstRegion, List.of(),
+                firstRegion, atCap);
+        final AtomicInteger atCapReads = new AtomicInteger();
+        NaturalSpawner.spawnForChunk(level, this.conductorChunk(new ChunkPos(1, 1), atCapReads), emptiedRegion.state(),
+                true, true, false);
+        assertEquals(0, atCapReads.get(),
+                "the region that lost its mob must not spawn again while the level is at its cap");
+
+        // The same region, the same empty entity list, but a level that is no longer at its cap: the body runs.
+        mobs.clear();
+        final LevelSpawnCapCounter belowCap = LevelSpawnCapCounter.count(level, source);
+        final RegionSpawnState.Built belowCapRegion = RegionSpawnState.build(level, source, firstRegion, List.of(),
+                firstRegion, belowCap);
+        final AtomicInteger belowCapReads = new AtomicInteger();
+        NaturalSpawner.spawnForChunk(level, this.conductorChunk(new ChunkPos(1, 1), belowCapReads),
+                belowCapRegion.state(), true, true, false);
+        assertEquals(1, belowCapReads.get(),
+                "the level-wide cap, not the region's own entity list, decides whether a region may spawn");
+    }
+
+    /**
+     * The cap is exceeded by at most the regions of one tick, and the counter reconciles at the next tick.
+     * <p>
+     * Four region bodies each take the slot of one monster and then spawn a cluster of two: the reservation makes
+     * the check atomic, so the count can only pass the limit by the cluster each region spawns past it, never by the
+     * regions that merely race for a slot. The next tick's count over the level's own mobs is what the counter held.
+     */
+    @Test
+    void capIsExceededByAtMostTheRegionsOfOneTickAndReconcilesAtTheNextTick() throws Exception {
+        final int regions = 4;
+        final int clusterSize = 2;
+        final List<Entity> mobs = new ArrayList<>();
+        final Set<Long> known = Set.of(new ChunkPos(1, 1).toLong());
+        final ServerLevel level = this.mockLevel(known, 20L, mobs);
+        final RegionSpawnSource source = source(level, known, known, ONE_MONSTER_SLOT_CHUNKS);
+        final LevelSpawnCapCounter counter = LevelSpawnCapCounter.count(level, source);
+        final int limit = counter.limit(MobCategory.MONSTER);
+        assertEquals(1, limit, "the monster cap of this level is one");
+
+        final CountDownLatch start = new CountDownLatch(1);
+        final List<Thread> workers = new ArrayList<>(regions);
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        for (int index = 0; index < regions; index++) {
+            final Thread worker = new Thread(() -> {
+                try {
+                    start.await();
+                    if (counter.tryReserve(MobCategory.MONSTER)) {
+                        try {
+                            for (int mob = 0; mob < clusterSize; mob++) {
+                                counter.recordSpawn(MobCategory.MONSTER);
+                            }
+                        } finally {
+                            counter.release(MobCategory.MONSTER);
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failures.add(throwable);
+                }
+            }, "NeoForge Region Worker test-cap-" + index);
+            workers.add(worker);
+            worker.start();
+        }
+        start.countDown();
+        for (final Thread worker : workers) {
+            worker.join();
+        }
+        assertTrue(failures.isEmpty(), "a region body failed: " + failures);
+
+        final int spawned = counter.count(MobCategory.MONSTER);
+        assertEquals(0, spawned % clusterSize, "every region body that took the slot spawned its whole cluster");
+        assertTrue(spawned <= limit + regions,
+                "the cap may be exceeded by at most the regions of one tick, but the count is " + spawned);
+        assertTrue(spawned >= clusterSize, "at least one region has to pass a cap of one");
+
+        // The next tick counts the level again and has to see the mobs the counter counted.
+        for (int index = 0; index < spawned; index++) {
+            mobs.add(mockMob(positionIn(new ChunkPos(1, 1))));
+        }
+        assertEquals(spawned, LevelSpawnCapCounter.count(level, source).count(MobCategory.MONSTER),
+                "the counter reconciles with the level at the next tick");
     }
 
     /**
@@ -345,7 +568,8 @@ class RegionSpawnTest {
     }
 
     /**
-     * With the switch off there is no plan at all, so the level runs the untouched vanilla body.
+     * With the switch off there is no plan at all - and with it no level-wide counter - so the level runs the
+     * untouched vanilla body, whose cap is the count of its own spawn state.
      */
     @Test
     void disabledSpawningSliceKeepsTheVanillaPath() {
@@ -357,6 +581,24 @@ class RegionSpawnTest {
                 "the hook must not create a plan for a disabled slice");
         assertFalse(this.engine.diagnostics().spawnWorkerExecutionEnabled(), "the switch has to be reported off");
         assertFalse(this.engine.diagnostics().spawnWorkerDispatchEffective(), "the slice must not be effective");
+
+        // The state the vanilla path builds is the four-argument createState, which has no shared counter: its cap
+        // is its own count of the level, and a level at its cap refuses the category exactly like before.
+        final Set<Long> known = Set.of(new ChunkPos(1, 1).toLong());
+        final List<Entity> mobs = new ArrayList<>(List.of(mockMob(positionIn(new ChunkPos(1, 1))),
+                mockMob(positionIn(new ChunkPos(1, 1)))));
+        final ServerLevel capped = this.mockLevel(known, 20L, mobs);
+        final AtomicInteger atCapReads = new AtomicInteger();
+        NaturalSpawner.spawnForChunk(capped, this.conductorChunk(new ChunkPos(1, 1), atCapReads),
+                NaturalSpawner.createState(ONE_MONSTER_SLOT_CHUNKS, mobs, fullChunkGetter(capped, known), permissiveCap()),
+                true, true, false);
+        assertEquals(0, atCapReads.get(),
+                "the vanilla state has to refuse a category whose own count reached its own cap");
+        final AtomicInteger belowCapReads = new AtomicInteger();
+        NaturalSpawner.spawnForChunk(capped, this.conductorChunk(new ChunkPos(1, 1), belowCapReads),
+                NaturalSpawner.createState(289, mobs, fullChunkGetter(capped, known), permissiveCap()),
+                true, true, false);
+        assertTrue(belowCapReads.get() > 0, "the vanilla state has to let a category through below its cap");
     }
 
     /**
@@ -366,8 +608,9 @@ class RegionSpawnTest {
     void regionNeighborhoodCoversEveryChunkASpawnBodyCanReach() {
         final Set<Long> spawnable = Set.of(new ChunkPos(1, 1).toLong());
         final ServerLevel level = this.mockLevel(spawnable);
-        final RegionSpawnState.Built built = RegionSpawnState.build(level, source(level, spawnable, spawnable, 1),
-                spawnable, List.of(), spawnable);
+        final RegionSpawnSource source = source(level, spawnable, spawnable, 1);
+        final RegionSpawnState.Built built = RegionSpawnState.build(level, source, spawnable, List.of(), spawnable,
+                LevelSpawnCapCounter.count(level, source));
 
         final int reach = RegionSpawnNeighborhood.REACH_CHUNKS;
         for (int offsetX = -reach; offsetX <= reach; offsetX++) {
@@ -414,9 +657,20 @@ class RegionSpawnTest {
      */
     private static RegionSpawnSource source(ServerLevel level, Collection<Long> knownChunks, Set<Long> spawnableChunks,
             int levelWideCount) {
+        return source(level, knownChunks, spawnableChunks, levelWideCount, List.of());
+    }
+
+    /**
+     * {@return the spawn source of a test level with {@code playersNear} close enough for spawning to every chunk}
+     * <p>
+     * The vanilla per-player cap refuses every category for a chunk no player is close to, so a test that lets a
+     * spawn body run has to give it a player; the region state then counts the mobs of that player itself.
+     */
+    private static RegionSpawnSource source(ServerLevel level, Collection<Long> knownChunks, Set<Long> spawnableChunks,
+            int levelWideCount, List<ServerPlayer> playersNear) {
         return new RegionSpawnSource(
                 fullChunkGetter(level, knownChunks),
-                chunkKey -> List.<ServerPlayer>of(),
+                chunkKey -> playersNear,
                 spawnableChunks::contains,
                 () -> levelWideCount);
     }
@@ -453,6 +707,19 @@ class RegionSpawnTest {
         return count;
     }
 
+    /** {@return a per-player cap that lets every category through, so only the category cap decides} */
+    private static net.minecraft.world.level.LocalMobCapCalculator permissiveCap() {
+        return new net.minecraft.world.level.LocalMobCapCalculator(null) {
+            @Override
+            public void addMob(ChunkPos chunkPos, MobCategory category) {}
+
+            @Override
+            public boolean canSpawn(MobCategory category, ChunkPos chunkPos) {
+                return true;
+            }
+        };
+    }
+
     /**
      * {@return the vanilla per-player cap without a chunk map}
      * <p>
@@ -481,6 +748,21 @@ class RegionSpawnTest {
         return drawn;
     }
 
+    /**
+     * {@return a player the vanilla per-player cap sees as close enough for spawning}
+     * <p>
+     * Only the identity of the player is used: the cap counts mobs per player and refuses a chunk no player is
+     * close to, so a body that may spawn needs a player to hold the count of.
+     */
+    private static ServerPlayer mockPlayer() {
+        return mock(ServerPlayer.class);
+    }
+
+    /** {@return a position inside {@code chunk}, at the height the test chunks answer} */
+    private static BlockPos positionIn(ChunkPos chunk) {
+        return new BlockPos(chunk.getMinBlockX() + 8, 64, chunk.getMinBlockZ() + 8);
+    }
+
     private static List<ChunkPos> chunks(int regionX, int regionZ, int edge) {
         final List<ChunkPos> chunks = new ArrayList<>(edge * edge);
         for (int offsetX = 0; offsetX < edge; offsetX++) {
@@ -492,10 +774,20 @@ class RegionSpawnTest {
     }
 
     private ServerLevel mockLevel(Set<Long> loadedChunks) {
-        return this.mockLevel(loadedChunks, 20L);
+        return this.mockLevel(loadedChunks, 20L, List.of());
     }
 
     private ServerLevel mockLevel(Set<Long> loadedChunks, long gameTime) {
+        return this.mockLevel(loadedChunks, gameTime, List.of());
+    }
+
+    /**
+     * {@return a test level holding {@code entities}}
+     * <p>
+     * The entity list is what {@code level.getAllEntities()} answers, so a spawn state and the level-wide counter
+     * count exactly the entities the test put into the level.
+     */
+    private ServerLevel mockLevel(Set<Long> loadedChunks, long gameTime, List<Entity> entities) {
         final ServerLevel level = mock(ServerLevel.class, CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
         doReturn("test-level").when(level).toString();
@@ -504,9 +796,11 @@ class RegionSpawnTest {
         when(level.dimension()).thenReturn(OVERWORLD);
         // The physical section bucket of a region is the grid the region ownership lease tests against.
         doReturn(REGION_CHUNK_SIZE).when(level).entitySectionRegionChunkSize();
-        doReturn(List.of()).when(level).getAllEntities();
+        doReturn(entities).when(level).getAllEntities();
         doReturn(false).when(level).isRaining();
         doReturn(false).when(level).isThundering();
+        // The spawn position search of a spawn body draws between the level's bottom and the heightmap.
+        doReturn(SPAWN_BODY_MIN_BUILD_HEIGHT).when(level).getMinBuildHeight();
         doNothing().when(level).tickPrecipitation(any());
         doNothing().when(level).tickLightning(any());
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
@@ -558,16 +852,63 @@ class RegionSpawnTest {
 
     /** {@return a mob of one region, at {@code pos}, of the monster category} */
     private static Mob mockMob(BlockPos pos) {
+        return mockMob(pos, MobCategory.MONSTER, false);
+    }
+
+    /**
+     * {@return a mob at {@code pos} of {@code category}, persistent or not, as the spawn state counts it}
+     * <p>
+     * Both the vanilla {@code createState} and the level-wide counter classify an entity with
+     * {@code getClassification(true)} and skip it when it is persistent.
+     */
+    private static Mob mockMob(BlockPos pos, MobCategory category, boolean persistent) {
         final Mob mob = mock(Mob.class);
         @SuppressWarnings("unchecked")
         final EntityType<Mob> type = mock(EntityType.class);
-        when(type.getCategory()).thenReturn(MobCategory.MONSTER);
+        when(type.getCategory()).thenReturn(category);
         doReturn(type).when(mob).getType();
-        when(mob.getClassification(anyBoolean())).thenReturn(MobCategory.MONSTER);
+        when(mob.getClassification(anyBoolean())).thenReturn(category);
         when(mob.blockPosition()).thenReturn(pos);
-        when(mob.isPersistenceRequired()).thenReturn(false);
+        when(mob.isPersistenceRequired()).thenReturn(persistent);
         when(mob.requiresCustomPersistence()).thenReturn(false);
         return mob;
+    }
+
+    /**
+     * {@return the chunk of one spawn body whose first block state is a redstone conductor}
+     * <p>
+     * The spawn body of a chunk stops at its first candidate position when the block there is a redstone conductor,
+     * before it asks for a spawn placement or creates a mob. The body therefore runs to its end - it takes and
+     * releases the cap slot of its category - without spawning anything, and {@code blockStateReads} counts how
+     * often it got that far: one read per category whose cap let it in, none for a category the cap refused.
+     */
+    private LevelChunk conductorChunk(ChunkPos pos, AtomicInteger blockStateReads) {
+        return this.conductorChunk(pos, blockStateReads, null, null);
+    }
+
+    /**
+     * {@return a conductor chunk whose first block state read waits for {@code entered} and then for
+     * {@code released}}
+     * <p>
+     * The read happens after the cap test of the category, so a test can hold a body that took the last slot of a
+     * category while another region checks the same cap.
+     */
+    private LevelChunk conductorChunk(ChunkPos pos, AtomicInteger blockStateReads, @Nullable CountDownLatch entered,
+            @Nullable CountDownLatch released) {
+        final LevelChunk chunk = this.chunk(pos);
+        final BlockState conductor = mock(BlockState.class);
+        when(conductor.isRedstoneConductor(any(), any())).thenReturn(true);
+        doAnswer(invocation -> {
+            blockStateReads.incrementAndGet();
+            if (entered != null) {
+                entered.countDown();
+            }
+            if (released != null) {
+                released.await();
+            }
+            return conductor;
+        }).when(chunk).getBlockState(any(BlockPos.class));
+        return chunk;
     }
 
     /** {@return an entity that is not in the level yet, at {@code pos} of {@code level}} */

@@ -745,8 +745,9 @@ public final class RegionThreadingHooks {
     /**
      * Counts one mob category a natural spawn attempt was refused for because the mob cap was reached.
      * <p>
-     * Inside a region spawn worker group this is the cap of the region; on the server thread it is the vanilla
-     * level-wide cap, which the vanilla spawn diagnostics already report, so nothing is counted there.
+     * Inside a region spawn worker group this is the level-wide cap, read from the shared counter of the tick; on
+     * the server thread it is the vanilla body, which the vanilla spawn diagnostics already report, so nothing is
+     * counted there.
      */
     public static void countSpawnCapRefusal() {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();

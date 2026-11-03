@@ -25,10 +25,10 @@ import org.jetbrains.annotations.ApiStatus;
  * One level tick's natural spawning that is executed on region workers.
  * <p>
  * The batch is the set of chunks the server thread decided may spawn and could hand over, grouped by the region
- * that owns the chunk. A group leases its region and holds the {@code SpawnState} of that region, so the mob cap
- * a spawn of the group is admitted against is computed from the region's own chunks and entities instead of the
- * whole level. A region's chunks spawn in the order the level's chunk list collected them, and different regions
- * run in parallel while a region never spawns against itself.
+ * that owns the chunk. A group leases its region and holds the {@code SpawnState} of that region, which is built
+ * from the region's own entities but capped by the level-wide mob count of the tick. A region's chunks spawn in the
+ * order the level's chunk list collected them, and different regions run in parallel while a region never spawns
+ * against itself.
  * <p>
  * A group also carries the entity ownership lease of its region, so a spawn body reaches entity storage through
  * the same grants as an entity tick: the entity it creates is a pending entity whose position writes are field
