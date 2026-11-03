@@ -48,6 +48,8 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingRandomTicks;
 
+        public final BooleanValue enableRegionThreadingSpawning;
+
         public final IntValue regionThreadingWorkerThreads;
 
         public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
@@ -134,6 +136,13 @@ public class NeoForgeConfig {
                     .translation("neoforge.configgui.enableRegionThreadingRandomTicks")
                     .worldRestart()
                     .define("enableRegionThreadingRandomTicks", false);
+
+            enableRegionThreadingSpawning = builder
+                    .comment(
+                            "EXPERIMENTAL: Runs the natural spawning of a level on the worker of the region that owns the chunk, while the server thread waits for the batch. Each region spawns against its own mob cap, computed from the region's own loaded chunks and the entities of that region, from a random source derived from the world seed, the dimension, the game time, the region and the chunk, and every mob a region spawns is admitted by the server thread at the barrier. Natural spawning requires enableRegionThreadingBridge and a fixed region policy (the physical entity sections of a level are partitioned per region only for a fixed layout). Only chunks whose eight neighboring chunks are loaded run on a worker; a chunk with an unloaded neighbor, a chunk whose region cannot be leased and a chunk the batch cannot admit stays on the server thread, where it spawns from the vanilla level-wide state exactly like vanilla. The spawn gate, the custom spawners and the per-chunk broadcast stay on the server thread. Every refusal is counted by reason and reported by the region threading diagnostics.")
+                    .translation("neoforge.configgui.enableRegionThreadingSpawning")
+                    .worldRestart()
+                    .define("enableRegionThreadingSpawning", false);
 
             regionThreadingWorkerThreads = builder
                     .comment("EXPERIMENTAL: Number of native region worker threads reserved for the future region scheduler. A value of 0 uses max(1, available processors - 1).")

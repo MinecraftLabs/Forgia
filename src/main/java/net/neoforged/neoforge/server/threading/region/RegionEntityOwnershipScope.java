@@ -301,6 +301,46 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     }
 
     /**
+     * {@return true when the admission of one spawned riding graph was recorded for the barrier of the active
+     * lease}
+     * <p>
+     * This is the admission of a natural spawn, and it differs from
+     * {@link #deferEntityAddition(ServerLevel, Entity)} in one point: the position of the spawn is <b>not</b>
+     * required to lie inside the leased region. Vanilla selects a spawn position from the chunk that spawns and
+     * walks it by up to twenty blocks, without regard to a region border that the vanilla code does not know, so a
+     * spawn of a region's chunk can land in the region next to it. The lease can still record it, because the
+     * record is applied by the barrier on the server thread - the unmodified {@code ServerLevel.addEntity} - which
+     * commits the entity to whichever region stores its position, and the region index is published by the join
+     * event exactly like for an admission inside the lease. The worker itself writes nothing but the entity's own
+     * fields.
+     * <p>
+     * Every other condition is the one of a lease-contained admission: a native region worker, the level of the
+     * lease, an entity that is neither in a level nor removed, and a graph whose members are all in the same state,
+     * so a half graph is never admitted.
+     */
+    public static boolean deferSpawnAddition(ServerLevel level, Entity entity) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null
+                || !scope.isActive()
+                || !RegionWorkerScope.isNativeWorkerThread()
+                || scope.coordinate.level() != level
+                || entity.level() != level
+                || entity.isAddedToLevel()
+                || entity.isRemoved()) {
+            return false;
+        }
+        final List<Entity> graph = entity.getSelfAndPassengers().toList();
+        for (final Entity member : graph) {
+            if (member.level() != level || member.isAddedToLevel() || member.isRemoved()) {
+                // Half a graph is never a valid state: refuse the whole admission instead of recording the
+                // members that would be admissible.
+                return false;
+            }
+        }
+        return scope.group.deferAddition(entity, graph);
+    }
+
+    /**
      * {@return true when {@code pos} of {@code level} lies inside the region of the active lease {@code scope}}
      * <p>
      * The bounds are the ones of the physical section bucket of the leased region, the same block bounds the

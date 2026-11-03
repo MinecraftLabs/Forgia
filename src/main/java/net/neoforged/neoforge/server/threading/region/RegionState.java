@@ -127,6 +127,21 @@ final class RegionState {
     }
 
     /**
+     * {@return the loaded chunks of this region as {@link net.minecraft.world.level.ChunkPos#asLong(int, int)}
+     * keys}
+     * <p>
+     * The set is assembled from the sections of this region and is a snapshot: the natural spawning plan counts
+     * the spawnable chunks of the region from it on the server thread, before its workers run.
+     */
+    java.util.Set<Long> loadedChunkKeys() {
+        final java.util.Set<Long> chunks = new java.util.HashSet<>(this.chunkCount());
+        for (final RegionSectionState section : this.sections.values()) {
+            chunks.addAll(section.chunkKeys());
+        }
+        return chunks;
+    }
+
+    /**
      * Indexes {@code entity} as a member of this region, behind the entities it already holds.
      * <p>
      * Called by the regionizer under its write lock when it publishes the entity's region mapping. The entry

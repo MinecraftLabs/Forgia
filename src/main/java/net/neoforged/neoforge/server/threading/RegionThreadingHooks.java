@@ -34,6 +34,9 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
 import net.neoforged.neoforge.server.threading.region.RegionScopedEntityQuery;
+import net.neoforged.neoforge.server.threading.region.RegionSpawnAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionSpawnPlan;
+import net.neoforged.neoforge.server.threading.region.RegionSpawnSource;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
@@ -685,6 +688,97 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Starts the region-scoped natural spawning of the current level tick.
+     * <p>
+     * The call opens the slice of the opt-in spawn attribution, which is closed by
+     * {@link #runSpawnPlan(RegionSpawnPlan)} and stays disabled unless a diagnostics run enables it.
+     *
+     * @param source          the server-owned reads the plan needs from the level's chunk source
+     * @param spawnFriendlies whether the friends categories may spawn in this tick
+     * @param spawnEnemies    whether the enemy categories may spawn in this tick
+     * @param spawnPersistent whether the persistent categories may spawn in this tick
+     * @param barrier         waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when natural spawning has to stay on the server thread
+     */
+    @Nullable
+    public static RegionSpawnPlan beginSpawnPlan(ServerLevel level, RegionSpawnSource source, boolean spawnFriendlies,
+            boolean spawnEnemies, boolean spawnPersistent, RegionTickBarrier barrier) {
+        RegionSpawnAttribution.beginSlice(level);
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.beginSpawnPlan(level, source, spawnFriendlies, spawnEnemies, spawnPersistent, barrier);
+        }
+        return null;
+    }
+
+    /**
+     * Spawns for the chunks collected by {@code plan} on region workers and waits for the batch.
+     */
+    public static void runSpawnPlan(@Nullable RegionSpawnPlan plan) {
+        try {
+            if (plan != null) {
+                plan.executeAndAwait();
+            }
+        } finally {
+            // The slice covers the whole spawn pass, including a failing batch: the attribution only measures,
+            // so it must not lose the slice of a tick that threw.
+            RegionSpawnAttribution.endSlice();
+        }
+    }
+
+    /**
+     * {@return the vanilla spawn-gate answer for {@code pos} of {@code level} inside a spawn worker group, or
+     * {@code null} when the caller has to ask the level itself}
+     * <p>
+     * {@code ServerLevel.isNaturalSpawningAllowed} reads the entity manager's chunk visibility map, which only the
+     * server thread may touch. A spawn worker therefore answers from the snapshot the plan recorded for its region.
+     */
+    @Nullable
+    public static Boolean spawnPositionAllowed(ServerLevel level, BlockPos pos) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.spawnPositionAllowed(level, pos);
+        }
+        return null;
+    }
+
+    /**
+     * Counts one mob category a natural spawn attempt was refused for because the mob cap was reached.
+     * <p>
+     * Inside a region spawn worker group this is the cap of the region; on the server thread it is the vanilla
+     * level-wide cap, which the vanilla spawn diagnostics already report, so nothing is counted there.
+     */
+    public static void countSpawnCapRefusal() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.countSpawnCapRefusal();
+        }
+    }
+
+    /**
+     * Defers the admission of one naturally spawned entity to the barrier of the spawn batch.
+     * <p>
+     * The hook is the spawn half of the deferred entity admission: a spawn worker constructs and configures the
+     * mob - the position writes of a pending entity are field writes - and the barrier runs the unmodified
+     * {@code ServerLevel.addEntity} for the riding graph on the server thread.
+     *
+     * @return {@code true} when the admission was recorded and the caller must skip the vanilla admission,
+     *         {@code false} when the caller has to admit the entity itself
+     */
+    public static boolean deferSpawnAddition(ServerLevel level, net.minecraft.world.entity.Entity entity) {
+        if (RegionEntityOwnershipScope.deferSpawnAddition(level, entity)) {
+            return true;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            // Only counts inside a spawn worker group: on the server thread the caller admits the entity
+            // itself, which is the vanilla path and not a refusal.
+            engine.countRefusedSpawnAddition();
+        }
+        return false;
+    }
+
+    /**
      * Wraps the level random so region workers draw from the random source of their group instead of the
      * shared level random. When no worker slice that can read {@code level.random} is enabled, the vanilla
      * random is returned unchanged.
@@ -694,7 +788,8 @@ public final class RegionThreadingHooks {
         if (threading instanceof RegionThreadingEngine engine
                 && (engine.isEntityTickWorkerExecutionEnabled()
                         || engine.isScheduledTickWorkerExecutionEnabled()
-                        || engine.isChunkTickWorkerExecutionEnabled())) {
+                        || engine.isChunkTickWorkerExecutionEnabled()
+                        || engine.isSpawnWorkerDispatchEffective())) {
             return new RegionAwareRandomSource(vanilla);
         }
         return vanilla;

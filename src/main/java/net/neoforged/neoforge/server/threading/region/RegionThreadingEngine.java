@@ -129,6 +129,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final boolean blockEntityTickWorkerExecutionEnabled;
     private final boolean scheduledTickWorkerExecutionEnabled;
     private final boolean chunkTickWorkerExecutionEnabled;
+    private final boolean spawnWorkerExecutionEnabled;
     private final AtomicLong rejectedWorkerTaskCount = new AtomicLong();
     private final AtomicLong failedQueuedTaskCount = new AtomicLong();
     private final AtomicLong entityTicksOnWorkers = new AtomicLong();
@@ -248,11 +249,39 @@ public final class RegionThreadingEngine implements RegionThreading {
      * section storage instead of per-region buckets.
      */
     private final AtomicLong nonPartitionedChunkTicks = new AtomicLong();
+    /** Chunks whose natural spawning ran on the worker of their region. */
+    private final AtomicLong spawnChunksOnWorkers = new AtomicLong();
+    /**
+     * Chunks the plan kept on the server thread, by reason. Every one of them spawns exactly once, from the
+     * vanilla level-wide spawn state, so none of them is dropped.
+     */
+    private final AtomicLong gateRefusedSpawnChunks = new AtomicLong();
+    private final AtomicLong unloadedNeighborhoodSpawnChunks = new AtomicLong();
+    private final AtomicLong deferredUpdateBudgetSpawnChunks = new AtomicLong();
+    private final AtomicLong lateSpawnChunks = new AtomicLong();
+    /** Regions whose lease could not be acquired, so their chunks spawned on the server thread. */
+    private final AtomicLong unleasedSpawnChunks = new AtomicLong();
+    /** Chunks whose worker spawn body a chunk source refusal truncated after its first spawn. */
+    private final AtomicLong truncatedSpawnChunks = new AtomicLong();
+    /** Chunks a closed level identity kept out of the batch, so they never spawned. */
+    private final AtomicLong skippedSpawnChunks = new AtomicLong();
+    /**
+     * Mob categories a region's spawn state refused because the region's own mob cap was reached. Counted on the
+     * worker for the region that owns the chunk, so it measures cap refusals, not missing spawn attempts.
+     */
+    private final AtomicLong capRefusedSpawns = new AtomicLong();
+    /**
+     * Spawn attempts that could not be recorded as an admission, so no entity was created. The barrier's own
+     * refusals are counted in {@link #droppedDeferredAdditionCount}.
+     */
+    private final AtomicLong refusedSpawnAdditions = new AtomicLong();
     private final AtomicBoolean entityTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean blockEntityTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean scheduledTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean chunkTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean chunkTickStorageNoticeLogged = new AtomicBoolean();
+    private final AtomicBoolean spawnWorkersNoticeLogged = new AtomicBoolean();
+    private final AtomicBoolean spawnStorageNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean entityTickFallbackNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean scheduledTickFallbackNoticeLogged = new AtomicBoolean();
     /**
@@ -342,6 +371,21 @@ public final class RegionThreadingEngine implements RegionThreading {
      * thread.
      */
     private final ThreadLocal<Queue<BlockPos>> currentChunkTickLightning = new ThreadLocal<>();
+    /**
+     * Random source of the spawn body that executes on the current thread. It is installed for the spawn body of
+     * one chunk, so {@link #currentGroupRandom()} answers with the random source of that chunk and every
+     * {@code level.random} draw of the body resolves it instead of the shared vanilla source.
+     */
+    private final ThreadLocal<RandomSource> currentSpawnRandom = new ThreadLocal<>();
+    /**
+     * Per-chunk answers of the spawn body that executes on the current thread, or {@code null} outside a spawn
+     * group.
+     * <p>
+     * The vanilla spawn body asks the level whether a candidate position's chunk may spawn and which players are
+     * close enough for spawning, both of which read server-owned structures. Inside a spawn group the level reads
+     * this snapshot instead, so a worker never touches the entity manager's visibility map or the chunk map.
+     */
+    private final ThreadLocal<RegionSpawnNeighborhood> currentSpawnNeighborhood = new ThreadLocal<>();
     /**
      * Entries one region tick batch may reserve for the units it admits to its deferred block updates.
      * Production keeps {@link RegionDeferredBlockUpdates#MAX_ENTRIES}, which is the bound every slice derives its
@@ -516,9 +560,23 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Creates an engine with an explicit region layout, every bounded tick slice and an entity storage mode.
      * <p>
      * This is the production constructor: the layout carries both the policy and the fixed region edge
-     * length, so nothing downstream has to guess the size.
+     * length, so nothing downstream has to guess the size. Natural spawning stays on the server thread; a caller
+     * that wants the spawning slice uses
+     * {@link #RegionThreadingEngine(int, boolean, boolean, boolean, boolean, boolean, boolean, boolean, RegionLayout, RegionEntityStorageMode)}.
      */
     public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, false, layout, entityStorageMode);
+    }
+
+    /**
+     * Creates an engine with an explicit region layout, every bounded tick slice, the natural spawning slice and
+     * an entity storage mode.
+     * <p>
+     * The layout carries both the policy and the fixed region edge length, so nothing downstream has to guess the
+     * size. The spawning slice is the only slice that admits entities a region does not store itself, because
+     * vanilla picks a spawn position without regard to the region border; see {@link RegionSpawnPlan}.
+     */
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, boolean spawnWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
         this.layout = layout;
         this.regionizer = new ThreadedRegionizer(this.layout);
         this.workerPool = new RegionWorkerPool(workerThreads > 0 ? workerThreads : Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
@@ -528,6 +586,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.blockEntityTickWorkerExecutionEnabled = blockEntityTickWorkerExecutionEnabled;
         this.scheduledTickWorkerExecutionEnabled = scheduledTickWorkerExecutionEnabled;
         this.chunkTickWorkerExecutionEnabled = chunkTickWorkerExecutionEnabled;
+        this.spawnWorkerExecutionEnabled = spawnWorkerExecutionEnabled;
         this.entityStorageMode = entityStorageMode;
         RegionOwnershipViolationHandler.reset();
         RegionEntityOwnershipScope.resetCounters();
@@ -539,6 +598,14 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionLayout layout) {
         this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, layout, RegionEntityStorageMode.MAIN_THREAD_ONLY);
+    }
+
+    /**
+     * Creates an engine with an explicit region layout, every bounded tick slice and the natural spawning slice,
+     * keeping entity storage on the server thread.
+     */
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, boolean spawnWorkerExecutionEnabled, RegionLayout layout) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, spawnWorkerExecutionEnabled, layout, RegionEntityStorageMode.MAIN_THREAD_ONLY);
     }
 
     public RegionPolicy regionPolicy() {
@@ -1432,6 +1499,43 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Starts the region-scoped natural spawning of the current {@code level} tick.
+     * <p>
+     * The level's own chunk loop evaluates the spawn gate of every chunk and hands every chunk that may spawn to
+     * {@link RegionSpawnPlan#accept(LevelChunk, boolean)}. This call only decides whether the slice runs at all.
+     *
+     * @param source  the server-owned reads the plan needs from the level's chunk source
+     * @param barrier waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when natural spawning has to stay on the server thread
+     */
+    @Nullable
+    public RegionSpawnPlan beginSpawnPlan(ServerLevel level, RegionSpawnSource source, boolean spawnFriendlies,
+            boolean spawnEnemies, boolean spawnPersistent, RegionTickBarrier barrier) {
+        if (!this.spawnWorkerExecutionEnabled || this.shutdown) {
+            return null;
+        }
+        if (level.entitySectionRegionChunkSize() <= 0) {
+            // A spawn admits its entity through the region ownership lease, and that lease only exists for a level
+            // whose sections are partitioned per region. A level that keeps the legacy shared section storage
+            // would have to refuse every spawn, so its natural spawning stays on the server thread.
+            if (this.spawnStorageNoticeLogged.compareAndSet(false, true)) {
+                LOGGER.info("Region natural spawning stays on the server thread for a level without region-owned entity section storage");
+            }
+            return null;
+        }
+        if (level.getProfiler() != InactiveProfiler.INSTANCE) {
+            // The server profiler is a single stack based filler; concurrent worker spawns would corrupt it.
+            return null;
+        }
+        if (this.regionizer.isLevelClosed(level)) {
+            // The level identity is retired; spawn inline like vanilla instead of publishing a batch for region
+            // state that no longer exists.
+            return null;
+        }
+        return new RegionSpawnPlan(this, level, source, spawnFriendlies, spawnEnemies, spawnPersistent, barrier);
+    }
+
+    /**
      * {@return true when the chunk tick of a level executes on region workers}
      * <p>
      * This is the configured request, not the effective dispatch: the profiler, a closing level and the
@@ -1669,6 +1773,10 @@ public final class RegionThreadingEngine implements RegionThreading {
         final RandomSource random = this.currentChunkTickRandom.get();
         if (random != null) {
             return random;
+        }
+        final RandomSource spawn = this.currentSpawnRandom.get();
+        if (spawn != null) {
+            return spawn;
         }
         final RandomSource blockEntity = this.currentBlockEntityTickRandom.get();
         if (blockEntity != null) {
@@ -3274,6 +3382,301 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Spawns for {@code chunks} on the workers of their regions and waits for the batch.
+     * <p>
+     * Runs on the server thread: the batch is published under the lifecycle read gate before any region lease is
+     * acquired, exactly like the other slices, so a concurrent shutdown or level unload waits for it instead of
+     * retiring a region the batch still holds. The per-region spawn state and the per-chunk answers are built
+     * here, on the server thread, while the groups are leased: they read the region entity index and the chunk
+     * map, which only the server thread may touch.
+     * <p>
+     * The worker bodies only read chunks and mutate entities they create, so the batch runs before the chunk tick
+     * batch of the same level tick: no worker of this slice writes a block that another region's spawn body could
+     * read. Every chunk a worker cannot spawn for - an unleased region, a truncated body, a closed level - is
+     * spawned on the server thread after the barrier instead of being dropped.
+     */
+    void spawnChunks(ServerLevel level, List<RegionSpawnChunk> chunks, RegionSpawnPlan plan, RegionTickBarrier barrier) {
+        // The server thread is done deciding which chunks may spawn; the attribution of the slice closes its plan
+        // segment here, before the batch is published.
+        RegionSpawnAttribution.endPlanSegment();
+        if (chunks.isEmpty()) {
+            return;
+        }
+
+        final RegionSpawnBatch batch = new RegionSpawnBatch(level, plan.spawnFriendlies(), plan.spawnEnemies(),
+                plan.spawnPersistent(), this.deferredBlockUpdateBudget);
+        final TickBatchPublication publication = this.publishTickBatch(batch, level);
+        if (publication == TickBatchPublication.LEVEL_CLOSED) {
+            // The level clear completed after this collection. Its region state is retired and no batch may be
+            // published for it: the collected chunks must not spawn for a level that already unloaded.
+            this.skippedSpawnChunks.addAndGet(chunks.size());
+            return;
+        }
+        if (publication == TickBatchPublication.SHUTDOWN) {
+            // The engine was shut down between the collection and the batch; the collected chunks still have to
+            // spawn, but no batch may be published after shutdown started.
+            for (final RegionSpawnChunk chunk : chunks) {
+                plan.spawnInline(chunk.chunk());
+            }
+            return;
+        }
+        batch.markExecutingOnCurrentThread();
+        final boolean attribution = RegionSpawnAttribution.isEnabled();
+        Throwable failure = null;
+        try {
+            final long leaseStart = attribution ? System.nanoTime() : 0L;
+            try {
+                this.leaseSpawnGroups(batch, plan, chunks, barrier);
+            } catch (Throwable throwable) {
+                failure = throwable;
+            } finally {
+                if (attribution) {
+                    RegionSpawnAttribution.recordLease(System.nanoTime() - leaseStart);
+                }
+            }
+            final long awaitStart = attribution ? System.nanoTime() : 0L;
+            try {
+                batch.submitAndAwait(this.workerPool, barrier);
+            } catch (Throwable throwable) {
+                if (failure == null) {
+                    failure = throwable;
+                }
+            } finally {
+                if (attribution) {
+                    RegionSpawnAttribution.recordAwait(System.nanoTime() - awaitStart);
+                }
+            }
+        } finally {
+            final long handoffStart = attribution ? System.nanoTime() : 0L;
+            try {
+                failure = runBatchCompletion(failure, () -> this.applyDeferredSpawnRemovals(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredSpawnAdditions(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
+                failure = runBatchCompletion(failure, () -> this.spawnFallbackChunks(batch, plan));
+                failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
+                batch.finish();
+                this.activeTickBatches.remove(batch);
+                batch.clearExecutingOnCurrentThread();
+            } finally {
+                if (attribution) {
+                    RegionSpawnAttribution.recordHandoff(System.nanoTime() - handoffStart);
+                }
+            }
+        }
+
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+        batch.throwIfFailed();
+    }
+
+    /**
+     * Groups the collected chunks by their authoritative region, takes the lease of every group and builds the
+     * spawn state of that region.
+     * <p>
+     * Runs after the batch was published, so cleanup already waits for it and no lifecycle read gate may be taken
+     * here. A region that dies while its lease is acquired is re-resolved on the next attempt. Anything that
+     * cannot be resolved to a live, leasable region is spawned on the server thread instead.
+     */
+    private void leaseSpawnGroups(RegionSpawnBatch batch, RegionSpawnPlan plan, List<RegionSpawnChunk> pending, RegionTickBarrier barrier) {
+        List<RegionSpawnChunk> remaining = pending;
+        int batchedChunks = 0;
+        for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
+            final RegionTickGrouping<RegionState, RegionSpawnChunk> grouping = new RegionTickGrouping<>();
+            final List<RegionSpawnChunk> retry = new ArrayList<>();
+            for (final RegionSpawnChunk chunk : remaining) {
+                final RegionState region = this.regionizer.getOrCreate(chunk.region(this.layout, batch.level()));
+                if (region == null || region.isDead()) {
+                    retry.add(chunk);
+                } else {
+                    grouping.add(region, chunk);
+                }
+            }
+            if (grouping.isEmpty()) {
+                remaining = retry;
+                break;
+            }
+
+            final List<RegionSpawnChunk> next = new ArrayList<>(retry);
+            boolean leasedAny = false;
+            for (final RegionState region : grouping.regions()) {
+                final List<RegionSpawnChunk> regionChunks = grouping.items(region);
+                if (batch.leases(region)) {
+                    // An earlier group of this same batch already owns the lease. It cannot be acquired again
+                    // and must never be awaited on this thread.
+                    batch.group(region).ifPresent(group -> group.addChunks(regionChunks));
+                    continue;
+                }
+                if (!this.acquireRegionLease(region, barrier)) {
+                    next.addAll(regionChunks);
+                    continue;
+                }
+                leasedAny = true;
+                batchedChunks += regionChunks.size();
+                this.addLeasedGroup(region, () -> {
+                    // The cap of the region is built from the region's own chunks and entities, on the server
+                    // thread, from the same full-chunk getter the vanilla state uses.
+                    final RegionSpawnState.Built built = plan.buildRegionState(region, regionChunks);
+                    batch.addGroup(region, regionChunks, built.state(), built.neighborhood(), this::spawnGroup);
+                });
+            }
+            remaining = next;
+            if (!leasedAny) {
+                // Every candidate region died during lease acquisition; fall back instead of spinning.
+                break;
+            }
+        }
+
+        for (final RegionSpawnChunk chunk : remaining) {
+            batch.addFallback(chunk);
+            this.unleasedSpawnChunks.incrementAndGet();
+        }
+        if (batchedChunks > 0 && this.spawnWorkersNoticeLogged.compareAndSet(false, true)) {
+            LOGGER.info("Region natural spawning is now executing on region workers: {} chunks", batchedChunks);
+        }
+    }
+
+    /**
+     * The worker task of one region: it spawns for the chunks of that region in collection order.
+     * <p>
+     * The group holds the lease of the region and the entity ownership lease of the entities stored in it, so a
+     * spawn body reaches entity storage only through the region-scoped query and every admission it makes is
+     * deferred to the barrier. The chunk's own random source is installed for the whole spawn body, so every
+     * {@code level.random} draw of the body resolves it instead of the shared vanilla source, and the per-chunk
+     * answers of the region are installed so the body never reads the server-owned chunk map or the entity
+     * manager's visibility map.
+     * <p>
+     * A spawn body that needs a chunk the worker may not load cannot be re-run - the mobs that already spawned
+     * would spawn twice - so the chunk's body stops where the refusal happened and the chunk is counted as
+     * truncated.
+     */
+    private Runnable spawnGroup(RegionSpawnBatch.Group group) {
+        final RegionState region = group.region();
+        final RegionCoordinate coordinate = region.coordinate();
+        final ServerLevel level = group.batch().level();
+        final List<RegionSpawnChunk> chunks = group.chunks();
+        final boolean spawnFriendlies = group.batch().spawnFriendlies();
+        final boolean spawnEnemies = group.batch().spawnEnemies();
+        final boolean spawnPersistent = group.batch().spawnPersistent();
+        return () -> {
+            final long start = System.nanoTime();
+            final int[] spawned = { 0 };
+            final int[] truncated = { 0 };
+            try {
+                region.beginOwnership();
+                // A spawn body writes no scheduled tick in vanilla, but a modded spawn hook can; the queue is the
+                // one every slice defers into, so nothing has to be special-cased if it does.
+                this.currentRegionTickMutations.set(group.batch().regionTickMutations());
+                try {
+                    final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    try {
+                        final RegionNeighborUpdateScope previousNeighbors = RegionNeighborUpdateScope.enter(new RegionNeighborUpdateScope());
+                        try {
+                            this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
+                                for (final RegionSpawnChunk chunk : chunks) {
+                                    if (!region.isOwnedByCurrentThread() || this.regionizer.isLevelClosed(level)
+                                            || group.batch().isAdditionSeamClosed()) {
+                                        // The lease is gone, the level unloaded or the batch can no longer admit:
+                                        // the remaining chunks of the region keep the server-thread body.
+                                        group.batch().addFallback(chunk);
+                                        continue;
+                                    }
+                                    if (!group.batch().tryReserveBlockUpdates()) {
+                                        // The batch cannot reserve the block-write effects of this chunk, so its
+                                        // spawn body is refused before it starts and spawns on the server thread.
+                                        group.batch().addFallback(chunk);
+                                        this.countRefusedDeferredBlockUpdate(RegionTickSlice.SPAWN);
+                                        continue;
+                                    }
+                                    final RandomSource random = chunk.random(level, coordinate);
+                                    this.currentSpawnRandom.set(random);
+                                    this.currentSpawnNeighborhood.set(group.neighborhood());
+                                    try {
+                                        net.minecraft.world.level.NaturalSpawner.spawnForChunk(level, chunk.chunk(), group.state(),
+                                                spawnFriendlies, spawnEnemies, spawnPersistent);
+                                        ++spawned[0];
+                                    } catch (Throwable throwable) {
+                                        if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
+                                            throw throwable;
+                                        }
+                                        // The spawns this body already deferred stay deferred; the rest of the
+                                        // chunk's spawn attempt is lost and counted.
+                                        ++truncated[0];
+                                    } finally {
+                                        this.currentSpawnNeighborhood.remove();
+                                        this.currentSpawnRandom.remove();
+                                    }
+                                }
+                            });
+                        } finally {
+                            RegionNeighborUpdateScope.exit(previousNeighbors);
+                        }
+                    } finally {
+                        ownership.close();
+                    }
+                } finally {
+                    this.currentRegionTickMutations.remove();
+                }
+            } finally {
+                region.endOwnership();
+                region.clearRunning();
+                final long duration = System.nanoTime() - start;
+                region.tickMetrics().recordTick(duration);
+                RegionTickWatchdog.warnIfLongTick("spawning batch " + coordinate, duration);
+                this.spawnChunksOnWorkers.addAndGet(spawned[0]);
+                this.truncatedSpawnChunks.addAndGet(truncated[0]);
+                this.regionizer.removeIfEmpty(region);
+            }
+        };
+    }
+
+    /**
+     * Spawns for the chunks whose region could not be leased or whose body was truncated on the server thread
+     * after the batch.
+     * <p>
+     * The chunks were decided and collected on the server thread, so they must not go through the generic region
+     * handoff again: that could defer them to a later region tick or drop them on a closed level. A chunk whose
+     * level identity closed while the batch ran is counted as skipped instead of spawning into a retired level.
+     */
+    private void spawnFallbackChunks(RegionSpawnBatch batch, RegionSpawnPlan plan) {
+        final ServerLevel level = batch.level();
+        final Collection<RegionSpawnChunk> fallback = batch.fallbackChunks();
+        if (fallback.isEmpty()) {
+            return;
+        }
+        if (this.regionizer.isLevelClosed(level)) {
+            this.skippedSpawnChunks.addAndGet(fallback.size());
+            fallback.clear();
+            return;
+        }
+        for (final RegionSpawnChunk chunk : fallback) {
+            plan.spawnInline(chunk.chunk());
+        }
+        fallback.clear();
+    }
+
+    /**
+     * Applies the admissions that a spawn body deferred to the barrier.
+     * <p>
+     * Every mob a region spawns is one record of its riding graph; the barrier runs the unmodified vanilla
+     * admission on the server thread. A record that cannot be admitted is counted as dropped, because the entity
+     * never reached the level and nothing retries it.
+     */
+    private void applyDeferredSpawnAdditions(RegionSpawnBatch batch) {
+        this.applyDeferredAdditions(batch.level(), batch.drainDeferredAdditions(), batch.isAdditionSeamClosed());
+    }
+
+    /**
+     * Applies the removals that a spawn body deferred to the barrier.
+     * <p>
+     * A {@code finalizeSpawn} can remove an entity - vanilla does not, but a modded one can - so the slice
+     * carries the same removal seam as the other spawning slices.
+     */
+    private void applyDeferredSpawnRemovals(RegionSpawnBatch batch) {
+        this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
+    }
+
+    /**
      * Groups {@code pending} chunks by their authoritative region and takes the lease of every group.
      * <p>
      * Runs after the batch was published, so cleanup already waits for it and no lifecycle read gate may be
@@ -3555,11 +3958,11 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * {@return true when every chunk around {@code chunkPos} is loaded}
      * <p>
-     * A random tick of the chunk can read or write the eight neighboring chunks, and a worker may not load a
-     * chunk: the chunk source refuses the request instead of waiting for the server thread that waits for the
-     * worker. A chunk with an unloaded neighbor therefore keeps the server-thread body.
+     * A random tick, an entity tick or a spawn body of the chunk can read or write the eight neighboring chunks,
+     * and a worker may not load a chunk: the chunk source refuses the request instead of waiting for the server
+     * thread that waits for the worker. A chunk with an unloaded neighbor therefore keeps the server-thread body.
      */
-    boolean isChunkTickNeighborhoodLoaded(ServerLevel level, ChunkPos chunkPos) {
+    boolean isLoadedChunkNeighborhood(ServerLevel level, ChunkPos chunkPos) {
         final ServerChunkCache chunkSource = level.getChunkSource();
         for (int offsetX = -1; offsetX <= 1; offsetX++) {
             for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
@@ -3617,6 +4020,91 @@ public final class RegionThreadingEngine implements RegionThreading {
             counters[index] = new AtomicLong();
         }
         return counters;
+    }
+
+    /** Counts one chunk whose vanilla spawn gate refused it, so vanilla spawns nothing for it either. */
+    void countGateRefusedSpawnChunk() {
+        this.gateRefusedSpawnChunks.incrementAndGet();
+    }
+
+    /** Counts one chunk kept on the server thread because a neighboring chunk is not loaded. */
+    void countUnloadedNeighborhoodSpawnChunk() {
+        this.unloadedNeighborhoodSpawnChunks.incrementAndGet();
+    }
+
+    /**
+     * Counts one chunk kept on the server thread because the batch had already admitted its whole deferred
+     * update budget, so the block writes of its spawn body would have had nowhere to be recorded.
+     */
+    void countDeferredUpdateBudgetSpawnChunk() {
+        this.deferredUpdateBudgetSpawnChunks.incrementAndGet();
+        this.countRefusedDeferredBlockUpdate(RegionTickSlice.SPAWN);
+    }
+
+    /** Counts one chunk collected after its batch already ran, so the server thread spawned for it inline. */
+    void countLateSpawnChunk() {
+        this.lateSpawnChunks.incrementAndGet();
+    }
+
+    /**
+     * Counts one mob category a region's spawn state refused because the region's own mob cap was reached.
+     * <p>
+     * Called from the vanilla spawn loop of a spawn worker through the region threading hook. On the server
+     * thread - the inline path of a refused chunk - nothing is counted: that path enforces the vanilla
+     * level-wide cap, which the vanilla diagnostics already report.
+     */
+    public void countSpawnCapRefusal() {
+        if (this.currentSpawnNeighborhood.get() != null) {
+            this.capRefusedSpawns.incrementAndGet();
+        }
+    }
+
+    /**
+     * Counts one spawn attempt that could not be recorded as a deferred admission, so no entity was created.
+     * <p>
+     * A spawn worker records every admission it makes for the barrier; an attempt that the batch refuses (its
+     * seam is closed, the entity is already in the level or the lease is gone) reaches the storage guard, which
+     * refuses it. The counter makes the lost spawn visible next to the admission counters of the barrier.
+     */
+    public void countRefusedSpawnAddition() {
+        this.refusedSpawnAdditions.incrementAndGet();
+    }
+
+    /**
+     * {@return the number of chunks one spawn batch may admit to its deferred update budget}
+     * <p>
+     * The plan asks before it collects a chunk, so a chunk whose spawn body would have no room for its block
+     * writes keeps the server-thread body instead.
+     */
+    int spawnDeferredUpdateBudget() {
+        return this.deferredBlockUpdateBudget / RegionTickSlice.SPAWN.reservationPerUnit();
+    }
+
+    /**
+     * {@return the vanilla spawn-gate answer for {@code pos} of {@code level} in the spawn body executing on the
+     * current thread, or {@code null} when the caller has to ask the level itself}
+     * <p>
+     * The vanilla body asks {@code ServerLevel.isNaturalSpawningAllowed} for a candidate position outside the
+     * chunk that spawns. That read goes through the entity manager's visibility map, which only the server thread
+     * may touch, so a spawn worker answers from the snapshot the plan recorded for its region instead.
+     */
+    @Nullable
+    public Boolean spawnPositionAllowed(ServerLevel level, BlockPos pos) {
+        final RegionSpawnNeighborhood neighborhood = this.currentSpawnNeighborhood.get();
+        if (neighborhood == null) {
+            return null;
+        }
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext) || basicContext.level().orElse(null) != level) {
+            return null;
+        }
+        return neighborhood.isSpawnAllowed(ChunkPos.asLong(SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ())));
+    }
+
+    /** {@return true when the configured natural spawning slice actually dispatches chunks} */
+    @ApiStatus.Internal
+    public boolean isSpawnWorkerDispatchEffective() {
+        return this.spawnWorkerExecutionEnabled;
     }
 
     /** {@return a copy of {@code counters} as plain longs, indexed by the ordinal of the slice} */
@@ -4466,7 +4954,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * section update or another removal: the next worker move or removal is refused by the storage guard
      * instead of being granted and dropped. The updates and removals that already wait are released and
      * counted, so no entity reference stays reachable from the batch and nothing is applied after the
-     * shutdown. A block-entity batch only defers removals, so that is the only seam it closes.
+     * shutdown. A block-entity batch only defers removals, so that is the only seam it closes; a spawn batch
+     * defers admissions and removals and closes both.
      */
     private void closeDeferredSeams() {
         for (final RegionTickBatch active : this.activeTickBatches) {
@@ -4482,6 +4971,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.droppedDeferredSectionUpdateCount.addAndGet(chunkTickBatch.closeDeferredSectionUpdates());
                 this.releaseDeferredRemovals(chunkTickBatch.closeDeferredRemovals());
                 final RegionDeferredEntityAdditions.Drain releasedAdditions = chunkTickBatch.closeDeferredAdditions();
+                this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
+                this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
+            } else if (active instanceof RegionSpawnBatch spawnBatch) {
+                this.releaseDeferredRemovals(spawnBatch.closeDeferredRemovals());
+                final RegionDeferredEntityAdditions.Drain releasedAdditions = spawnBatch.closeDeferredAdditions();
                 this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
                 this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
             }
@@ -5105,6 +5599,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.blockEntityTickWorkerExecutionEnabled,
                 this.scheduledTickWorkerExecutionEnabled,
                 this.chunkTickWorkerExecutionEnabled,
+                this.spawnWorkerExecutionEnabled,
                 this.entityTicksOnWorkers.get(),
                 this.skippedEntityTicks.get(),
                 this.fallbackEntityTicks.get(),
@@ -5136,6 +5631,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.deferredBlockUpdateCounters(),
                 this.deferredUpdateBudgetChunkTicks.get(),
                 this.nonPartitionedChunkTicks.get(),
+                this.spawnChunksOnWorkers.get(),
+                this.gateRefusedSpawnChunks.get(),
+                this.unloadedNeighborhoodSpawnChunks.get(),
+                this.deferredUpdateBudgetSpawnChunks.get(),
+                this.lateSpawnChunks.get(),
+                this.unleasedSpawnChunks.get(),
+                this.truncatedSpawnChunks.get(),
+                this.skippedSpawnChunks.get(),
+                this.capRefusedSpawns.get(),
+                this.refusedSpawnAdditions.get(),
                 this.globalRegion.isRunning(),
                 this.globalRegion.isWorkerSubmitted(),
                 this.rejectedWorkerTaskCount.get(),
@@ -5151,6 +5656,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.entityStorageMode,
                 this.isScheduledTickWorkerDispatchEffective(),
                 this.isChunkTickWorkerDispatchEffective(),
+                this.isSpawnWorkerDispatchEffective(),
                 this.entityTransferJournal.pendingCount(),
                 this.entityTransferJournal.rememberedCount(),
                 this.entityTransferJournal.rejectedRecordCount(),

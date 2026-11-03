@@ -146,6 +146,8 @@ runs {
             // Measurement runs pass -PserverBenchmarkZombieLoot=false to turn the mob loot rule off for the
             // entity worker window; unset keeps the vanilla rule.
             systemProperty("neoforge.serverBenchmarkZombieLoot", providers.gradleProperty("serverBenchmarkZombieLoot").getOrElse("true"))
+            // Measurement runs pass -PserverBenchmarkSpawnChunks=N to size the natural spawning workload grid
+            systemProperty("neoforge.serverBenchmarkSpawnChunks", providers.gradleProperty("serverBenchmarkSpawnChunks").getOrElse("289"))
             // Measurement runs pass -PserverBenchmarkRandomTickChunks=N to size the random tick workload grid
             // without editing the test; unset keeps the default workload of the test.
             systemProperty("neoforge.serverBenchmarkRandomTickChunks", providers.gradleProperty("serverBenchmarkRandomTickChunks").getOrElse("256"))

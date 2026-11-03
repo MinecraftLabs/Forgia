@@ -10,11 +10,12 @@ import org.jetbrains.annotations.ApiStatus;
 /**
  * One slice of a level tick that executes on region workers.
  * <p>
- * Every slice writes blocks - a block entity through its own state and the container it talks to, an entity
- * through the blocks it places, a chunk through its random ticks and a scheduled tick through the block it
- * ticks - and every write reaches the two level-wide structures of {@link RegionDeferredBlockUpdates}. The
- * slice names the unit its batch admits against {@link RegionDeferredBlockUpdates#MAX_ENTRIES}, and it is the
- * key the diagnostics count the applied, dropped and refused records of a batch by.
+ * Every slice can write blocks - a block entity through its own state and the container it talks to, an entity
+ * through the blocks it places, a chunk through its random ticks, a scheduled tick through the block it ticks and
+ * a spawn body through the {@code finalizeSpawn} or equipment of the mob it creates - and every write reaches the
+ * two level-wide structures of {@link RegionDeferredBlockUpdates}. The slice names the unit its batch admits
+ * against {@link RegionDeferredBlockUpdates#MAX_ENTRIES}, and it is the key the diagnostics count the applied,
+ * dropped and refused records of a batch by.
  */
 @ApiStatus.Internal
 public enum RegionTickSlice {
@@ -38,7 +39,13 @@ public enum RegionTickSlice {
      * One scheduled block or fluid tick. The callback is one block tick, so it writes its own block and the
      * blocks it cascades into; eight entries cover it with a wide margin.
      */
-    SCHEDULED_TICK(8);
+    SCHEDULED_TICK(8),
+    /**
+     * One spawnable chunk of a natural spawning pass. A spawn body writes no blocks in vanilla - it reads the
+     * chunk and admits entities - so the reservation only has to cover the writes a modded spawn hook, a
+     * {@code finalizeSpawn} or a mob's equipment could still make; eight entries cover one spawn attempt.
+     */
+    SPAWN(8);
 
     private final int reservationPerUnit;
 

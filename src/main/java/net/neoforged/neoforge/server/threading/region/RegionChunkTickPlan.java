@@ -81,7 +81,7 @@ public final class RegionChunkTickPlan {
             this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;
         }
-        if (!this.engine.isChunkTickNeighborhoodLoaded(this.level, chunkPos)) {
+        if (!this.engine.isLoadedChunkNeighborhood(this.level, chunkPos)) {
             // A random tick that reaches a neighboring chunk would have to load it, and a worker may not load
             // a chunk. The chunk therefore keeps the server-thread body.
             this.engine.countUnloadedNeighborhoodChunkTick();

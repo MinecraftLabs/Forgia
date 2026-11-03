@@ -109,6 +109,18 @@ import java.util.List;
  * updates the barrier then published per entity. {@link #scheduledTaskMigrations()} counts the scheduled
  * entity tasks a move notification had to migrate to the region that now contains the task's entity.
  * <p>
+ * The spawn counters report the natural spawning slice. A spawn chunk on a worker is one chunk whose spawn body
+ * ran on the worker of its region, against that region's own spawn state. Every other chunk is counted by the
+ * reason it stayed on the server thread: the vanilla spawn gate refused it (no body runs, exactly like vanilla),
+ * a neighboring chunk is not loaded, the batch had no room for the block writes of its body, it was collected
+ * after its batch already ran, its region could not be leased or the engine had already shut down. None of them
+ * is dropped: every chunk that keeps the server thread spawns there, from the vanilla level-wide state.
+ * {@link #truncatedSpawnChunks()} counts chunks whose worker body a chunk source refusal truncated after it had
+ * already spawned: the spawns it recorded are admitted, the rest of the attempt is lost. {@link #capRefusedSpawns()}
+ * counts the mob categories a region's spawn state refused because the region's own cap was reached, and
+ * {@link #refusedSpawnAdditions()} counts spawn attempts that could not be recorded for the barrier at all, so no
+ * entity was created.
+ * <p>
  * {@link #regionTicks()} holds the per-region tick metrics of every live region and {@link #regionMetrics()}
  * their aggregate; both are immutable snapshots taken at the same moment as this record.
  * {@link RegionTickSnapshot} documents what region MSPT and region TPS mean, the window they are measured
@@ -135,6 +147,7 @@ public record RegionThreadingDiagnostics(
         boolean blockEntityTickWorkerExecutionEnabled,
         boolean scheduledTickWorkerExecutionEnabled,
         boolean chunkTickWorkerExecutionEnabled,
+        boolean spawnWorkerExecutionEnabled,
         long entityTicksOnWorkers,
         long skippedEntityTicks,
         long fallbackEntityTicks,
@@ -166,6 +179,16 @@ public record RegionThreadingDiagnostics(
         BlockUpdateCounters deferredBlockUpdates,
         long deferredUpdateBudgetChunkTicks,
         long nonPartitionedChunkTicks,
+        long spawnChunksOnWorkers,
+        long gateRefusedSpawnChunks,
+        long unloadedNeighborhoodSpawnChunks,
+        long deferredUpdateBudgetSpawnChunks,
+        long lateSpawnChunks,
+        long unleasedSpawnChunks,
+        long truncatedSpawnChunks,
+        long skippedSpawnChunks,
+        long capRefusedSpawns,
+        long refusedSpawnAdditions,
         boolean globalRegionRunning,
         boolean globalRegionSubmitted,
         long rejectedWorkerTaskCount,
@@ -181,6 +204,7 @@ public record RegionThreadingDiagnostics(
         RegionEntityStorageMode entityStorageMode,
         boolean scheduledTickWorkerDispatchEffective,
         boolean chunkTickWorkerDispatchEffective,
+        boolean spawnWorkerDispatchEffective,
         int pendingEntityTransferCount,
         int rememberedEntityTransferResultCount,
         long rejectedEntityTransferRecordCount,

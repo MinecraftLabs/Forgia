@@ -92,28 +92,62 @@
      boolean runDistanceManagerUpdates() {
          boolean flag = this.distanceManager.runAllUpdates(this.chunkMap);
          boolean flag1 = this.chunkMap.promoteChunkMap();
-@@ -353,20 +_,35 @@
+@@ -343,30 +_,71 @@
+             if (this.level.tickRateManager().runsNormally()) {
+                 profilerfiller.popPush("naturalSpawnCount");
+                 int l = this.distanceManager.getNaturalSpawnChunkCount();
+-                NaturalSpawner.SpawnState naturalspawner$spawnstate = NaturalSpawner.createState(
+-                    l, this.level.getAllEntities(), this::getFullChunk, new LocalMobCapCalculator(this.chunkMap)
+-                );
+-                this.lastSpawnState = naturalspawner$spawnstate;
+-                profilerfiller.popPush("spawnAndTick");
+                 boolean flag1 = this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING);
++                boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++                // Neo: the region spawn plan decides per chunk whether the spawn body may run on the region
++                // worker of its region. When the slice is off the plan is null and the vanilla body below runs
++                // unchanged. When it is on, the level-wide spawn state is only built for the chunks that stay
++                // on the server thread, on demand, so a tick that hands every chunk over never scans the
++                // level's entities; the plan is executed after the loop, before the chunk tick plan and the
++                // level broadcast.
++                final net.neoforged.neoforge.server.threading.region.RegionSpawnPlan spawnPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
++                    .beginSpawnPlan(this.level, this.spawnSource(l), this.spawnFriendlies, this.spawnEnemies, flag, this::managedBlockOnMainThread);
++                final NaturalSpawner.SpawnState naturalspawner$spawnstate = spawnPlan == null
++                    ? NaturalSpawner.createState(l, this.level.getAllEntities(), this::getFullChunk, new LocalMobCapCalculator(this.chunkMap))
++                    : null;
++                if (spawnPlan == null) {
++                    this.lastSpawnState = naturalspawner$spawnstate;
++                }
++                profilerfiller.popPush("spawnAndTick");
+                 Util.shuffle(list, this.level.random);
                  int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
-                 boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
- 
+-                boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++
 +                // Neo: the region chunk tick plan decides per chunk whether the chunk body may run on the
-+                // region worker of its region. Natural spawning, the inhabited time update, the spawn state
-+                // and the level random stay in this body; the plan is executed after the loop, before the
-+                // level broadcast, so every block change of a worker is published by the broadcast below.
++                // region worker of its region. The inhabited time update and the level random stay in this
++                // body; the plan is executed after the spawn plan, before the level broadcast, so every block
++                // change of a worker is published by the broadcast below.
 +                final net.neoforged.neoforge.server.threading.region.RegionChunkTickPlan chunkTickPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
 +                    .beginChunkTickPlan(this.level, k, this::managedBlockOnMainThread);
-+
+ 
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
                      ChunkPos chunkpos = levelchunk1.getPos();
 -                    if (this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) {
 +                    if ((this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) || this.distanceManager.shouldForceTicks(chunkpos.toLong())) {
-+                        // Neo: the per-chunk decisions and the natural spawning stay on the server thread. Only
-+                        // the chunk body itself is handed to the plan, which ticks it inline on the server
-+                        // thread (counted) when the chunk may not leave it.
++                        // Neo: the per-chunk decisions and the spawn gate stay on the server thread. The chunk
++                        // body itself is handed to the plans, which run it inline on the server thread
++                        // (counted) when the chunk may not leave it.
                          levelchunk1.incrementInhabitedTime(j);
-                         if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
-                             NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
+-                        if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
+-                            NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
++                        if (spawnPlan == null) {
++                            if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
++                                NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
++                            }
++                        } else {
++                            // The inner spawn gate is evaluated here, exactly where vanilla evaluates it, and the
++                            // plan counts the chunks it refuses.
++                            spawnPlan.accept(levelchunk1, flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos));
                          }
  
                          if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
@@ -126,10 +160,45 @@
                          }
                      }
                  }
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runSpawnPlan(spawnPlan);
++                if (spawnPlan != null) {
++                    // The debug view reports the last spawn state; with the slice on, that is the state the
++                    // server-thread fallback chunks spawned from, and null when no chunk stayed on the server
++                    // thread this tick.
++                    final NaturalSpawner.SpawnState inlineState = spawnPlan.inlineState();
++                    if (inlineState != null) {
++                        this.lastSpawnState = inlineState;
++                    }
++                }
 +                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runChunkTickPlan(chunkTickPlan);
  
                  profilerfiller.popPush("customSpawners");
                  if (flag1) {
+@@ -388,6 +_,24 @@
+         }
+     }
+ 
++    /**
++     * Neo: the server-owned reads the region spawn plan needs.
++     * <p>
++     * They are created here, where the chunk cache owns the structures, and the plan only calls them on the
++     * server thread: the full-chunk getter decides which mobs count for the cap, the chunk map names the players
++     * close enough for spawning, and the distance manager decides which chunks count into the natural spawn chunk
++     * count. The count is passed as a constant because {@code getNaturalSpawnChunkCount} runs the pending player
++     * distance updates, which vanilla does once per tick.
++     */
++    private net.neoforged.neoforge.server.threading.region.RegionSpawnSource spawnSource(int naturalSpawnChunkCount) {
++        return new net.neoforged.neoforge.server.threading.region.RegionSpawnSource(
++                this::getFullChunk,
++                chunkKey -> this.chunkMap.getPlayersCloseForSpawning(new ChunkPos(chunkKey)),
++                this.distanceManager::hasPlayersNearby,
++                () -> naturalSpawnChunkCount
++        );
++    }
++
+     @Override
+     public String gatherStats() {
+         return Integer.toString(this.getLoadedChunksCount());
 @@ -435,11 +_,17 @@
      }
  

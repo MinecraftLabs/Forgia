@@ -35,14 +35,22 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.Container;
+import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.MobSpawnType;
+import net.minecraft.world.entity.SpawnPlacements;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Zombie;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.NaturalSpawner;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
@@ -51,8 +59,12 @@ import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntitySectionStorage;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.AABB;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.common.util.FakePlayer;
+import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import net.neoforged.neoforge.event.tick.EntityTickEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreading;
@@ -65,6 +77,7 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
+import net.neoforged.neoforge.server.threading.region.RegionSpawnAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickSnapshot;
@@ -159,6 +172,26 @@ public class ServerLoadBenchmarkGameTests {
      * the property keeps the cache enabled, which is the production path.
      */
     static final String BLOCK_ENTITY_ADMISSION_CACHE_PROPERTY = "neoforge.serverBenchmarkBlockEntityAdmissionCache";
+    /**
+     * Chunks of the natural spawning workload when {@value #SPAWN_CHUNKS_PROPERTY} is unset.
+     * <p>
+     * The default is the full 17x17-chunk square of the vanilla spawn distance: vanilla computes its mob cap from
+     * every chunk a player is close enough to for spawning, loaded or not, so a smaller platform would make the
+     * level-wide cap larger than the sum of the region caps and the off/on comparison would compare two different
+     * areas instead of two cap scopes.
+     */
+    private static final int SPAWN_CHUNKS = 17 * 17;
+    /**
+     * System property that overrides {@link #SPAWN_CHUNKS}, so the size of the spawning workload can be varied
+     * without editing the test. The grid is the smallest square that holds the requested count.
+     */
+    static final String SPAWN_CHUNKS_PROPERTY = "neoforge.serverBenchmarkSpawnChunks";
+    /** Height of the spawning platform floor, far above the generated terrain of the test level. */
+    private static final int SPAWN_PLATFORM_HEIGHT = 200;
+    /** Air blocks between the spawning floor and its roof, so a mob fits under the roof. */
+    private static final int SPAWN_PLATFORM_HEADROOM = 3;
+    /** Ticks the spawning platform is left alone before the measured window, so the light of it settles. */
+    private static final int SPAWN_PLATFORM_SETTLE_TICKS = 40;
     /**
      * Chunks of the random tick workload when {@value #RANDOM_TICK_CHUNKS_PROPERTY} is unset.
      */
@@ -296,6 +329,7 @@ public class ServerLoadBenchmarkGameTests {
      * tick counters, the segments of the server-thread chunk tick slice and the block state fingerprint of the
      * window's end state.
      */
+    static final String SPAWN_CSV_HEADER = "profile,workers,regionSize,chunks,spawnableChunks,msptAvg,msptP50,msptP95,msptP99,spawnChunksOnWorkers,gateRefusedSpawnChunks,unloadedNeighborhoodSpawnChunks,deferredUpdateBudgetSpawnChunks,lateSpawnChunks,unleasedSpawnChunks,truncatedSpawnChunks,skippedSpawnChunks,capRefusedSpawns,refusedSpawnAdditions,spawnedMonsters,spawnedCreatures,spawnedWaterCreatures,spawnedWaterAmbient,spawnedAmbient,spawnedAxolotls,spawnedUndergroundWaterCreatures,spawnedMisc,mobsInLevel,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples";
     static final String RANDOM_TICK_CSV_HEADER = "profile,workers,regionSize,chunks,blocks,msptAvg,msptP50,msptP95,msptP99,chunkTicksOnWorkers,fallbackChunkTicks,boundaryChunkTicks,unloadedNeighborhoodChunkTicks,truncatedChunkTicks,unleasedChunkTicks,chunkTickLightningStrikes,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples,blockStateFingerprint";
     static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
@@ -515,6 +549,109 @@ public class ServerLoadBenchmarkGameTests {
                         if (cleaned.compareAndSet(false, true)) {
                             randomTicking.set(previousRandomTicking, level.getServer());
                             releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    @GameTest(batch = "benchmarkSpawn", timeoutTicks = 2000)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Measures the natural spawning slice and the spawned population under a dark spawn platform; only runs when neoforge.serverBenchmark is set")
+    static void measuresServerTickTimeUnderSpawnLoad(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_BENCH_NOTE skipped spawning workload: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = randomTickGrid(origin, intProperty(SPAWN_CHUNKS_PROPERTY, SPAWN_CHUNKS));
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
+            sampler.onMeasuredWindowStart(() -> {
+                RegionSpawnAttribution.reset();
+                RegionSpawnAttribution.setMeasuredLevel(level);
+            });
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<RegionSpawnAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionSpawnAttribution.snapshot());
+            final AtomicReference<Player> spawnPlayer = new AtomicReference<>();
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            // The GameTest server runs with mob spawning off and on a peaceful difficulty, so neither vanilla nor
+            // the region slice would spawn for any chunk. The workload turns both on for its own window and
+            // restores them afterwards.
+            final GameRules.BooleanValue doMobSpawning = level.getGameRules().getRule(GameRules.RULE_DOMOBSPAWNING);
+            final boolean previousDoMobSpawning = doMobSpawning.get();
+            final Difficulty previousDifficulty = level.getDifficulty();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    RegionSpawnAttribution.setEnabled(false);
+                    RegionSpawnAttribution.setMeasuredLevel(null);
+                    removeSpawnPlatform(level, grid);
+                    releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                    doMobSpawning.set(previousDoMobSpawning, level.getServer());
+                    level.getServer().setDifficulty(previousDifficulty, true);
+                    final Player player = spawnPlayer.get();
+                    if (player != null && !player.isRemoved()) {
+                        player.discard();
+                    }
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> forceChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS))
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the spawning chunk grid never finished its entity load"))
+                    .thenExecute(() -> {
+                        doMobSpawning.set(true, level.getServer());
+                        level.getServer().setDifficulty(Difficulty.NORMAL, true);
+                        placeSpawnPlatform(level, grid);
+                    })
+                    .thenIdle(SPAWN_PLATFORM_SETTLE_TICKS)
+                    // The spawn gate of the level is player-driven: vanilla spawns nothing for a chunk no player
+                    // is close enough to for spawning, and a spawn body needs a player to measure its distance
+                    // from. The ticking mock player is placed at the centre of the platform, so every chunk of
+                    // it that is within the vanilla spawn distance of a player spawns.
+                    .thenExecute(() -> {
+                        // A fake player instead of a game test player: it has no connection that the server
+                        // could drop during the window, and the spawn gate of a chunk is player-driven.
+                        final FakePlayer player = FakePlayerFactory.getMinecraft(level);
+                        final ChunkPos centre = originChunk(origin);
+                        player.moveTo(centre.getMinBlockX() + 8.5, SPAWN_PLATFORM_HEIGHT + 1.0, centre.getMinBlockZ() + 8.5);
+                        level.addNewPlayer(player);
+                        level.getChunkSource().move(player);
+                        spawnPlayer.set(player);
+                        helper.assertTrue(level.players().contains(player), "the spawn workload player was not added to the level");
+                    })
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().filter(chunk -> level.isNaturalSpawningAllowed(chunk))
+                                    .count() > grid.size() / 2,
+                            "the game test level never made the spawn platform entity ticking"))
+                    .thenExecute(() -> {
+                        before.set(RegionThreadingHooks.diagnostics());
+                        RegionSpawnAttribution.setEnabled(true);
+                        attributionBefore.set(RegionSpawnAttribution.snapshot());
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(sampler);
+                    })
+                    .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 1)
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        final RegionSpawnAttribution.Snapshot attributionAfter = RegionSpawnAttribution.snapshot();
+                        RegionSpawnAttribution.setEnabled(false);
+                        RegionSpawnAttribution.setMeasuredLevel(null);
+                        reportSpawns(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, level, grid, origin);
+                        if (cleaned.compareAndSet(false, true)) {
+                            removeSpawnPlatform(level, grid);
+                            releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                            doMobSpawning.set(previousDoMobSpawning, level.getServer());
+                            level.getServer().setDifficulty(previousDifficulty, true);
+                            final Player player = spawnPlayer.get();
+                            if (player != null && !player.isRemoved()) {
+                                player.discard();
+                            }
                         }
                     })
                     .thenSucceed();
@@ -910,6 +1047,285 @@ public class ServerLoadBenchmarkGameTests {
      * {@code blockStateFingerprint} is printed for both repeats of one profile: the same seed and the same region
      * layout have to end in the same block states.
      */
+    /**
+     * Places the natural spawning platform: a grass floor and an opaque roof
+     * {@value #SPAWN_PLATFORM_HEADROOM} blocks above it, over every chunk of the grid.
+     * <p>
+     * The floor is a spawnable solid block and the roof leaves only the three air blocks between them for a mob, so
+     * the light of the room is zero and every spawn rule of a monster passes on the floor. Both layers are placed
+     * with {@code Block.UPDATE_CLIENTS}, so the placement does not cascade through the level; the light of the room
+     * settles during the settle ticks before the measured window.
+     */
+    private static void placeSpawnPlatform(ServerLevel level, List<ChunkPos> grid) {
+        final BlockState floor = Blocks.GRASS_BLOCK.defaultBlockState();
+        final BlockState roof = Blocks.STONE.defaultBlockState();
+        for (final ChunkPos chunk : grid) {
+            for (int offsetX = 0; offsetX < 16; offsetX++) {
+                for (int offsetZ = 0; offsetZ < 16; offsetZ++) {
+                    final int x = chunk.getMinBlockX() + offsetX;
+                    final int z = chunk.getMinBlockZ() + offsetZ;
+                    level.setBlock(new BlockPos(x, SPAWN_PLATFORM_HEIGHT, z), floor, Block.UPDATE_CLIENTS);
+                    level.setBlock(new BlockPos(x, SPAWN_PLATFORM_HEIGHT + 1 + SPAWN_PLATFORM_HEADROOM, z), roof,
+                            Block.UPDATE_CLIENTS);
+                }
+            }
+        }
+    }
+
+    /**
+     * Removes the natural spawning platform and every mob that spawned on it, so a later measurement of the same
+     * server starts from the state the platform left.
+     */
+    private static void removeSpawnPlatform(ServerLevel level, List<ChunkPos> grid) {
+        final BlockState air = Blocks.AIR.defaultBlockState();
+        for (final ChunkPos chunk : grid) {
+            for (int offsetX = 0; offsetX < 16; offsetX++) {
+                for (int offsetZ = 0; offsetZ < 16; offsetZ++) {
+                    final int x = chunk.getMinBlockX() + offsetX;
+                    final int z = chunk.getMinBlockZ() + offsetZ;
+                    level.setBlock(new BlockPos(x, SPAWN_PLATFORM_HEIGHT, z), air, Block.UPDATE_CLIENTS);
+                    level.setBlock(new BlockPos(x, SPAWN_PLATFORM_HEIGHT + 1 + SPAWN_PLATFORM_HEADROOM, z), air,
+                            Block.UPDATE_CLIENTS);
+                }
+            }
+        }
+        final int minY = SPAWN_PLATFORM_HEIGHT;
+        final int maxY = SPAWN_PLATFORM_HEIGHT + SPAWN_PLATFORM_HEADROOM + 2;
+        for (final ChunkPos chunk : grid) {
+            final AABB box = new AABB(chunk.getMinBlockX(), minY, chunk.getMinBlockZ(),
+                    chunk.getMinBlockX() + 16, maxY, chunk.getMinBlockZ() + 16);
+            for (final Entity entity : level.getEntitiesOfClass(Entity.class, box, entity -> true)) {
+                if (!(entity instanceof Player)) {
+                    entity.discard();
+                }
+            }
+        }
+    }
+
+    /**
+     * Prints the natural spawning measurement of {@code level}: the server tick samples of the window, the
+     * per-category population the window spawned and the spawning slice with its counters and its attribution.
+     * <p>
+     * The spawned population of a category is the delta of the level's own entity count, so it counts what actually
+     * reached the level and not what a spawn body attempted. The population at the end of the window is reported as
+     * {@code mobsInLevel}, which is the number the vanillla mob cap of the same chunk count bounds.
+     */
+    private static void reportSpawns(ExtendedGameTestHelper helper, TickSampler sampler,
+            Optional<RegionThreadingDiagnostics> before, RegionSpawnAttribution.Snapshot attributionBefore,
+            RegionSpawnAttribution.Snapshot attributionAfter, ServerLevel level, List<ChunkPos> grid, BlockPos origin) {
+        final long[] sorted = sampler.sortedSamples();
+        helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
+        final long sliceP50Nanos = attributionAfter.latency().percentileNanos(0.50);
+        final int spawnableChunks = countSpawnableChunks(level, grid);
+        final long[] byCategory = mobsByCategory(level, grid);
+        final long mobsInLevel = Arrays.stream(byCategory).sum();
+        final NaturalSpawner.SpawnState lastState = level.getChunkSource().getLastSpawnState();
+        System.out.println(sampler.note(profile, after)
+                + " spawnWorkerExecution=" + after.map(RegionThreadingDiagnostics::spawnWorkerExecutionEnabled).orElse(false)
+                + " spawnWorkerDispatchEffective=" + after.map(RegionThreadingDiagnostics::spawnWorkerDispatchEffective).orElse(false)
+                + " spawnChunks=" + grid.size()
+                + " spawnableChunks=" + spawnableChunks
+                + " playerGatedChunks=" + countPlayerGatedChunks(level, grid)
+                + " lastSpawnStateChunks=" + (lastState == null ? -1 : lastState.getSpawnableChunkCount())
+                + " lastSpawnStateMonsters=" + (lastState == null ? -1 : lastState.getMobCategoryCounts().getInt(MobCategory.MONSTER))
+                + " roomLight=" + roomBrightness(level, origin)
+                + " probe=" + spawnProbe(level, origin)
+                + " mobsInLevel=" + mobsInLevel
+                + " maxMobsPerRegion=" + maxMobsPerRegion(level, grid, after)
+                + " regionsWithMobs=" + regionsWithMobs(level, grid, after)
+                + " spawnAttributionSlices=" + slices);
+        System.out.println("SERVER_BENCH_SPAWN_HEADER " + SPAWN_CSV_HEADER);
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_SPAWN_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
+                profile,
+                after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
+                grid.size(),
+                spawnableChunks,
+                averageMillis(sorted),
+                percentileMillis(sorted, 0.50),
+                percentileMillis(sorted, 0.95),
+                percentileMillis(sorted, 0.99),
+                delta(before, after, RegionThreadingDiagnostics::spawnChunksOnWorkers),
+                delta(before, after, RegionThreadingDiagnostics::gateRefusedSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::unloadedNeighborhoodSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::deferredUpdateBudgetSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::lateSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::unleasedSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::truncatedSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::skippedSpawnChunks),
+                delta(before, after, RegionThreadingDiagnostics::capRefusedSpawns),
+                delta(before, after, RegionThreadingDiagnostics::refusedSpawnAdditions),
+                byCategory[MobCategory.MONSTER.ordinal()],
+                byCategory[MobCategory.CREATURE.ordinal()],
+                byCategory[MobCategory.WATER_CREATURE.ordinal()],
+                byCategory[MobCategory.WATER_AMBIENT.ordinal()],
+                byCategory[MobCategory.AMBIENT.ordinal()],
+                byCategory[MobCategory.AXOLOTLS.ordinal()],
+                byCategory[MobCategory.UNDERGROUND_WATER_CREATURE.ordinal()],
+                byCategory[MobCategory.MISC.ordinal()],
+                mobsInLevel,
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityAdditionsRecorded),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityAdditionsApplied),
+                delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityAdditions),
+                delta(before, after, RegionThreadingDiagnostics::entityAddRejectedOnWorker),
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
+                millisPerSlice(attributionAfter.planNanos() - attributionBefore.planNanos(), slices),
+                millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
+                millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
+                millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
+                sliceP50Nanos / 1_000_000.0,
+                slices);
+        printRegionMetrics(after);
+    }
+
+    /** {@return the chunk of the test structure origin, the centre of the spawning platform} */
+    private static ChunkPos originChunk(BlockPos origin) {
+        return new ChunkPos(Math.floorDiv(origin.getX(), 16), Math.floorDiv(origin.getZ(), 16));
+    }
+
+    /**
+     * {@return a compact probe of the spawn facts of one platform position}
+     * <p>
+     * A dark platform spawns nothing if one link of the vanilla chain is missing - the heightmap does not see the
+     * roof, the roof does not reach the light engine, the biome has no monster list, the spawn placement or the
+     * spawn rules refuse the position, or the position collides. The probe names the link that failed, so a run
+     * without mobs is diagnosable from its own log.
+     */
+    private static String spawnProbe(ServerLevel level, BlockPos origin) {
+        final ChunkPos chunk = new ChunkPos(originChunk(origin).x + 2, originChunk(origin).z);
+        final BlockPos pos = new BlockPos(chunk.getMinBlockX() + 8, SPAWN_PLATFORM_HEIGHT + 1, chunk.getMinBlockZ() + 8);
+        final LevelChunk levelChunk = level.getChunk(chunk.x, chunk.z);
+        final var biome = level.getBiome(pos);
+        return "height=" + levelChunk.getHeight(Heightmap.Types.WORLD_SURFACE, pos.getX(), pos.getZ())
+                + ",below=" + BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos.below()).getBlock())
+                + ",at=" + BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock())
+                + ",sky=" + level.getBrightness(LightLayer.SKY, pos)
+                + ",block=" + level.getBrightness(LightLayer.BLOCK, pos)
+                + ",biome=" + biome.unwrapKey().map(key -> key.location().toString()).orElse("?")
+                + ",mobs=" + level.getChunkSource().getGenerator()
+                        .getMobsAt(biome, level.structureManager(), MobCategory.MONSTER, pos).unwrap().size()
+                + ",placementOk=" + SpawnPlacements.isSpawnPositionOk(EntityType.ZOMBIE, level, pos)
+                + ",rules=" + SpawnPlacements.checkSpawnRules(EntityType.ZOMBIE, level, MobSpawnType.NATURAL, pos, RandomSource.create(1L))
+                + ",noCollision=" + level.noCollision(EntityType.ZOMBIE.getSpawnAABB(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5));
+    }
+
+    /**
+     * {@return the largest number of platform mobs that stand in one region of the fixed grid}
+     * <p>
+     * The region slice bounds a region by {@code maxInstancesPerChunk * spawnableChunks / 289}; a region that holds
+     * visibly more mobs than that bound is a region whose spawn state did not count the mobs that stand in it, and
+     * the measured rate cannot be compared with vanilla before that is fixed.
+     */
+    private static int maxMobsPerRegion(ServerLevel level, List<ChunkPos> grid, Optional<RegionThreadingDiagnostics> diagnostics) {
+        final int[] counts = mobsPerRegion(level, grid, diagnostics);
+        int max = 0;
+        for (final int count : counts) {
+            max = Math.max(max, count);
+        }
+        return max;
+    }
+
+    /** {@return the number of regions of the fixed grid that hold at least one platform mob} */
+    private static int regionsWithMobs(ServerLevel level, List<ChunkPos> grid, Optional<RegionThreadingDiagnostics> diagnostics) {
+        int regions = 0;
+        for (final int count : mobsPerRegion(level, grid, diagnostics)) {
+            if (count > 0) {
+                ++regions;
+            }
+        }
+        return regions;
+    }
+
+    /** {@return the platform mobs per fixed region, indexed by {@code regionX * 64 + regionZ} of the grid} */
+    private static int[] mobsPerRegion(ServerLevel level, List<ChunkPos> grid, Optional<RegionThreadingDiagnostics> diagnostics) {
+        final int regionSize = Math.max(1, diagnostics.map(RegionThreadingDiagnostics::regionChunkSize).orElse(3));
+        final Map<Integer, Integer> counts = new java.util.HashMap<>();
+        final int minY = SPAWN_PLATFORM_HEIGHT;
+        final int maxY = SPAWN_PLATFORM_HEIGHT + SPAWN_PLATFORM_HEADROOM + 1;
+        for (final ChunkPos chunk : grid) {
+            final AABB box = new AABB(chunk.getMinBlockX(), minY, chunk.getMinBlockZ(),
+                    chunk.getMinBlockX() + 16, maxY, chunk.getMinBlockZ() + 16);
+            for (final Mob mob : level.getEntitiesOfClass(Mob.class, box, mob -> true)) {
+                final ChunkPos mobChunk = mob.chunkPosition();
+                final int key = (Math.floorDiv(mobChunk.x, regionSize) & 63) * 64 + (Math.floorDiv(mobChunk.z, regionSize) & 63);
+                counts.merge(key, 1, Integer::sum);
+            }
+        }
+        final int[] values = new int[counts.size()];
+        int index = 0;
+        for (final int count : counts.values()) {
+            values[index++] = count;
+        }
+        return values;
+    }
+
+    /**
+     * {@return the number of chunks of {@code grid} a player is close enough to for spawning}
+     * <p>
+     * This is the second half of the level's spawn gate - the natural spawning ticket is the first - and it is
+     * what makes a chunk of the platform spawn at all.
+     */
+    private static int countPlayerGatedChunks(ServerLevel level, List<ChunkPos> grid) {
+        int gated = 0;
+        for (final ChunkPos chunk : grid) {
+            if (level.getNearestPlayer(chunk.getMinBlockX() + 8.5, SPAWN_PLATFORM_HEIGHT, chunk.getMinBlockZ() + 8.5, -1.0, false) != null) {
+                ++gated;
+            }
+        }
+        return gated;
+    }
+
+    /**
+     * {@return the light of one position of the spawning room}
+     * <p>
+     * A monster only spawns where the light is zero, so a room whose roof did not reach the light engine reports a
+     * positive value here and spawns nothing.
+     */
+    private static int roomBrightness(ServerLevel level, BlockPos origin) {
+        final ChunkPos chunk = originChunk(origin);
+        return level.getMaxLocalRawBrightness(
+                new BlockPos(chunk.getMinBlockX() + 8, SPAWN_PLATFORM_HEIGHT + 1, chunk.getMinBlockZ() + 8));
+    }
+
+    /**
+     * {@return the number of chunks of {@code grid} the level allows natural spawning in}
+     * <p>
+     * This is the area term both cap scopes use: vanilla counts every chunk of the level a player is close enough
+     * to for spawning, and the region slice counts the region's share of the same predicate. Dividing the vanilla
+     * mob cap by it is how the cap per chunk is compared between the profiles.
+     */
+    private static int countSpawnableChunks(ServerLevel level, List<ChunkPos> grid) {
+        int spawnable = 0;
+        for (final ChunkPos chunk : grid) {
+            if (level.isNaturalSpawningAllowed(chunk)) {
+                ++spawnable;
+            }
+        }
+        return spawnable;
+    }
+
+    /**
+     * {@return the mobs of every category that stand on the spawning platform, indexed by
+     * {@link MobCategory#ordinal()}}
+     */
+    private static long[] mobsByCategory(ServerLevel level, List<ChunkPos> grid) {
+        final long[] counts = new long[MobCategory.values().length];
+        final int minY = SPAWN_PLATFORM_HEIGHT;
+        final int maxY = SPAWN_PLATFORM_HEIGHT + SPAWN_PLATFORM_HEADROOM + 1;
+        for (final ChunkPos chunk : grid) {
+            final AABB box = new AABB(chunk.getMinBlockX(), minY, chunk.getMinBlockZ(),
+                    chunk.getMinBlockX() + 16, maxY, chunk.getMinBlockZ() + 16);
+            for (final Mob mob : level.getEntitiesOfClass(Mob.class, box, mob -> true)) {
+                ++counts[mob.getType().getCategory().ordinal()];
+            }
+        }
+        return counts;
+    }
+
     private static void reportRandomTicks(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before,
             RegionChunkTickAttribution.Snapshot attributionBefore, RegionChunkTickAttribution.Snapshot attributionAfter,
             int chunks, int blocks, long placedFingerprint, long endFingerprint, long gameTime) {

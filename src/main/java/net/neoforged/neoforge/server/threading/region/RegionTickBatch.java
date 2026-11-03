@@ -140,7 +140,18 @@ abstract class RegionTickBatch {
      * of those changes the group and how many draws the members before a given one take from it.
      */
     final long groupRandomSeed(RegionCoordinate coordinate) {
-        final ServerLevel level = this.level();
+        return regionRandomSeed(this.level(), coordinate);
+    }
+
+    /**
+     * {@return the seed of the random source of the region {@code coordinate} of {@code level} in its current
+     * tick}
+     * <p>
+     * The group random of every slice is derived from this value, and the natural spawning slice derives the
+     * random source of a spawned chunk from it as well, so "the region random of this tick" has one spelling.
+     * See {@link #groupRandomSeed(RegionCoordinate)} for what the derivation provides and what it does not.
+     */
+    static long regionRandomSeed(ServerLevel level, RegionCoordinate coordinate) {
         long seed = RandomSupport.mixStafford13(level.getSeed());
         seed = RandomSupport.mixStafford13(seed ^ level.getGameTime());
         seed = RandomSupport.mixStafford13(seed ^ level.dimension().location().hashCode());
