@@ -208,7 +208,7 @@ class RegionEntityOwnershipLeaseTest {
         final Object group = addGroup.invoke(batch, region, List.of(members), (Function<Object, Runnable>) ignored -> () -> {});
 
         final Method open = Class.forName(REGION_PACKAGE + "RegionEntityOwnershipScope")
-                .getDeclaredMethod("open", RegionCoordinate.class, addGroup.getReturnType());
+                .getDeclaredMethod("open", RegionCoordinate.class, Class.forName(REGION_PACKAGE + "RegionOwnershipLeaseGroup"));
         open.setAccessible(true);
         return (RegionEntityOwnershipScope) open.invoke(null, coordinate, group);
     }

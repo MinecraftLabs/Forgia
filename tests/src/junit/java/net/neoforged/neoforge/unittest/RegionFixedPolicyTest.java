@@ -28,6 +28,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
@@ -380,6 +381,8 @@ class RegionFixedPolicyTest {
         final ServerLevel level = mock(ServerLevel.class);
         when(level.getProfiler()).thenReturn(InactiveProfiler.INSTANCE);
         when(level.toString()).thenReturn("fixed-policy-test-level");
+        // The group random of a block-entity group is derived from the level's dimension, seed and game time.
+        when(level.dimension()).thenReturn(Level.OVERWORLD);
         // This test is about the region mapping of admitted tickers, not about the entity-load admission
         // that is proven against a real entity manager in RegionBlockEntityTickEligibilityTest.
         when(level.areEntitiesLoaded(anyLong())).thenReturn(true);

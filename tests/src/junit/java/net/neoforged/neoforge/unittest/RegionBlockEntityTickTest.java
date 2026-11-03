@@ -931,6 +931,11 @@ class RegionBlockEntityTickTest {
     private static ServerLevel mockLevel() {
         final ServerLevel level = mock(ServerLevel.class, CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
+        // The group random of a block-entity group is derived from the level's dimension, seed and game
+        // time, so the level has to answer them like a real server level.
+        doReturn(Level.OVERWORLD).when(level).dimension();
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
         // Region coordinates are part of worker task descriptions, which must not call into the level.
         doReturn("test-level").when(level).toString();
         final TickRateManager tickRateManager = mock(TickRateManager.class);

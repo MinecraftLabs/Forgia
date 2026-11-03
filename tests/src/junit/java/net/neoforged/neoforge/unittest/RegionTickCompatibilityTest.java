@@ -47,8 +47,8 @@ class RegionTickCompatibilityTest {
                 "minecraft:enchanting_table",
                 "minecraft:vault",
                 "minecraft:trial_spawner",
-                "minecraft:hopper",
                 "minecraft:dispenser",
+                "minecraft:dropper",
                 "minecraft:crafter",
                 "minecraft:spawner",
                 "minecraft:campfire",
@@ -56,6 +56,16 @@ class RegionTickCompatibilityTest {
         }) {
             assertFalse(RegionTickCompatibility.isRegionSafeBlockEntityType(type), type);
         }
+    }
+
+    @Test
+    void hopperIsRegionSafeOnlyAwayFromARegionBoundary() {
+        // The hopper is the one declared type that reaches entity storage: its item query is a region-scoped
+        // query of the leased region, its containers are one block away, and the item entity it absorbs is
+        // removed through the ownership lease of its group, which defers the level callback to the barrier.
+        // It still starts neighbor updates, so it needs the same interior position as the furnace family.
+        assertTrue(RegionTickCompatibility.isRegionSafeBlockEntityType("minecraft:hopper"));
+        assertTrue(RegionTickCompatibility.requiresInteriorRegion("minecraft:hopper"));
     }
 
     @Test

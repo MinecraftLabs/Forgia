@@ -14,6 +14,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.levelgen.RandomSupport;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -61,6 +63,37 @@ abstract class RegionTickBatch {
 
     final ServerLevel level() {
         return this.level;
+    }
+
+    /**
+     * {@return the seed of the random source of the worker group of {@code coordinate} in this tick}
+     * <p>
+     * The seed is derived from values the level already owns - its world seed, its dimension, the game time
+     * and the region coordinate - and not from a draw of the level random. Building a group therefore
+     * neither consumes the vanilla random sequence nor makes the sequence of one region depend on the
+     * groups of the other regions of the same tick: the group of a region starts from the same seed no
+     * matter how many regions tick next to it, in which order their leases were acquired and which worker
+     * runs it. Every input passes through the splitmix64 finalizer, so a step of one tick or of one region
+     * changes every bit of the {@code LegacyRandomSource} seed instead of only its low bits.
+     * <p>
+     * Every slice that installs a group random uses this derivation, so an entity group and a block-entity
+     * group of the same region and tick draw the same sequence. They never run at the same time - each slice
+     * is its own batch - and neither one is compared with the other, so sharing the derivation keeps one
+     * spelling of "the group random of this region in this tick" instead of one per slice.
+     * <p>
+     * Determinism provided: for one world seed, dimension, game time and region coordinate the group draws
+     * a fixed sequence, independent of the other regions of the tick, of the worker count and of the order
+     * in which the regions are dispatched to workers. Not provided: this is not the vanilla sequence
+     * (vanilla draws every entity of a level from one level-wide source), and the sequence is not stable
+     * across a region merge or split, a layout change or a change of the group's members, because each
+     * of those changes the group and how many draws the members before a given one take from it.
+     */
+    final long groupRandomSeed(RegionCoordinate coordinate) {
+        final ServerLevel level = this.level();
+        long seed = RandomSupport.mixStafford13(level.getSeed());
+        seed = RandomSupport.mixStafford13(seed ^ level.getGameTime());
+        seed = RandomSupport.mixStafford13(seed ^ level.dimension().location().hashCode());
+        return RandomSupport.mixStafford13(seed ^ ChunkPos.asLong(coordinate.regionX(), coordinate.regionZ()));
     }
 
     /**

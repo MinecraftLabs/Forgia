@@ -11,10 +11,14 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Function;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.entity.EntityInLevelCallback;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -24,12 +28,34 @@ import org.jetbrains.annotations.ApiStatus;
  * the lease of exactly one region and ticks the snapshot tickers of that region in their original order,
  * so different regions run in parallel while a region never ticks against itself. Tickers whose region
  * cannot be leased safely are ticked on the server thread after the batch instead of being dropped.
+ * <p>
+ * A group also carries the entity ownership lease of its region, so a ticker whose compatibility declaration
+ * admits entity work reaches the entities of its own region through the region-scoped query and its mutations
+ * of them go through the same grants as an entity tick group. The lease is only opened for the tickers of
+ * that group and closed before the region lease, and it defers the server-owned storage effect of a granted
+ * removal to the barrier of this batch: a hopper that absorbs an item entity of its region removes the
+ * entity's own state on the worker and the barrier runs the level callback on the server thread.
+ * <p>
+ * The batch also carries the two server-owned structures a block-entity tick can reach through a neighbor
+ * update: the deferred mutations of {@code LevelTicks} and the removal records of the ownership lease.
  */
 @ApiStatus.Internal
 final class RegionBlockEntityTickBatch extends RegionTickBatch {
     private final List<Group> groups = new ArrayList<>();
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Collection<RegionBlockEntityTickAdmission> fallbackTickers = new ConcurrentLinkedQueue<>();
+    /**
+     * Scheduled block and fluid ticks a worker could not schedule inline, because {@code LevelTicks} is
+     * server-owned storage. A block-entity tick reaches them through the neighbor update of its own
+     * {@code setChanged()}: a comparator or a diode next to the ticker re-evaluates its output and schedules
+     * the delay of its next tick.
+     */
+    private final Queue<Runnable> regionTickMutations = new ConcurrentLinkedQueue<>();
+    /**
+     * Removals a worker deferred to the barrier, shared with the entity tick batch: both slices grant the
+     * removal of an entity they own and let the barrier run its level callback on the server thread.
+     */
+    private final RegionDeferredEntityRemovals deferredRemovals = new RegionDeferredEntityRemovals(this);
 
     RegionBlockEntityTickBatch(ServerLevel level) {
         super(level);
@@ -44,7 +70,9 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
      */
     Group addGroup(RegionState region, List<RegionBlockEntityTickAdmission> tickers, Function<Group, Runnable> workFactory) {
         this.leasedRegions.add(region);
-        final Group group = new Group(this, region, tickers);
+        // The random source is created here, inside the lease release path of the caller, so a failure
+        // while building it cannot leave the region TICKING without a worker that releases it.
+        final Group group = new Group(this, region, tickers, this.groupRandomSeed(region.coordinate()));
         this.groups.add(group);
         this.addTask("block entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
@@ -71,16 +99,72 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
     }
 
     /**
-     * One region's share of the batch: the region lease and the tickers it ticks in snapshot order.
+     * {@return the server-owned scheduled tick mutations the worker groups of this batch deferred}
+     * <p>
+     * The publishing server thread drains the queue after the batch, exactly like it drains the queue of a
+     * scheduled or random tick batch, so no worker mutates {@code LevelTicks}.
      */
-    static final class Group {
+    Queue<Runnable> regionTickMutations() {
+        return this.regionTickMutations;
+    }
+
+    /**
+     * {@return true when the barrier of this batch will still apply deferred removals}
+     *
+     * @see RegionDeferredEntityRemovals#accepts()
+     */
+    boolean acceptsDeferredRemovals() {
+        return this.deferredRemovals.accepts();
+    }
+
+    /** {@return true when this batch no longer accepts or applies deferred removals} */
+    boolean isRemovalSeamClosed() {
+        return this.deferredRemovals.isSeamClosed();
+    }
+
+    /**
+     * Records the level callback of one removal that a worker deferred to the barrier.
+     *
+     * @return {@code false} when the seam was closed or the barrier already completed, so the caller has to
+     *         keep the storage refusal
+     */
+    boolean deferRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+        return this.deferredRemovals.defer(entity, callback, reason);
+    }
+
+    /**
+     * Stops accepting deferred removals and releases the ones that already wait.
+     *
+     * @return the released removals and the repeats that were counted but not applied
+     */
+    RegionDeferredEntityRemovals.Drain closeDeferredRemovals() {
+        return this.deferredRemovals.close();
+    }
+
+    /** Takes the deferred removals that wait for the end of the batch. */
+    RegionDeferredEntityRemovals.Drain drainDeferredRemovals() {
+        return this.deferredRemovals.drain();
+    }
+
+    /**
+     * One region's share of the batch: the region lease, the tickers it ticks and the random source its
+     * tickers draw from.
+     * <p>
+     * The group is also the ownership lease of the block entities of that region: a ticker of this group owns
+     * every entity stored in the leased region, because the region-scoped query only returns the entities of
+     * that storage. It defers removals only - a vanilla block-entity tick neither moves nor admits an entity -
+     * and refuses the other two server-owned effects, so a ticker that tries them keeps the storage refusal.
+     */
+    static final class Group implements RegionOwnershipLeaseGroup {
         private final RegionBlockEntityTickBatch batch;
         private final RegionState region;
         private final List<RegionBlockEntityTickAdmission> tickers = new ArrayList<>();
+        private final RandomSource random;
 
-        Group(RegionBlockEntityTickBatch batch, RegionState region, List<RegionBlockEntityTickAdmission> tickers) {
+        Group(RegionBlockEntityTickBatch batch, RegionState region, List<RegionBlockEntityTickAdmission> tickers, long randomSeed) {
             this.batch = batch;
             this.region = region;
+            this.random = RandomSource.create(randomSeed);
             this.tickers.addAll(tickers);
         }
 
@@ -98,6 +182,56 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
 
         void addTickers(List<RegionBlockEntityTickAdmission> tickers) {
             this.tickers.addAll(tickers);
+        }
+
+        /**
+         * {@return the random source every ticker of this group draws from while the group runs}
+         * <p>
+         * The engine installs this one instance for the whole worker tick loop, so a direct
+         * {@code level.random} read of a ticker resolves it through the level random wrapper instead of the
+         * shared vanilla source. It is derived in {@link RegionTickBatch#groupRandomSeed(RegionCoordinate)}
+         * and never shared with another group.
+         */
+        RandomSource random() {
+            return this.random;
+        }
+
+        /**
+         * {@return whether this group owns {@code entity}}
+         * <p>
+         * The block entities of a region reach an entity through the region-scoped query, which only reads the
+         * physical section bucket of the leased region. The group therefore owns the entities stored in that
+         * bucket, and the query result and the ownership decision agree by construction.
+         */
+        @Override
+        public boolean owns(Entity entity) {
+            return entity.level() == this.batch.level()
+                    && RegionEntityOwnershipScope.isInsideRegion(this.region.coordinate(), this.batch.level(), entity.blockPosition());
+        }
+
+        @Override
+        public boolean acceptsDeferredRemovals() {
+            return this.batch.acceptsDeferredRemovals();
+        }
+
+        @Override
+        public boolean deferRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+            return this.batch.deferRemoval(entity, callback, reason);
+        }
+
+        @Override
+        public boolean acceptsDeferredSectionUpdates() {
+            return false;
+        }
+
+        @Override
+        public boolean deferSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {
+            return false;
+        }
+
+        @Override
+        public boolean deferAddition(Entity entity, List<Entity> graph) {
+            return false;
         }
     }
 }

@@ -128,6 +128,9 @@ runs {
             // Measurement runs pass -PserverBenchmarkFurnaces=N to vary the size of the furnace workload
             // without editing the test; unset keeps the default workload of the test.
             systemProperty("neoforge.serverBenchmarkFurnaces", providers.gradleProperty("serverBenchmarkFurnaces").getOrElse("4096"))
+            // Measurement runs pass -PserverBenchmarkHoppers=N to vary the size of the hopper workload
+            // without editing the test; unset keeps the default workload of the test.
+            systemProperty("neoforge.serverBenchmarkHoppers", providers.gradleProperty("serverBenchmarkHoppers").getOrElse("2048"))
             // Measurement runs pass -PserverBenchmarkEntityWorkerTicks=false to measure the same entity
             // worker workload with its entity ticks on the server thread, which is the reference row.
             systemProperty("neoforge.serverBenchmarkEntityWorkerTicks", providers.gradleProperty("serverBenchmarkEntityWorkerTicks").getOrElse("true"))

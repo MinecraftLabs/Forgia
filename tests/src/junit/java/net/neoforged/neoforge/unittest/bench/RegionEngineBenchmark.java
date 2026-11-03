@@ -425,6 +425,10 @@ class RegionEngineBenchmark {
         when(tickRateManager.runsNormally()).thenReturn(true);
         doReturn(tickRateManager).when(level).tickRateManager();
         doReturn(true).when(level).shouldTickBlocksAt(any(BlockPos.class));
+        // The group random of a block-entity group is derived from the level's dimension, seed and game time.
+        doReturn(Level.OVERWORLD).when(level).dimension();
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
         doAnswer(invocation -> {
             awaitBounded(invocation.getArgument(0));

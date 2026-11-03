@@ -17,12 +17,14 @@ import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Entity ownership lease of exactly one region entity tick group.
+ * Entity ownership lease of exactly one region worker group.
  * <p>
  * The scope carries the leased level and region as one {@link RegionCoordinate}, the
- * {@link RegionEntityTickBatch.Group} that answers {@link RegionEntityTickBatch.Group#owns(Entity)}, and a
- * monotonically increasing lease id. It is installed around the worker tick loop of that group only and
- * removed in a {@code finally}, so a worker task outside the tick loop never inherits it.
+ * {@link RegionOwnershipLeaseGroup} that answers {@link RegionOwnershipLeaseGroup#owns(Entity)} and defers the
+ * storage effects of a granted mutation, and a monotonically increasing lease id. It is installed around the
+ * worker tick loop of that group only and removed in a {@code finally}, so a worker task outside the tick loop
+ * never inherits it. Both slices that reach entity storage open one: the entity tick group for the entities it
+ * ticks and the block-entity tick group for the entities its tickers reach through the region-scoped query.
  * <p>
  * The lease id makes a lease unusable as soon as a newer lease was opened on the same thread: a nested
  * scope replaces the enclosing one instead of inheriting it, and a scope that was closed can never grant a
@@ -139,7 +141,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     private static final AtomicLong REJECTED_QUERY_COUNT = new AtomicLong();
 
     private final RegionCoordinate coordinate;
-    private final RegionEntityTickBatch.Group group;
+    private final RegionOwnershipLeaseGroup group;
     private final long leaseId;
     @Nullable
     private final RegionEntityOwnershipScope previous;
@@ -147,7 +149,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     private final Long previousLeaseId;
     private boolean closed;
 
-    private RegionEntityOwnershipScope(RegionCoordinate coordinate, RegionEntityTickBatch.Group group, long leaseId) {
+    private RegionEntityOwnershipScope(RegionCoordinate coordinate, RegionOwnershipLeaseGroup group, long leaseId) {
         this.coordinate = coordinate;
         this.group = group;
         this.leaseId = leaseId;
@@ -158,7 +160,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     /**
      * Installs a new lease for the worker tick loop of {@code group} on the current thread.
      */
-    static RegionEntityOwnershipScope open(RegionCoordinate coordinate, RegionEntityTickBatch.Group group) {
+    static RegionEntityOwnershipScope open(RegionCoordinate coordinate, RegionOwnershipLeaseGroup group) {
         final RegionEntityOwnershipScope scope = new RegionEntityOwnershipScope(coordinate, group, NEXT_LEASE_ID.incrementAndGet());
         CURRENT.set(scope);
         CURRENT_LEASE_ID.set(scope.leaseId);
@@ -230,7 +232,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         if (GRANTABLE_REMOVAL_OPERATIONS.contains(operation)) {
             // Only a native worker defers, so only a native worker is granted the removal of an added entity.
             return !entity.isAddedToLevel()
-                    || (RegionWorkerScope.isNativeWorkerThread() && scope.group.batch().acceptsDeferredRemovals());
+                    || (RegionWorkerScope.isNativeWorkerThread() && scope.group.acceptsDeferredRemovals());
         }
         return GRANTABLE_OPERATIONS.contains(operation)
                 && !entity.isRemoved()
@@ -295,7 +297,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
                 return false;
             }
         }
-        return scope.group.batch().deferAddition(entity, graph);
+        return scope.group.deferAddition(entity, graph);
     }
 
     /**
@@ -306,12 +308,24 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      * {@code false}, so a lease never records an admission for storage that is not partitioned.
      */
     private static boolean containsPosition(RegionEntityOwnershipScope scope, ServerLevel level, BlockPos pos) {
+        return isInsideRegion(scope.coordinate, level, pos);
+    }
+
+    /**
+     * {@return true when {@code pos} of {@code level} is stored in the physical section bucket of
+     * {@code coordinate}}
+     * <p>
+     * This is the block bound of one region, used by the lease containment of an admission and by the ownership
+     * decision of a block-entity tick group, whose tickers reach the entities of exactly this bucket through the
+     * region-scoped query. A level without physical region buckets answers {@code false}.
+     */
+    static boolean isInsideRegion(RegionCoordinate coordinate, ServerLevel level, BlockPos pos) {
         final int regionChunkSize = level.entitySectionRegionChunkSize();
         if (regionChunkSize <= 0) {
             return false;
         }
-        return Math.floorDiv(SectionPos.blockToSectionCoord(pos.getX()), regionChunkSize) == scope.coordinate.regionX()
-                && Math.floorDiv(SectionPos.blockToSectionCoord(pos.getZ()), regionChunkSize) == scope.coordinate.regionZ();
+        return Math.floorDiv(SectionPos.blockToSectionCoord(pos.getX()), regionChunkSize) == coordinate.regionX()
+                && Math.floorDiv(SectionPos.blockToSectionCoord(pos.getZ()), regionChunkSize) == coordinate.regionZ();
     }
 
     /**
@@ -393,7 +407,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
                 SectionPos.posToSectionCoord(x),
                 SectionPos.posToSectionCoord(y),
                 SectionPos.posToSectionCoord(z));
-        if (!scope.group.batch().deferSectionUpdate(entity, callback, targetSection)) {
+        if (!scope.group.deferSectionUpdate(entity, callback, targetSection)) {
             // The batch stopped accepting section updates between the ownership grant and this record - the
             // engine shut down in between - so this move can never be published. Refusing it here, before
             // Entity.setPosRaw writes the position, keeps the reject-before-mutation invariant of the guard;
@@ -413,7 +427,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      */
     private static boolean defersSectionUpdate(Entity entity) {
         final RegionEntityOwnershipScope scope = sectionUpdateOwner(entity);
-        return scope != null && scope.group.batch().acceptsDeferredSectionUpdates();
+        return scope != null && scope.group.acceptsDeferredSectionUpdates();
     }
 
     /**
@@ -445,7 +459,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
                 || callback == EntityInLevelCallback.NULL) {
             return false;
         }
-        return scope.group.batch().deferRemoval(entity, callback, reason);
+        return scope.group.deferRemoval(entity, callback, reason);
     }
 
     /**
@@ -453,7 +467,7 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      * <p>
      * The ownership part of the deferral decision: a native region worker, an active lease, an entity that
      * is added to a level and not removed, and a group that owns the entity. Whether the lease can still
-     * defer is decided by {@link RegionEntityTickBatch#acceptsDeferredSectionUpdates()}.
+     * defer is decided by {@link RegionOwnershipLeaseGroup#acceptsDeferredSectionUpdates()}.
      */
     @Nullable
     private static RegionEntityOwnershipScope sectionUpdateOwner(Entity entity) {

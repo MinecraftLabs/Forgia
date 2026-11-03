@@ -43,6 +43,7 @@ import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -488,6 +489,11 @@ class RegionBlockEntityTickEligibilityTest {
         when(tickRateManager.runsNormally()).thenReturn(true);
         doReturn(tickRateManager).when(level).tickRateManager();
         doReturn(true).when(level).shouldTickBlocksAt(any(BlockPos.class));
+        // The group random of a block-entity group is derived from the level's dimension, seed and game
+        // time, so the level has to answer them like a real server level.
+        doReturn(Level.OVERWORLD).when(level).dimension();
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
         doAnswer(invocation -> {
             final BooleanSupplier condition = invocation.getArgument(0);

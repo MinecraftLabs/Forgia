@@ -16,9 +16,7 @@ import java.util.function.Function;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
-import net.minecraft.world.level.levelgen.RandomSupport;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -85,17 +83,11 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     /**
      * Removals that a worker recorded for the barrier, keyed by entity identity.
      * <p>
-     * The entity is its own key, so a repeat of the same removal is one hash lookup instead of a scan, and
-     * the first record is the removal that runs. The map is guarded by its own monitor, is only filled from
-     * workers, and is drained and cleared once per tick by the barrier, so it stays bounded by the entities
-     * removed in the current tick. Each entry keeps the level callback the inline vanilla removal would have
-     * invoked and the removal reason, so the barrier runs the normal removal path on the server thread.
+     * The record is shared with the block-entity tick batch, which defers the removal of an item entity a
+     * hopper absorbed: both slices apply the level callback of a removal on the server thread and count the
+     * same repeats.
      */
-    private final IdentityHashMap<Entity, DeferredEntityRemoval> deferredRemovals = new IdentityHashMap<>();
-    /** Removal requests the batch turned into a no-op; guarded by the monitor of {@link #deferredRemovals}. */
-    private long repeatedRemovalCount;
-    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredRemovals}. */
-    private volatile boolean removalSeamClosed;
+    private final RegionDeferredEntityRemovals deferredRemovals = new RegionDeferredEntityRemovals(this);
     /**
      * Admissions that a worker recorded for the barrier, in record order.
      * <p>
@@ -141,32 +133,6 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         this.groups.add(group);
         this.addTask("entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
-    }
-
-    /**
-     * {@return the seed of the random source of the entity group of {@code coordinate} in this tick}
-     * <p>
-     * The seed is derived from values the level already owns - its world seed, its dimension, the game time
-     * and the region coordinate - and not from a draw of the level random. Building a group therefore
-     * neither consumes the vanilla random sequence nor makes the sequence of one region depend on the
-     * groups of the other regions of the same tick: the group of a region starts from the same seed no
-     * matter how many regions tick next to it, in which order their leases were acquired and which worker
-     * runs it. Every input passes through the splitmix64 finalizer, so a step of one tick or of one region
-     * changes every bit of the {@code LegacyRandomSource} seed instead of only its low bits.
-     * <p>
-     * Determinism provided: for one world seed, dimension, game time and region coordinate the group draws
-     * a fixed sequence, independent of the other regions of the tick, of the worker count and of the order
-     * in which the regions are dispatched to workers. Not provided: this is not the vanilla sequence
-     * (vanilla draws every entity of a level from one level-wide source), and the sequence is not stable
-     * across a region merge or split, a layout change or a change of the group's entity set, because each
-     * of those changes the group and how many draws the entities before a given entity take from it.
-     */
-    long groupRandomSeed(RegionCoordinate coordinate) {
-        final ServerLevel level = this.level();
-        long seed = RandomSupport.mixStafford13(level.getSeed());
-        seed = RandomSupport.mixStafford13(seed ^ level.getGameTime());
-        seed = RandomSupport.mixStafford13(seed ^ level.dimension().location().hashCode());
-        return RandomSupport.mixStafford13(seed ^ ChunkPos.asLong(coordinate.regionX(), coordinate.regionZ()));
     }
 
     /**
@@ -325,22 +291,18 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * storage removal nobody applies.
      */
     boolean acceptsDeferredRemovals() {
-        return !this.isRemovalSeamClosed() && !this.isComplete();
+        return this.deferredRemovals.accepts();
     }
 
     /**
      * {@return true when this batch no longer accepts or applies deferred removals}
      */
     boolean isRemovalSeamClosed() {
-        return this.removalSeamClosed;
+        return this.deferredRemovals.isSeamClosed();
     }
 
     /**
      * Records the level callback of one removal that a worker deferred to the barrier.
-     * <p>
-     * The first removal of an entity is the one that runs. A repeat - the vanilla entry point removing an
-     * entity that a previous removal already marked, which reaches the same funnel again - is a counted no-op,
-     * so the entity is never removed twice.
      *
      * @param entity   the entity that is being removed
      * @param callback the level callback the inline vanilla removal would have invoked
@@ -349,42 +311,23 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      *         never be applied and the caller has to keep the storage refusal
      */
     boolean deferRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
-        synchronized (this.deferredRemovals) {
-            if (this.removalSeamClosed || this.isComplete()) {
-                return false;
-            }
-            if (this.deferredRemovals.containsKey(entity)) {
-                this.repeatedRemovalCount++;
-                return true;
-            }
-            this.deferredRemovals.put(entity, new DeferredEntityRemoval(entity, callback, reason));
-            return true;
-        }
+        return this.deferredRemovals.defer(entity, callback, reason);
     }
 
     /**
      * Stops accepting deferred removals and releases the ones that already wait.
-     * <p>
-     * Called when the engine shuts down: the barrier of this batch will never apply a removal again, so a
-     * worker that still ticks must be refused instead of granted, and the released removals must not keep an
-     * entity reference alive.
      *
      * @return the released removals and the repeats that were counted but not applied
      */
-    RemovalDrain closeDeferredRemovals() {
-        synchronized (this.deferredRemovals) {
-            this.removalSeamClosed = true;
-            return this.drainRemovals();
-        }
+    RegionDeferredEntityRemovals.Drain closeDeferredRemovals() {
+        return this.deferredRemovals.close();
     }
 
     /**
      * Takes the deferred removals that wait for the end of the batch.
      */
-    RemovalDrain drainDeferredRemovals() {
-        synchronized (this.deferredRemovals) {
-            return this.drainRemovals();
-        }
+    RegionDeferredEntityRemovals.Drain drainDeferredRemovals() {
+        return this.deferredRemovals.drain();
     }
 
     /**
@@ -460,13 +403,6 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         return drain;
     }
 
-    private RemovalDrain drainRemovals() {
-        final RemovalDrain drain = new RemovalDrain(List.copyOf(this.deferredRemovals.values()), this.repeatedRemovalCount);
-        this.deferredRemovals.clear();
-        this.repeatedRemovalCount = 0L;
-        return drain;
-    }
-
     /**
      * Takes the deferred section updates that wait for the end of the batch.
      */
@@ -534,19 +470,6 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     record DeferredSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {}
 
     /**
-     * One deferred removal: the removed entity, the level callback the inline vanilla removal would have
-     * invoked and the removal reason the entity was marked with. The barrier runs that callback on the server
-     * thread, which is the whole server-owned part of the removal.
-     */
-    record DeferredEntityRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {}
-
-    /**
-     * One drain of the deferred removals of a batch: the removals to apply and the removal requests that were
-     * already recorded or already applied and were therefore counted as no-ops.
-     */
-    record RemovalDrain(List<DeferredEntityRemoval> removals, long repeats) {}
-
-    /**
      * One deferred admission: the entity the worker added and the whole riding graph it belongs to, in the
      * order the barrier admits it. The root is kept for diagnostics; the graph is what the barrier admits.
      */
@@ -562,7 +485,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * One region's share of the batch: the region lease, the entities it ticks, the snapshot members it is
      * allowed to execute inline, and the random source its entity ticks draw from.
      */
-    static final class Group {
+    static final class Group implements RegionOwnershipLeaseGroup {
         private final RegionEntityTickBatch batch;
         private final RegionState region;
         private final List<Entity> entities = new ArrayList<>();
@@ -598,8 +521,8 @@ final class RegionEntityTickBatch extends RegionTickBatch {
          * <p>
          * The engine installs this one instance for the whole worker tick loop, so a direct
          * {@code level.random} read of any entity of the group resolves it through the level random
-         * wrapper. It is derived in {@link RegionEntityTickBatch#groupRandomSeed(RegionCoordinate)} and
-         * never shared with another group.
+         * wrapper. It is derived in {@link RegionTickBatch#groupRandomSeed(RegionCoordinate)} and never
+         * shared with another group.
          */
         RandomSource random() {
             return this.random;
@@ -612,8 +535,34 @@ final class RegionEntityTickBatch extends RegionTickBatch {
             }
         }
 
-        boolean owns(Entity entity) {
+        @Override
+        public boolean owns(Entity entity) {
             return this.batch.owns(this, entity);
+        }
+
+        @Override
+        public boolean acceptsDeferredRemovals() {
+            return this.batch.acceptsDeferredRemovals();
+        }
+
+        @Override
+        public boolean deferRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+            return this.batch.deferRemoval(entity, callback, reason);
+        }
+
+        @Override
+        public boolean acceptsDeferredSectionUpdates() {
+            return this.batch.acceptsDeferredSectionUpdates();
+        }
+
+        @Override
+        public boolean deferSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {
+            return this.batch.deferSectionUpdate(entity, callback, targetSection);
+        }
+
+        @Override
+        public boolean deferAddition(Entity entity, List<Entity> graph) {
+            return this.batch.deferAddition(entity, graph);
         }
 
         @Nullable

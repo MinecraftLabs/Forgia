@@ -194,6 +194,13 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final ThreadLocal<RandomSource> currentEntityTickRandom = new ThreadLocal<>();
     /**
+     * Random source of the block-entity tick group that executes on the current thread. It is installed once
+     * per group for the whole worker tick loop, so {@link #currentGroupRandom()} answers with it for every
+     * ticker of the group and the block-entity access gate opens for the block entities of its region; both
+     * are removed again after the loop.
+     */
+    private final ThreadLocal<RandomSource> currentBlockEntityTickRandom = new ThreadLocal<>();
+    /**
      * Random source of the scheduled tick group that executes on the current thread. It is only set for
      * the duration of a worker group, so {@link #scheduledTickRandom()} returns {@code null} everywhere
      * else and the vanilla level random stays authoritative outside a batch.
@@ -204,8 +211,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * set for the duration of a worker group; the server thread drains it after the phase, so a worker
      * never mutates either {@code LevelTicks} instance concurrently.
      * <p>
-     * Scheduled block/fluid ticks and random ticks both mutate {@code LevelTicks} through this queue, so
-     * the two slices never mutate the scheduling structures concurrently.
+     * Scheduled block/fluid ticks, random ticks and block-entity ticks all mutate {@code LevelTicks} through
+     * this queue, so the slices never mutate the scheduling structures concurrently.
      */
     private final ThreadLocal<Queue<Runnable>> currentRegionTickMutations = new ThreadLocal<>();
     /**
@@ -1063,10 +1070,10 @@ public final class RegionThreadingEngine implements RegionThreading {
      * {@return the random source of the region worker group executing on the current thread, or
      * {@code null} outside a worker group}
      * <p>
-     * Entity, scheduled and random tick groups each own a random source while they run. The level random
-     * wrapper uses this to redirect direct {@code level.random} reads of a worker to the random source of
-     * its group instead of the shared vanilla source, which no two workers ever share because every group
-     * owns its own source.
+     * Entity, scheduled, random and block-entity tick groups each own a random source while they run. The
+     * level random wrapper uses this to redirect direct {@code level.random} reads of a worker to the random
+     * source of its group instead of the shared vanilla source, which no two workers ever share because every
+     * group owns its own source.
      */
     @Nullable
     public RandomSource currentGroupRandom() {
@@ -1078,22 +1085,32 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (random != null) {
             return random;
         }
+        final RandomSource blockEntity = this.currentBlockEntityTickRandom.get();
+        if (blockEntity != null) {
+            return blockEntity;
+        }
         return this.currentEntityTickRandom.get();
     }
 
     /**
      * {@return the random source of the block tick group executing on the current thread, or {@code null}
-     * outside a scheduled or random tick worker group}
+     * outside a scheduled, random or block-entity tick worker group}
      * <p>
-     * This is the narrower question the block-entity access gate asks, because only a scheduled or random
-     * tick group opens that gate for the block entities of its region. An entity tick group owns a random
-     * source as well, but that one is resolved through {@link #currentGroupRandom()} and does not grant
-     * block-entity access.
+     * This is the narrower question the block-entity access gate asks, because only a group that ticks the
+     * blocks or the block entities of its region opens that gate. A scheduled or random tick group opens it
+     * because its callback runs block code that reads its own block entity; a block-entity tick group opens it
+     * because its ticker reads the block entities of its region - a hopper reads its attached container, which
+     * is one block away. An entity tick group owns a random source as well, but that one is resolved through
+     * {@link #currentGroupRandom()} and does not grant block-entity access.
      */
     @Nullable
     public RandomSource currentRegionTickRandom() {
         final RandomSource scheduled = this.currentScheduledTickRandom.get();
-        return scheduled != null ? scheduled : this.currentRandomTickRandom.get();
+        if (scheduled != null) {
+            return scheduled;
+        }
+        final RandomSource random = this.currentRandomTickRandom.get();
+        return random != null ? random : this.currentBlockEntityTickRandom.get();
     }
 
     /**
@@ -1703,6 +1720,11 @@ public final class RegionThreadingEngine implements RegionThreading {
      * that merged or split between collection and lease acquisition is replaced by its authoritative
      * successor instead of dropping the ticker. Tickers whose region cannot be leased safely are ticked on
      * the server thread after the batch rather than being dropped.
+     * <p>
+     * The two server-owned effects a worker group defers are applied here, after the workers finished and
+     * before the batch is released: the removals of the entities an owned ticker removed, and the scheduled
+     * ticks its neighbor updates started. The fallback ticks run between them, so a ticker the server thread
+     * ticks after the batch observes the removals of the batch it belongs to.
      */
     void tickBlockEntities(ServerLevel level, List<RegionBlockEntityTickAdmission> tickers, RegionTickBarrier barrier) {
         if (tickers.isEmpty()) {
@@ -1759,7 +1781,14 @@ public final class RegionThreadingEngine implements RegionThreading {
         } finally {
             final long handoffStart = attribution ? System.nanoTime() : 0L;
             try {
+                // The removal of an owned item entity is the one vanilla storage effect a block-entity
+                // worker may defer. It runs before the fallback ticks, so a hopper that the server thread
+                // ticks after the batch no longer sees the item entity a worker already absorbed.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockEntityRemovals(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackBlockEntities(batch));
+                // The scheduled ticks a ticker started through the neighbor update of its own setChanged()
+                // were recorded on the workers; they mutate LevelTicks here, on the server thread.
+                failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
                 batch.finish();
                 this.activeTickBatches.remove(batch);
                 batch.clearExecutingOnCurrentThread();
@@ -1865,45 +1894,67 @@ public final class RegionThreadingEngine implements RegionThreading {
         final RegionCoordinate coordinate = region.coordinate();
         final List<RegionBlockEntityTickAdmission> tickers = group.tickers();
         final ServerLevel level = group.batch().level();
+        final RandomSource random = group.random();
         return () -> {
             final long start = System.nanoTime();
             final int[] ticked = { 0 };
             try {
                 region.beginOwnership();
-                this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
-                    for (final RegionBlockEntityTickAdmission admission : tickers) {
-                        final TickingBlockEntity ticker = admission.ticker();
-                        if (ticker.isRemoved()) {
-                            continue;
-                        }
-                        // Validate before the body: stale admissions are deferred exactly once, never
-                        // recovered by throwing after a ticker could already have produced side effects.
-                        if (admission.level() != level || !admission.isCurrent() || !region.isOwnedByCurrentThread()) {
-                            group.batch().addFallback(admission);
-                            this.fallbackBlockEntityTicks.incrementAndGet();
-                            continue;
-                        }
-                        if (RegionWorkerScope.isNativeWorkerThread()) {
-                            try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
-                                ticker.tick();
-                            } catch (Throwable throwable) {
-                                // A chunk request the chunk source refused is a handoff, not a failure: the
-                                // ticker is ticked on the server thread after the batch instead of aborting
-                                // the group.
-                                if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
-                                    throw throwable;
+                // The group random is installed once for the whole worker tick loop, so a direct
+                // level.random read of a ticker resolves this group's source through the level random
+                // wrapper instead of the shared vanilla one, and the block-entity access gate of the
+                // level answers for the block entities of this region.
+                this.currentBlockEntityTickRandom.set(random);
+                // LevelTicks is server-owned storage: a scheduled tick a ticker starts through the
+                // neighbor update of its own setChanged() is recorded here and applied by the publishing
+                // server thread after the batch, never from a worker.
+                this.currentRegionTickMutations.set(group.batch().regionTickMutations());
+                try {
+                    // The ownership lease covers exactly this worker tick loop: it is opened after the
+                    // region lease and closed before it, so a worker task outside the loop never sees it.
+                    final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    try {
+                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
+                            for (final RegionBlockEntityTickAdmission admission : tickers) {
+                                final TickingBlockEntity ticker = admission.ticker();
+                                if (ticker.isRemoved()) {
+                                    continue;
                                 }
-                                group.batch().addFallback(admission);
-                                this.fallbackBlockEntityTicks.incrementAndGet();
-                                continue;
+                                // Validate before the body: stale admissions are deferred exactly once, never
+                                // recovered by throwing after a ticker could already have produced side effects.
+                                if (admission.level() != level || !admission.isCurrent() || !region.isOwnedByCurrentThread()) {
+                                    group.batch().addFallback(admission);
+                                    this.fallbackBlockEntityTicks.incrementAndGet();
+                                    continue;
+                                }
+                                if (RegionWorkerScope.isNativeWorkerThread()) {
+                                    try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
+                                        ticker.tick();
+                                    } catch (Throwable throwable) {
+                                        // A chunk request the chunk source refused is a handoff, not a failure: the
+                                        // ticker is ticked on the server thread after the batch instead of aborting
+                                        // the group.
+                                        if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
+                                            throw throwable;
+                                        }
+                                        group.batch().addFallback(admission);
+                                        this.fallbackBlockEntityTicks.incrementAndGet();
+                                        continue;
+                                    }
+                                } else {
+                                    // Executor rejection runs on the server thread and keeps the real load check.
+                                    this.tickBlockEntityInline(level, ticker);
+                                }
+                                ++ticked[0];
                             }
-                        } else {
-                            // Executor rejection runs on the server thread and keeps the real load check.
-                            this.tickBlockEntityInline(level, ticker);
-                        }
-                        ++ticked[0];
+                        });
+                    } finally {
+                        ownership.close();
                     }
-                });
+                } finally {
+                    this.currentRegionTickMutations.remove();
+                    this.currentBlockEntityTickRandom.remove();
+                }
             } finally {
                 region.endOwnership();
                 region.clearRunning();
@@ -2971,18 +3022,36 @@ public final class RegionThreadingEngine implements RegionThreading {
      * completion path as every other server-thread step.
      */
     private void applyDeferredEntityRemovals(RegionEntityTickBatch batch) {
-        final RegionEntityTickBatch.RemovalDrain drain = batch.drainDeferredRemovals();
+        this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
+    }
+
+    /**
+     * Applies the removals of an owned entity that a block-entity worker deferred to the barrier.
+     * <p>
+     * A hopper that absorbs an item entity of its region removes it through the same vanilla funnel, so the
+     * removal is deferred and applied exactly like the removal of a dying entity: the worker writes the
+     * entity's own removal state, and this step runs the level callback on the server thread after the batch.
+     */
+    private void applyDeferredBlockEntityRemovals(RegionBlockEntityTickBatch batch) {
+        this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
+    }
+
+    /**
+     * Applies one drain of deferred removals on the server thread.
+     *
+     * @see #applyDeferredEntityRemovals(RegionEntityTickBatch)
+     */
+    private void applyDeferredRemovals(ServerLevel level, RegionDeferredEntityRemovals.Drain drain, boolean seamClosed) {
         this.repeatedDeferredRemovalCount.addAndGet(drain.repeats());
         if (drain.removals().isEmpty()) {
             return;
         }
-        final ServerLevel level = batch.level();
-        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isRemovalSeamClosed()) {
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || seamClosed) {
             this.droppedDeferredRemovalCount.addAndGet(drain.removals().size());
             return;
         }
         Throwable failure = null;
-        for (final RegionEntityTickBatch.DeferredEntityRemoval removal : drain.removals()) {
+        for (final RegionDeferredEntityRemovals.DeferredRemoval removal : drain.removals()) {
             final Entity entity = removal.entity();
             if (!entity.isRemoved()
                     || !entity.isAddedToLevel()
@@ -3097,26 +3166,34 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Closes the deferred seams of every active entity batch when shutdown starts.
+     * Closes the deferred seams of every active batch when shutdown starts.
      * <p>
      * A shut-down engine never runs a barrier again, so a batch that still ticks must not accept another
      * section update or another removal: the next worker move or removal is refused by the storage guard
      * instead of being granted and dropped. The updates and removals that already wait are released and
      * counted, so no entity reference stays reachable from the batch and nothing is applied after the
-     * shutdown.
+     * shutdown. A block-entity batch only defers removals, so that is the only seam it closes.
      */
     private void closeDeferredSeams() {
         for (final RegionTickBatch active : this.activeTickBatches) {
             if (active instanceof RegionEntityTickBatch entityBatch) {
                 this.droppedDeferredSectionUpdateCount.addAndGet(entityBatch.closeDeferredSectionUpdates());
-                final RegionEntityTickBatch.RemovalDrain releasedRemovals = entityBatch.closeDeferredRemovals();
-                this.droppedDeferredRemovalCount.addAndGet(releasedRemovals.removals().size());
-                this.repeatedDeferredRemovalCount.addAndGet(releasedRemovals.repeats());
+                this.releaseDeferredRemovals(entityBatch.closeDeferredRemovals());
                 final RegionEntityTickBatch.AdditionDrain releasedAdditions = entityBatch.closeDeferredAdditions();
                 this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
                 this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
+            } else if (active instanceof RegionBlockEntityTickBatch blockEntityBatch) {
+                this.releaseDeferredRemovals(blockEntityBatch.closeDeferredRemovals());
             }
         }
+    }
+
+    /**
+     * Counts the removals a closed seam released as dropped and the repeats it counted.
+     */
+    private void releaseDeferredRemovals(RegionDeferredEntityRemovals.Drain released) {
+        this.droppedDeferredRemovalCount.addAndGet(released.removals().size());
+        this.repeatedDeferredRemovalCount.addAndGet(released.repeats());
     }
 
     /**

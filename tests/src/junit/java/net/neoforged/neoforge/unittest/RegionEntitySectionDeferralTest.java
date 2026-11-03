@@ -672,7 +672,8 @@ class RegionEntitySectionDeferralTest {
      * Opens the real lease the engine opens around one worker tick loop, for {@code group}.
      */
     private static RegionEntityOwnershipScope openLease(ServerLevel level, Object group) throws ReflectiveOperationException {
-        final Method open = RegionEntityOwnershipScope.class.getDeclaredMethod("open", RegionCoordinate.class, group.getClass());
+        final Method open = RegionEntityOwnershipScope.class.getDeclaredMethod("open", RegionCoordinate.class,
+                Class.forName(REGION_PACKAGE + "RegionOwnershipLeaseGroup"));
         open.setAccessible(true);
         return (RegionEntityOwnershipScope) open.invoke(null, new RegionCoordinate(level, 0, 0), group);
     }
