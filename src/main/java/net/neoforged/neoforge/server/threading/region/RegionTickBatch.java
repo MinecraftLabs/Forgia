@@ -49,6 +49,11 @@ abstract class RegionTickBatch {
     private final Set<MainThreadWork<?>> pendingMainThreadWork = new LinkedHashSet<>();
     private boolean mainThreadWorkClosed;
     private boolean submitted;
+    /**
+     * Wall time the publishing thread needed to hand the groups to the executor, so the part of a wait that is
+     * submission is observable instead of being counted as worker time.
+     */
+    private long submitNanos;
 
     RegionTickBatch(ServerLevel level) {
         this.level = level;
@@ -202,6 +207,11 @@ abstract class RegionTickBatch {
         }
     }
 
+    /** {@return the wall time the publishing thread spent handing the groups to the executor} */
+    final long submitNanos() {
+        return this.submitNanos;
+    }
+
     /**
      * {@return true when every worker group finished}
      */
@@ -252,8 +262,10 @@ abstract class RegionTickBatch {
             }
             this.submitted = true;
         }
+        final long submitStart = System.nanoTime();
         this.tasks.submitOpen(executor, this.groupBarrier);
         this.groupBarrier.setupComplete();
+        this.submitNanos = System.nanoTime() - submitStart;
         Throwable barrierFailure = null;
         try {
             // The batch-aware barrier services the main-thread handoffs of the workers in addition to the

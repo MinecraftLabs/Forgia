@@ -8,6 +8,7 @@ package net.neoforged.neoforge.server.threading.region;
 import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
@@ -2372,31 +2373,65 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
             }
             final long awaitStart = attribution ? System.nanoTime() : 0L;
+            final long awaitCpuStart = attribution ? RegionBlockEntityTickAttribution.currentThreadCpuNanos() : 0L;
             try {
-                batch.submitAndAwait(this.workerPool, barrier);
+                // The barrier is the level's main-thread chunk-source block, so the batch waits by polling the
+                // main-thread queue. Counting the polls and the CPU time of the wait shows how much of the wait
+                // the server thread runs instead of parking, which is what competes with the workers.
+                batch.submitAndAwait(this.workerPool, attribution ? condition -> barrier.await(() -> {
+                    RegionBlockEntityTickAttribution.recordAwaitPoll();
+                    return condition.getAsBoolean();
+                }) : barrier);
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
                 }
             } finally {
                 if (attribution) {
-                    RegionBlockEntityTickAttribution.recordAwait(System.nanoTime() - awaitStart);
+                    final long awaitEnd = System.nanoTime();
+                    RegionBlockEntityTickAttribution.recordAwait(awaitEnd - awaitStart,
+                            RegionBlockEntityTickAttribution.currentThreadCpuNanos() - awaitCpuStart);
+                    // The slowest group bounds the wait the workers caused; the rest of the await is dispatch
+                    // and completion, which is what a barrier-model fix could remove.
+                    RegionBlockEntityTickAttribution.recordBatchMakespan(batch.slowestGroupNanos());
+                    // Splits the wait into the time until the first group started, the span the workers ran
+                    // in and the time until the wait noticed the last group finished.
+                    RegionBlockEntityTickAttribution.recordBatchPhases(awaitStart, awaitEnd,
+                            batch.firstGroupStartNanos(), batch.lastGroupEndNanos());
+                    RegionBlockEntityTickAttribution.recordBatchSubmit(batch.submitNanos());
                 }
             }
         } finally {
             final long handoffStart = attribution ? System.nanoTime() : 0L;
             try {
+                // Every handoff step is timed on its own when the attribution is enabled, so the deferred
+                // work of a batch is attributable per step instead of as one block.
+                final long removalStart = attribution ? System.nanoTime() : 0L;
+                final long removalsBefore = attribution ? this.deferredRemovalCount() : 0L;
                 // The removal of an owned item entity is the one vanilla storage effect a block-entity
                 // worker may defer. It runs before the fallback ticks, so a hopper that the server thread
                 // ticks after the batch no longer sees the item entity a worker already absorbed.
                 failure = runBatchCompletion(failure, () -> this.applyDeferredBlockEntityRemovals(batch));
+                final long fallbackStart = attribution ? System.nanoTime() : 0L;
+                final long removals = attribution ? this.deferredRemovalCount() - removalsBefore : 0L;
                 failure = runBatchCompletion(failure, () -> this.tickFallbackBlockEntities(batch));
+                final long mutationStart = attribution ? System.nanoTime() : 0L;
+                final long fallbackTickers = attribution ? countBlockEntityTickers(batch.fallbackChunks()) + batch.fallbackTickers().size() : 0L;
+                final long mutations = attribution ? batch.regionTickMutations().size() : 0L;
                 // The scheduled ticks a ticker started through the neighbor update of its own setChanged()
                 // were recorded on the workers; they mutate LevelTicks here, on the server thread.
                 failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
+                final long finishStart = attribution ? System.nanoTime() : 0L;
                 batch.finish();
                 this.activeTickBatches.remove(batch);
                 batch.clearExecutingOnCurrentThread();
+                if (attribution) {
+                    final long finishEnd = System.nanoTime();
+                    RegionBlockEntityTickAttribution.recordHandoffRemovals(fallbackStart - removalStart, removals);
+                    RegionBlockEntityTickAttribution.recordHandoffFallback(mutationStart - fallbackStart, fallbackTickers);
+                    RegionBlockEntityTickAttribution.recordHandoffMutations(finishStart - mutationStart, mutations);
+                    RegionBlockEntityTickAttribution.recordHandoffFinish(finishEnd - finishStart);
+                }
             } finally {
                 if (attribution) {
                     RegionBlockEntityTickAttribution.recordHandoff(System.nanoTime() - handoffStart);
@@ -2448,6 +2483,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                     for (final RegionBlockEntityTickChunk chunk : regionChunks) {
                         batch.addFallbackChunk(chunk);
                         this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
+                        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION, chunk.admissions().size());
                     }
                     continue;
                 }
@@ -2475,6 +2511,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         for (final RegionBlockEntityTickChunk chunk : remaining) {
             batch.addFallbackChunk(chunk);
             this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
+            RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.UNRESOLVABLE_REGION, chunk.admissions().size());
         }
         if (batchedTickers > 0 && this.blockEntityTickWorkersNoticeLogged.compareAndSet(false, true)) {
             LOGGER.info("Region block entity ticks are now executing on region workers: {} block entities", batchedTickers);
@@ -2491,7 +2528,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /** {@return the number of tickers {@code chunks} hand to a worker group} */
-    private static int countBlockEntityTickers(List<RegionBlockEntityTickChunk> chunks) {
+    private static int countBlockEntityTickers(Collection<RegionBlockEntityTickChunk> chunks) {
         int tickers = 0;
         for (final RegionBlockEntityTickChunk chunk : chunks) {
             tickers += chunk.admissions().size();
@@ -2508,8 +2545,12 @@ public final class RegionThreadingEngine implements RegionThreading {
         return () -> {
             final long start = System.nanoTime();
             final int[] ticked = { 0 };
+            final boolean tickerTiming = RegionBlockEntityTickAttribution.isEnabled();
+            final long cpuStart = tickerTiming ? RegionBlockEntityTickAttribution.currentThreadCpuNanos() : 0L;
+            int admitted = 0;
             try {
                 final List<RegionBlockEntityTickAdmission> tickers = this.orderBlockEntityGroup(group, chunks);
+                admitted = tickers.size();
                 region.beginOwnership();
                 // The group random is installed once for the whole worker tick loop, so a direct
                 // level.random read of a ticker resolves this group's source through the level random
@@ -2536,9 +2577,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                                 if (admission.level() != level || !admission.isCurrent() || !region.isOwnedByCurrentThread()) {
                                     group.batch().addFallback(admission);
                                     this.fallbackBlockEntityTicks.incrementAndGet();
+                                    RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.STALE_ADMISSION, 1);
                                     continue;
                                 }
                                 if (RegionWorkerScope.isNativeWorkerThread()) {
+                                    final long tickerStart = tickerTiming ? System.nanoTime() : 0L;
                                     try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
                                         ticker.tick();
                                     } catch (Throwable throwable) {
@@ -2550,7 +2593,13 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         }
                                         group.batch().addFallback(admission);
                                         this.fallbackBlockEntityTicks.incrementAndGet();
+                                        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE, 1);
                                         continue;
+                                    }
+                                    if (tickerTiming) {
+                                        // The ticker's own tick, so the group wall time can be split into the
+                                        // vanilla body and the wrapper the slice adds around it.
+                                        RegionBlockEntityTickAttribution.recordTicker(System.nanoTime() - tickerStart);
                                     }
                                 } else {
                                     // Executor rejection runs on the server thread and keeps the real load check.
@@ -2570,10 +2619,28 @@ public final class RegionThreadingEngine implements RegionThreading {
                 region.endOwnership();
                 region.clearRunning();
                 final long duration = System.nanoTime() - start;
+                // The group reports its own wall time and size, so the measured window can tell a barrier
+                // that waits for the slowest group from one that waits for work.
+                RegionBlockEntityTickAttribution.recordGroup(duration,
+                        tickerTiming ? RegionBlockEntityTickAttribution.currentThreadCpuNanos() - cpuStart : 0L,
+                        admitted, ticked[0]);
+                if (tickerTiming) {
+                    group.batch().recordGroupDuration(duration);
+                    group.batch().recordGroupStart(start);
+                    group.batch().recordGroupEnd(start + duration);
+                }
                 region.tickMetrics().recordTick(duration);
                 RegionTickWatchdog.warnIfLongTick("block entity batch " + coordinate, duration);
                 this.blockEntityTicksOnWorkers.addAndGet(ticked[0]);
-                this.regionizer.removeIfEmpty(region);
+                if (tickerTiming) {
+                    // Retiring an empty region takes the regionizer write lock, which every finishing group of
+                    // the batch wants at the same time: the one shared section a group enters after its tickers.
+                    final long retireStart = System.nanoTime();
+                    this.regionizer.removeIfEmpty(region);
+                    RegionBlockEntityTickAttribution.recordGroupRetire(System.nanoTime() - retireStart);
+                } else {
+                    this.regionizer.removeIfEmpty(region);
+                }
             }
         };
     }
@@ -2616,6 +2683,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     private void deferStaleBlockEntityChunk(RegionBlockEntityTickBatch.Group group, RegionBlockEntityTickChunk chunk) {
         this.staleBlockEntityChunkSnapshots.incrementAndGet();
         this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
+        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.STALE_SNAPSHOT, chunk.admissions().size());
         group.batch().addFallbackChunk(chunk);
     }
 
@@ -3702,6 +3770,16 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private void applyDeferredBlockEntityRemovals(RegionBlockEntityTickBatch batch) {
         this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
+    }
+
+    /**
+     * {@return the number of deferred entity removals this engine applied or repeated so far}
+     * <p>
+     * The difference of two reads around a drain is the number of removals that drain carried, which the
+     * opt-in attribution reports as the count of the deferred removal step.
+     */
+    private long deferredRemovalCount() {
+        return this.appliedDeferredRemovalCount.get() + this.repeatedDeferredRemovalCount.get();
     }
 
     /**

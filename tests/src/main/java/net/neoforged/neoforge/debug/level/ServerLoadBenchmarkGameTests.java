@@ -63,6 +63,7 @@ import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
+import net.neoforged.neoforge.server.threading.region.RegionTickSnapshot;
 import net.neoforged.testframework.DynamicTest;
 import net.neoforged.testframework.annotation.ForEachTest;
 import net.neoforged.testframework.annotation.TestHolder;
@@ -1325,6 +1326,7 @@ public class ServerLoadBenchmarkGameTests {
                 slices,
                 admissionCache);
         printRegionMetrics(after);
+        printHopperDiagnostics(profile, attributionAfter, after);
         helper.assertTrue(conserved,
                 "the hopper workload lost or duplicated items: start " + itemCountStart + ", dropped " + itemsDropped + ", end " + itemCountEnd);
         helper.assertTrue(delivered > 0L, "the hopper workload never moved an item");
@@ -1336,6 +1338,184 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static double millisPerSlice(long nanos, long slices) {
         return slices <= 0L ? -1.0 : nanos / (double) slices / 1_000_000.0;
+    }
+
+    /**
+     * Prints the decomposition of the measured window that the hopper CSV row cannot carry: what the worker
+     * groups of the block-entity slice did, how the handoff splits into its steps, and why tickers ticked on the
+     * server thread instead of a worker.
+     * <p>
+     * The accumulators are reset when the measured window starts and the snapshot is taken when it ends, so the
+     * snapshot is the total of the window and every per-tick value divides by the window's slice count. A
+     * profile without a worker batch (region threading off) records no slice and reports {@code -1} for every
+     * per-tick value, which is how a missing measurement is told apart from a zero one.
+     * <p>
+     * The group distribution separates the two ways a barrier can be the limit: a batch whose groups are uneven
+     * reports a group coefficient of variation above zero and a slowest group well above the mean, while a batch
+     * whose groups are balanced but whose workers are saturated reports a worker utilization near one and a
+     * slowest group near the ideal share of one worker. {@code packingRatio} is the slowest group divided by the
+     * equal share of one worker, so a perfectly packed batch reports about one. {@code tickerMsPerTick} is the
+     * part of the group wall time the tickers spent inside their own tick and {@code wrapperMsPerTick} the rest,
+     * so a worker that runs slower than the same work inline is not confused with a wrapper that became
+     * expensive. {@code awaitPollsPerTick} and {@code awaitPollNs} are the barrier condition evaluations per
+     * tick and the await time each of them accounts for, which tells a wait that parks from one that spins.
+     */
+    private static void printHopperDiagnostics(String profile, RegionBlockEntityTickAttribution.Snapshot attribution, Optional<RegionThreadingDiagnostics> diagnostics) {
+        final long slices = attribution.sliceCount();
+        final int workers = diagnostics.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0);
+        final RegionBlockEntityTickAttribution.GroupDistribution groups = attribution.groups();
+        final RegionBlockEntityTickAttribution.HandoffSteps handoff = attribution.handoffSteps();
+        final double meanGroupNanos = mean(groups.nanos(), groups.groups());
+        final double meanTickers = mean(groups.tickers(), groups.groups());
+        final double workerBusyMean = mean(groups.nanos(), (long) Math.max(workers, 1) * Math.max(slices, 1L));
+        final double workerBusyMax = groups.workers().stream().mapToLong(RegionBlockEntityTickAttribution.WorkerLoad::nanos).max().orElse(0L) / (double) Math.max(slices, 1L);
+        final double workerBusyMin = groups.workers().stream().mapToLong(RegionBlockEntityTickAttribution.WorkerLoad::nanos).min().orElse(0L) / (double) Math.max(slices, 1L);
+        System.out.println("SERVER_BENCH_HOPPER_GROUPS_HEADER profile,slices,workers,groupsPerTick,emptyGroupsPerTick,idleGroupsPerTick,meanTickersPerGroup,maxTickersPerGroup,tickerCv,meanGroupMs,groupP50Ms,groupP95Ms,groupP99Ms,maxGroupMs,groupCv,sumGroupMsPerTick,sumGroupMsPerTickClean,tickerMsPerTick,wrapperMsPerTick,tickerUsPerTicker,workerBusyMinMs,workerBusyMeanMs,workerBusyMaxMs,workerBusyCv,packingRatio,workerUtilization,awaitPollsPerTick,awaitPollNs,awaitCpuRatio,batchMaxGroupMs,awaitMinusBatchMaxMs,makespanOverIdeal,submitMs,dispatchMs,spanMs,tailMs,workerCpuMsPerTick,cpuOverWall,retireMsPerTick,stalledGroupsPerTick,perWorkerBusyMs");
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_GROUPS %s,%d,%d,%.2f,%.2f,%.2f,%.1f,%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.1f,%.1f,%.3f,%.4f,%.4f,%.4f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.4f,%.2f,%s%n",
+                profile,
+                slices,
+                workers,
+                perTick(groups.groups(), slices),
+                perTick(groups.emptyGroups(), slices),
+                perTick(groups.idleGroups(), slices),
+                meanTickers,
+                groups.maxTickers(),
+                coefficientOfVariation(groups.tickers(), groups.tickersSquared(), groups.groups()),
+                meanGroupNanos / 1_000_000.0,
+                groups.latency().percentileNanos(0.50) / 1_000_000.0,
+                groups.latency().percentileNanos(0.95) / 1_000_000.0,
+                groups.latency().percentileNanos(0.99) / 1_000_000.0,
+                groups.maxNanos() / 1_000_000.0,
+                coefficientOfVariation(groups.nanos(), groups.nanosSquared(), groups.groups()),
+                millisPerSlice(groups.nanos(), slices),
+                millisPerSlice(groups.nanos() - groups.stalledNanos(), slices),
+                millisPerSlice(groups.tickerNanos(), slices),
+                millisPerSlice(groups.nanos() - groups.tickerNanos(), slices),
+                groups.tickerCount() <= 0L ? -1.0 : groups.tickerNanos() / (double) groups.tickerCount() / 1_000.0,
+                workerBusyMin / 1_000_000.0,
+                workerBusyMean / 1_000_000.0,
+                workerBusyMax / 1_000_000.0,
+                spread(groups.workers(), slices),
+                ratio(groups.maxNanos(), meanGroupNanos * workers),
+                ratio(groups.nanos(), (double) Math.max(workers, 1) * attribution.awaitNanos()),
+                perTick(attribution.awaitPolls(), slices),
+                attribution.awaitPolls() <= 0L ? -1.0 : attribution.awaitNanos() / (double) attribution.awaitPolls(),
+                ratio(attribution.awaitCpuNanos(), (double) attribution.awaitNanos()),
+                millisPerSlice(attribution.batchMakespanNanos(), slices),
+                millisPerSlice(attribution.awaitNanos() - attribution.batchMakespanNanos(), slices),
+                ratio(attribution.batchMakespanNanos(), (double) slices * meanGroupNanos * workers),
+                millisPerSlice(attribution.batchSubmitNanos(), slices),
+                millisPerSlice(attribution.batchDispatchNanos(), slices),
+                millisPerSlice(attribution.batchSpanNanos(), slices),
+                millisPerSlice(attribution.batchTailNanos(), slices),
+                millisPerSlice(groups.cpuNanos(), slices),
+                ratio(groups.cpuNanos(), (double) groups.nanos()),
+                millisPerSlice(groups.retireNanos(), slices),
+                perTick(groups.stalledGroups(), slices),
+                perWorkerBusy(groups.workers(), slices));
+        System.out.println("SERVER_BENCH_HOPPER_HANDOFF_HEADER profile,slices,handoffMs,removalMs,removalsPerTick,fallbackMs,fallbackTickersPerTick,mutationMs,mutationsPerTick,finishMs,otherMs");
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_HANDOFF %s,%d,%.4f,%.4f,%.2f,%.4f,%.2f,%.4f,%.2f,%.4f,%.4f%n",
+                profile,
+                slices,
+                millisPerSlice(attribution.handoffNanos(), slices),
+                millisPerSlice(handoff.removalNanos(), slices),
+                perTick(handoff.removalCount(), slices),
+                millisPerSlice(handoff.fallbackNanos(), slices),
+                perTick(handoff.fallbackTickers(), slices),
+                millisPerSlice(handoff.mutationNanos(), slices),
+                perTick(handoff.mutationCount(), slices),
+                millisPerSlice(handoff.finishNanos(), slices),
+                millisPerSlice(attribution.handoffNanos() - handoff.removalNanos() - handoff.fallbackNanos() - handoff.mutationNanos() - handoff.finishNanos(), slices));
+        System.out.println("SERVER_BENCH_HOPPER_FALLBACK_HEADER profile,slices,unsafeRegionTickersPerTick,unresolvableRegionTickersPerTick,staleSnapshotTickersPerTick,staleAdmissionTickersPerTick,chunkUnavailableTickersPerTick,totalTickersPerTick");
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_FALLBACK %s,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f%n",
+                profile,
+                slices,
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION), slices),
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.UNRESOLVABLE_REGION), slices),
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_SNAPSHOT), slices),
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_ADMISSION), slices),
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE), slices),
+                perTick(attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION)
+                        + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.UNRESOLVABLE_REGION)
+                        + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_SNAPSHOT)
+                        + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_ADMISSION)
+                        + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE), slices));
+        printHopperRegionSpread(diagnostics);
+    }
+
+    /**
+     * Prints the mean region MSPT of the window and its spread, so a workload whose regions carry uneven load is
+     * visible in one line.
+     */
+    private static void printHopperRegionSpread(Optional<RegionThreadingDiagnostics> diagnostics) {
+        diagnostics.ifPresent(current -> {
+            final List<RegionTickSnapshot> regions = current.regionTicks().stream().filter(RegionTickSnapshot::hasSamples).toList();
+            final double mean = regions.stream().mapToDouble(RegionTickSnapshot::msptAvg).average().orElse(0.0);
+            final double max = regions.stream().mapToDouble(RegionTickSnapshot::msptAvg).max().orElse(0.0);
+            final double variance = regions.stream().mapToDouble(region -> Math.pow(region.msptAvg() - mean, 2)).average().orElse(0.0);
+            System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_REGIONS %s,%d,%.4f,%.4f,%.3f,%d%n",
+                    profileName(diagnostics),
+                    regions.size(),
+                    mean,
+                    max,
+                    mean <= 0.0 ? -1.0 : Math.sqrt(variance) / mean,
+                    current.regionMetrics().regionsBehind());
+        });
+    }
+
+    /** {@return {@code count} per measured tick, or {@code -1} when the window recorded no slice} */
+    private static double perTick(long count, long slices) {
+        return slices <= 0L ? -1.0 : count / (double) slices;
+    }
+
+    /** {@return {@code total / count}, or zero when nothing was counted} */
+    private static double mean(long total, long count) {
+        return count <= 0L ? 0.0 : total / (double) count;
+    }
+
+    /** {@return {@code numerator / denominator}, or {@code -1} when the denominator is not positive} */
+    private static double ratio(long numerator, double denominator) {
+        return denominator <= 0.0 ? -1.0 : numerator / denominator;
+    }
+
+    /**
+     * {@return the coefficient of variation of a distribution whose count, sum and squared sum are known, or
+     * {@code -1} when the mean is not positive}
+     */
+    private static double coefficientOfVariation(long sum, double squaredSum, long count) {
+        final double mean = mean(sum, count);
+        if (mean <= 0.0) {
+            return -1.0;
+        }
+        return Math.sqrt(Math.max(squaredSum / count - mean * mean, 0.0)) / mean;
+    }
+
+    /**
+     * {@return the coefficient of variation of the per-tick busy time of the worker threads, or {@code -1} when
+     * no worker ran a group}
+     */
+    private static double spread(List<RegionBlockEntityTickAttribution.WorkerLoad> workers, long slices) {
+        if (workers.isEmpty() || slices <= 0L) {
+            return -1.0;
+        }
+        final double mean = workers.stream().mapToDouble(worker -> worker.nanos() / (double) slices).average().orElse(0.0);
+        if (mean <= 0.0) {
+            return -1.0;
+        }
+        final double variance = workers.stream().mapToDouble(worker -> Math.pow(worker.nanos() / (double) slices - mean, 2)).average().orElse(0.0);
+        return Math.sqrt(variance) / mean;
+    }
+
+    /** {@return the per-tick group wall time of every worker thread that ran a group} */
+    private static String perWorkerBusy(List<RegionBlockEntityTickAttribution.WorkerLoad> workers, long slices) {
+        final StringBuilder busy = new StringBuilder();
+        for (final RegionBlockEntityTickAttribution.WorkerLoad worker : workers) {
+            if (busy.length() > 0) {
+                busy.append(';');
+            }
+            busy.append(worker.thread()).append('=').append(String.format(Locale.ROOT, "%.4f", perTick(worker.nanos(), slices) / 1_000_000.0));
+        }
+        return busy.length() == 0 ? "none" : busy.toString();
     }
 
     private static void reportEntities(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, EntityChurn churn, int chunks) {

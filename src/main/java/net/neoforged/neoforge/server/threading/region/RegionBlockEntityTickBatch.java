@@ -58,6 +58,19 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
      * removal of an entity they own and let the barrier run its level callback on the server thread.
      */
     private final RegionDeferredEntityRemovals deferredRemovals = new RegionDeferredEntityRemovals(this);
+    /**
+     * Slowest group of this batch. The server thread waits for the whole batch, so the slowest group is the
+     * part of the wait the workers caused; the difference to the wait is dispatch and completion. It is only
+     * written while the opt-in attribution of the slice is enabled.
+     */
+    private final java.util.concurrent.atomic.AtomicLong slowestGroupNanos = new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * First group start and last group end of this batch, so the server-thread wait splits into the time until
+     * the first worker picked up work, the span the workers ran in and the time until the wait noticed that the
+     * last group finished. Only written while the opt-in attribution of the slice is enabled.
+     */
+    private final java.util.concurrent.atomic.AtomicLong firstGroupStartNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong lastGroupEndNanos = new java.util.concurrent.atomic.AtomicLong();
 
     RegionBlockEntityTickBatch(ServerLevel level) {
         super(level);
@@ -102,6 +115,42 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
 
     Collection<RegionBlockEntityTickAdmission> fallbackTickers() {
         return this.fallbackTickers;
+    }
+
+    /**
+     * Records the wall time of one finished group, keeping the slowest one.
+     */
+    void recordGroupDuration(long durationNanos) {
+        this.slowestGroupNanos.accumulateAndGet(durationNanos, Math::max);
+    }
+
+    /** {@return the wall time of the slowest group of this batch, or zero when no group reported one} */
+    long slowestGroupNanos() {
+        return this.slowestGroupNanos.get();
+    }
+
+    /**
+     * Records the start of one group of this batch, keeping the first one.
+     */
+    void recordGroupStart(long startNanos) {
+        this.firstGroupStartNanos.compareAndSet(0L, startNanos);
+    }
+
+    /**
+     * Records the end of one group of this batch, keeping the last one.
+     */
+    void recordGroupEnd(long endNanos) {
+        this.lastGroupEndNanos.accumulateAndGet(endNanos, Math::max);
+    }
+
+    /** {@return the start of the first group of this batch, or zero when no group reported one} */
+    long firstGroupStartNanos() {
+        return this.firstGroupStartNanos.get();
+    }
+
+    /** {@return the end of the last group of this batch, or zero when no group reported one} */
+    long lastGroupEndNanos() {
+        return this.lastGroupEndNanos.get();
     }
 
     boolean leases(RegionState region) {
