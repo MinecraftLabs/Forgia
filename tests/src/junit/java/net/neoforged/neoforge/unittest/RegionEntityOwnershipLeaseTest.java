@@ -34,6 +34,11 @@ import org.junit.jupiter.api.Test;
  */
 class RegionEntityOwnershipLeaseTest {
     private static final String REGION_PACKAGE = "net.neoforged.neoforge.server.threading.region.";
+    /**
+     * Entries the batch reserves for the deferred block updates. The seams under test defer no block write, so
+     * the production bound is used.
+     */
+    private static final int DEFERRED_BLOCK_UPDATE_ENTRIES = 1 << 16;
     private static final String SET_POS_RAW = "Entity.setPosRaw";
     /**
      * Operation the lease-membership tests probe with.
@@ -194,9 +199,9 @@ class RegionEntityOwnershipLeaseTest {
     private RegionEntityOwnershipScope openLease(Entity... members) throws ReflectiveOperationException {
         final RegionCoordinate coordinate = new RegionCoordinate(this.level, 0, 0);
         final Class<?> batchClass = Class.forName(REGION_PACKAGE + "RegionEntityTickBatch");
-        final Constructor<?> batchConstructor = batchClass.getDeclaredConstructor(ServerLevel.class);
+        final Constructor<?> batchConstructor = batchClass.getDeclaredConstructor(ServerLevel.class, int.class);
         batchConstructor.setAccessible(true);
-        final Object batch = batchConstructor.newInstance(this.level);
+        final Object batch = batchConstructor.newInstance(this.level, DEFERRED_BLOCK_UPDATE_ENTRIES);
 
         final Class<?> regionClass = Class.forName(REGION_PACKAGE + "RegionState");
         final Constructor<?> regionConstructor = regionClass.getDeclaredConstructor(RegionCoordinate.class);

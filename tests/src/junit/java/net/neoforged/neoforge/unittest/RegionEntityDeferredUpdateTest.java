@@ -39,6 +39,11 @@ import org.junit.jupiter.api.Timeout;
 @Timeout(120)
 class RegionEntityDeferredUpdateTest {
     private static final String ENTITY_BATCH_TYPE = "net.neoforged.neoforge.server.threading.region.RegionEntityTickBatch";
+    /**
+     * Entries the batch reserves for the deferred block updates. The seams under test defer no block write, so
+     * the production bound is used.
+     */
+    private static final int DEFERRED_BLOCK_UPDATE_ENTRIES = 1 << 16;
 
     private static final Method DEFER_ENTITY_UPDATE;
     private static final Method DRAIN_DEFERRED_UPDATES;
@@ -162,9 +167,9 @@ class RegionEntityDeferredUpdateTest {
     }
 
     private static Object newBatch() throws ReflectiveOperationException {
-        final Constructor<?> constructor = Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class);
+        final Constructor<?> constructor = Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class, int.class);
         constructor.setAccessible(true);
-        return constructor.newInstance(mock(ServerLevel.class));
+        return constructor.newInstance(mock(ServerLevel.class), DEFERRED_BLOCK_UPDATE_ENTRIES);
     }
 
     private static List<Entity> entities(int count) {

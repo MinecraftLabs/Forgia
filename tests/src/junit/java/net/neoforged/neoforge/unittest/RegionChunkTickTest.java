@@ -686,32 +686,26 @@ class RegionChunkTickTest {
     void fallbackChunkDrawsTheSamePositionsAsAWorkerChunk() throws InterruptedException {
         final List<BlockPos> onTheWorker = this.runInteriorChunkTick();
 
+        // Force the refusal deterministically with the deferred-update budget: the first chunk takes the only
+        // reservation, so the chunk under test is refused before its body and ticks inline with the same
+        // per-chunk random source. Holding a synthetic lease on the region instead raced with the plan's own
+        // lease attempt and made this test flaky.
         this.installEngine(true);
+        this.engine.setChunkTickDeferredUpdateBudget(1);
         final TickRecorder recorder = new TickRecorder();
         final ServerLevel level = mockLevel();
+        final LevelChunk first = chunk(OTHER_INTERIOR_CHUNK, new TickRecorder());
         final LevelChunk chunk = chunk(INTERIOR_CHUNK, recorder);
         final RegionChunkTickPlan plan = this.beginPlan(level);
-        // A lease of the chunk's region held by another thread makes the region unleased for the batch, so the
-        // chunk falls back to the server thread.
-        final CountDownLatch leased = new CountDownLatch(1);
-        final CountDownLatch release = new CountDownLatch(1);
-        final Thread leaseHolder = new Thread(() -> RegionThreadingHooks.runBlockTickTask(level, new BlockPos(20, 64, 20), () -> {
-            leased.countDown();
-            awaitOrFail(release, "the lease was never released");
-        }), "chunk-tick-lease-holder");
-        leaseHolder.start();
-        assertTrue(leased.await(10, TimeUnit.SECONDS), "the target region lease was never acquired");
-        try {
-            plan.accept(chunk);
-            plan.executeAndAwait(PARKING_BARRIER);
-        } finally {
-            release.countDown();
-            leaseHolder.join(10_000L);
-        }
+        plan.accept(first);
+        plan.accept(chunk);
+        plan.executeAndAwait(PARKING_BARRIER);
 
-        assertEquals(1L, this.engine.diagnostics().unleasedChunkTicks());
-        assertEquals(0L, this.engine.diagnostics().chunkTicksOnWorkers());
+        assertEquals(1L, this.engine.diagnostics().deferredUpdateBudgetChunkTicks(),
+                "the chunk under test has to be refused by the reservation, not dispatched");
         assertEquals(onTheWorker, recorder.positions(), "a fallback chunk has to draw the same positions as a worker chunk");
+        assertTrue(recorder.threads().stream().allMatch(name -> name.equals(Thread.currentThread().getName())),
+                () -> "the refused chunk has to tick on the server thread: " + recorder.threads());
     }
 
     @Test
@@ -937,6 +931,10 @@ class RegionChunkTickTest {
 
         List<BlockPos> positions() {
             return this.ticks.stream().map(Tick::pos).sorted(Comparator.comparing(BlockPos::asLong)).toList();
+        }
+
+        List<String> threads() {
+            return this.ticks.stream().map(Tick::thread).distinct().toList();
         }
     }
 

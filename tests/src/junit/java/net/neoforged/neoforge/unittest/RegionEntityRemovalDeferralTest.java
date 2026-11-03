@@ -88,6 +88,11 @@ import org.junit.jupiter.api.Timeout;
 class RegionEntityRemovalDeferralTest {
     private static final String REGION_PACKAGE = "net.neoforged.neoforge.server.threading.region.";
     private static final String ENTITY_BATCH_TYPE = REGION_PACKAGE + "RegionEntityTickBatch";
+    /**
+     * Entries the batch reserves for the deferred block updates. The seams under test defer no block write, so
+     * the production bound is used.
+     */
+    private static final int DEFERRED_BLOCK_UPDATE_ENTRIES = 1 << 16;
     private static final RegionTickBarrier PARKING_BARRIER = condition -> {
         while (!condition.getAsBoolean()) {
             LockSupport.parkNanos(100_000L);
@@ -532,9 +537,9 @@ class RegionEntityRemovalDeferralTest {
     }
 
     private static Object newEntityBatch(ServerLevel level) throws ReflectiveOperationException {
-        final Constructor<?> constructor = Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class);
+        final Constructor<?> constructor = Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class, int.class);
         constructor.setAccessible(true);
-        return constructor.newInstance(level);
+        return constructor.newInstance(level, DEFERRED_BLOCK_UPDATE_ENTRIES);
     }
 
     /**

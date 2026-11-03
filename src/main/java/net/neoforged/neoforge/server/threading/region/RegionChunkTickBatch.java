@@ -41,7 +41,8 @@ import org.jetbrains.annotations.ApiStatus;
  * may not resolve (the strike target comes from the POI manager and from entity storage, and it can be in
  * another region) and the light rechecks and block update publications of the block writes a worker performed
  * (the light engine and the block update publication are one structure per level, not one per region). All of
- * them are applied by the publishing server thread after the barrier.
+ * them are applied by the publishing server thread after the barrier, and the light rechecks and block updates
+ * of a write go through the deferred queue every region batch shares, in recording order.
  */
 @ApiStatus.Internal
 final class RegionChunkTickBatch extends RegionTickBatch {
@@ -69,15 +70,9 @@ final class RegionChunkTickBatch extends RegionTickBatch {
      * barrier.
      */
     private final Queue<BlockPos> lightningStrikes = new ConcurrentLinkedQueue<>();
-    /**
-     * The light rechecks and block update publications of the block writes the workers performed. The light
-     * engine and the block update publication of a level are level-wide, not partitioned per region, so a worker
-     * records them and the server thread applies them after the barrier, in recording order.
-     */
-    private final RegionDeferredChunkTickUpdates chunkTickUpdates = new RegionDeferredChunkTickUpdates();
 
-    RegionChunkTickBatch(ServerLevel level, int randomTickSpeed) {
-        super(level);
+    RegionChunkTickBatch(ServerLevel level, int randomTickSpeed, int blockUpdateEntryBudget) {
+        super(level, RegionTickSlice.CHUNK_TICK, blockUpdateEntryBudget);
         this.randomTickSpeed = randomTickSpeed;
     }
 
@@ -131,13 +126,6 @@ final class RegionChunkTickBatch extends RegionTickBatch {
     /** {@return the lightning strikes the workers rolled, in the order they were rolled} */
     Queue<BlockPos> lightningStrikes() {
         return this.lightningStrikes;
-    }
-
-    /**
-     * {@return the light rechecks and block updates the worker groups of this batch deferred, in recording order}
-     */
-    RegionDeferredChunkTickUpdates chunkTickUpdates() {
-        return this.chunkTickUpdates;
     }
 
     /**

@@ -70,7 +70,7 @@ public final class RegionChunkTickPlan {
             // A chunk collected after the batch ran belongs to a chunk the server thread deferred to a later
             // region drain. Tick it inline like a fallback chunk instead of dropping it.
             this.engine.countLateChunkTick();
-            this.level.tickChunk(chunk, this.randomTickSpeed);
+            this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;
         }
         final ChunkPos chunkPos = chunk.getPos();
@@ -78,14 +78,14 @@ public final class RegionChunkTickPlan {
             // A random tick of a boundary chunk can write into the neighboring region, so the chunk keeps the
             // server-thread body: the one-chunk bound of the interior rule is what makes a worker write safe.
             this.engine.countBoundaryChunkTick();
-            this.level.tickChunk(chunk, this.randomTickSpeed);
+            this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;
         }
         if (!this.engine.isChunkTickNeighborhoodLoaded(this.level, chunkPos)) {
             // A random tick that reaches a neighboring chunk would have to load it, and a worker may not load
             // a chunk. The chunk therefore keeps the server-thread body.
             this.engine.countUnloadedNeighborhoodChunkTick();
-            this.level.tickChunk(chunk, this.randomTickSpeed);
+            this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;
         }
         if (this.chunks.size() >= this.engine.chunkTickDeferredUpdateBudget()) {
@@ -94,7 +94,7 @@ public final class RegionChunkTickPlan {
             // that space per chunk before the body starts: a chunk that does not fit keeps the server-thread
             // body, where its writes need no deferred record at all.
             this.engine.countDeferredUpdateBudgetChunkTick();
-            this.level.tickChunk(chunk, this.randomTickSpeed);
+            this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;
         }
         this.chunks.add(RegionChunkTickEntry.of(chunk));

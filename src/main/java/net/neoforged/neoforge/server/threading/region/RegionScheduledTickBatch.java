@@ -31,6 +31,10 @@ import org.jetbrains.annotations.Nullable;
  * Every group owns its own {@link RandomSource}, derived from one server-thread seed source per batch.
  * A worker therefore never draws from the shared level random, and the sequence a region observes only
  * depends on the region order of this batch.
+ * <p>
+ * A scheduled tick that writes a block records the light recheck and the block update publication of the write
+ * in the deferred queue every region batch shares, and the ticks beyond the deferred block-update bound are
+ * executed on the server thread after the batch instead of on a worker.
  */
 @ApiStatus.Internal
 final class RegionScheduledTickBatch<T> extends RegionTickBatch {
@@ -42,8 +46,8 @@ final class RegionScheduledTickBatch<T> extends RegionTickBatch {
     @Nullable
     private RandomSource seedSource;
 
-    RegionScheduledTickBatch(ServerLevel level, ScheduledTickPhase phase) {
-        super(level);
+    RegionScheduledTickBatch(ServerLevel level, ScheduledTickPhase phase, int blockUpdateEntryBudget) {
+        super(level, RegionTickSlice.SCHEDULED_TICK, blockUpdateEntryBudget);
         this.phase = phase;
     }
 

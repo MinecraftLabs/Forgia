@@ -39,6 +39,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.ticks.LevelTicks;
 import net.minecraft.world.ticks.ScheduledTick;
 import net.neoforged.neoforge.entity.PartEntity;
@@ -225,10 +226,18 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong unleasedChunkTicks = new AtomicLong();
     /** Lightning strikes a chunk tick worker rolled and the server thread resolved at the barrier. */
     private final AtomicLong chunkTickLightningStrikes = new AtomicLong();
-    /** Light rechecks and block update publications a chunk tick worker deferred and the barrier applied. */
-    private final AtomicLong deferredChunkTickUpdatesApplied = new AtomicLong();
-    /** Deferred light rechecks and block updates that were never applied because their level closed. */
-    private final AtomicLong droppedDeferredChunkTickUpdates = new AtomicLong();
+    /**
+     * Deferred light rechecks and block update publications the barrier of each slice applied, indexed by
+     * {@link RegionTickSlice#ordinal()}.
+     */
+    private final AtomicLong[] appliedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
+    /** Deferred light rechecks and block updates of each slice that were never applied, indexed by slice. */
+    private final AtomicLong[] droppedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
+    /**
+     * Units of each slice that were refused before their body because the deferred block-update budget of their
+     * batch was exhausted, indexed by slice.
+     */
+    private final AtomicLong[] refusedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
     /**
      * Chunks the plan kept on the server thread because the deferred update budget of the batch was exhausted,
      * so their block writes would have had nowhere to be recorded.
@@ -334,19 +343,12 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final ThreadLocal<Queue<BlockPos>> currentChunkTickLightning = new ThreadLocal<>();
     /**
-     * The light rechecks and block update publications the chunk tick of the current thread has to defer.
-     * <p>
-     * Only set inside a worker group, so the level defers there and applies the effect inline on the server
-     * thread. The queue belongs to the batch, so the barrier of the batch that recorded an effect is the one that
-     * applies it.
+     * Entries one region tick batch may reserve for the units it admits to its deferred block updates.
+     * Production keeps {@link RegionDeferredBlockUpdates#MAX_ENTRIES}, which is the bound every slice derives its
+     * admission count from ({@link RegionTickSlice#reservationPerUnit()}); the mechanics tests lower it to
+     * observe the refusal without admitting thousands of units.
      */
-    private final ThreadLocal<RegionDeferredChunkTickUpdates> currentChunkTickUpdates = new ThreadLocal<>();
-    /**
-     * Number of chunks one chunk tick batch may admit to its deferred update budget. Production keeps
-     * {@link RegionDeferredChunkTickUpdates#MAX_CHUNKS_PER_BATCH}; the mechanics tests lower it to observe the
-     * refusal without admitting that many chunks.
-     */
-    private volatile int chunkTickDeferredUpdateBudget = RegionDeferredChunkTickUpdates.MAX_CHUNKS_PER_BATCH;
+    private volatile int deferredBlockUpdateBudget = RegionDeferredBlockUpdates.MAX_ENTRIES;
     private final Set<RegionTickBatch> activeTickBatches = ConcurrentHashMap.newKeySet();
     /**
      * Pending and terminal decisions of the recorded cross-region entity transfer transaction. The
@@ -1043,7 +1045,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
 
-        final RegionEntityTickBatch batch = new RegionEntityTickBatch(level);
+        final RegionEntityTickBatch batch = new RegionEntityTickBatch(level, this.deferredBlockUpdateBudget);
         // The chunk-load answers are shared by every region of the pass and by every following pass of the
         // same loaded chunk generation, so the level's loaded chunks are asked once instead of once per
         // neighborhood.
@@ -1133,6 +1135,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityRemovals(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityAdditions(batch));
+                // The light rechecks and block updates of the blocks the workers wrote are the level-wide effects
+                // of their tick, so they run before the server-thread fallback ticks of this batch observe the
+                // written state.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.tickSelfDrivenFallbacks(batch));
                 failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
                 final long publicationStart = attribution ? System.nanoTime() : 0L;
@@ -1199,6 +1205,11 @@ public final class RegionThreadingEngine implements RegionThreading {
             // The chunk source refused a chunk the worker tick needed; the tick it abandoned is completed
             // here, exactly like the fallback of the per-entity plan.
             this.tickEntityInline(level, entity);
+        }
+        for (final Entity entity : batch.deferredUpdateFallbackEntities()) {
+            // The batch could not reserve the block-write effects of the tick, so the worker never started it;
+            // the whole vanilla body runs here, like for an entity whose region could not be enumerated.
+            this.tickEntityServerSide(level, entity);
         }
         for (final Entity entity : batch.selfDrivenFallbackEntities()) {
             this.tickEntityServerSide(level, entity);
@@ -1551,15 +1562,15 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Records the light section status change of one block write of a chunk tick worker for the batch barrier.
+     * Records the light section status change of one block write of a region worker group for the batch barrier.
      *
      * @param pos   the written position, already immutable
      * @param empty whether the section of the position holds only air now
      * @return {@code true} when the change was recorded, {@code false} on a thread that has to call the light
      *         engine itself
      */
-    public boolean deferChunkTickLightSectionStatus(BlockPos pos, boolean empty) {
-        final RegionDeferredChunkTickUpdates updates = this.currentChunkTickUpdates.get();
+    public boolean deferLightSectionStatus(BlockPos pos, boolean empty) {
+        final RegionDeferredBlockUpdates updates = RegionTickBatch.currentBlockUpdates();
         if (updates == null) {
             return false;
         }
@@ -1568,14 +1579,14 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Records the light recheck of one block write of a chunk tick worker for the batch barrier.
+     * Records the light recheck of one block write of a region worker group for the batch barrier.
      *
      * @param pos the written position, already immutable
      * @return {@code true} when the recheck was recorded, {@code false} on a thread that has to call the light
      *         engine itself
      */
-    public boolean deferChunkTickLightCheck(BlockPos pos) {
-        final RegionDeferredChunkTickUpdates updates = this.currentChunkTickUpdates.get();
+    public boolean deferLightCheck(BlockPos pos) {
+        final RegionDeferredBlockUpdates updates = RegionTickBatch.currentBlockUpdates();
         if (updates == null) {
             return false;
         }
@@ -1584,13 +1595,13 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Records the block update publication of one block write of a chunk tick worker for the batch barrier.
+     * Records the block update publication of one block write of a region worker group for the batch barrier.
      *
      * @return {@code true} when the publication was recorded, {@code false} on a thread that has to publish it
      *         itself
      */
-    public boolean deferChunkTickBlockUpdate(BlockPos pos, BlockState oldState, BlockState newState, int flags) {
-        final RegionDeferredChunkTickUpdates updates = this.currentChunkTickUpdates.get();
+    public boolean deferBlockUpdate(BlockPos pos, BlockState oldState, BlockState newState, int flags) {
+        final RegionDeferredBlockUpdates updates = RegionTickBatch.currentBlockUpdates();
         if (updates == null) {
             return false;
         }
@@ -1599,15 +1610,36 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * {@return the entries one region tick batch may reserve for its deferred block updates}
+     */
+    int deferredBlockUpdateBudget() {
+        return this.deferredBlockUpdateBudget;
+    }
+
+    /**
      * {@return the number of chunks one chunk tick batch may admit to its deferred update budget}
      */
     int chunkTickDeferredUpdateBudget() {
-        return this.chunkTickDeferredUpdateBudget;
+        return this.deferredBlockUpdateBudget / RegionTickSlice.CHUNK_TICK.reservationPerUnit();
+    }
+
+    /**
+     * Lowers the deferred block-update budget, so a mechanics test can observe the refusal without admitting
+     * {@link RegionDeferredBlockUpdates#MAX_ENTRIES} entries.
+     *
+     * @param maxEntries the entries one batch may reserve; must be positive
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    public void setDeferredBlockUpdateBudget(int maxEntries) {
+        if (maxEntries <= 0) {
+            throw new IllegalArgumentException("The deferred block-update budget has to admit at least one entry: " + maxEntries);
+        }
+        this.deferredBlockUpdateBudget = maxEntries;
     }
 
     /**
      * Lowers the deferred update budget of the chunk tick batch, so a mechanics test can observe the refusal
-     * without admitting {@link RegionDeferredChunkTickUpdates#MAX_CHUNKS_PER_BATCH} chunks.
+     * without admitting thousands of chunks.
      *
      * @param maxChunks the number of chunks one batch may admit; must be positive
      */
@@ -1616,7 +1648,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (maxChunks <= 0) {
             throw new IllegalArgumentException("The deferred update budget has to admit at least one chunk: " + maxChunks);
         }
-        this.chunkTickDeferredUpdateBudget = maxChunks;
+        this.deferredBlockUpdateBudget = maxChunks * RegionTickSlice.CHUNK_TICK.reservationPerUnit();
     }
 
     /**
@@ -1804,7 +1836,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
 
-        final RegionEntityTickBatch batch = new RegionEntityTickBatch(level);
+        final RegionEntityTickBatch batch = new RegionEntityTickBatch(level, this.deferredBlockUpdateBudget);
         final List<Entity> pending = new ArrayList<>(accepted.size());
         for (final Entity entity : accepted) {
             if (entity.isRemoved() || entity.level() != level) {
@@ -1887,6 +1919,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // server-thread ticks of the same batch, and before the ownership publication, so the
                 // handoff tracks the new entity.
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityAdditions(batch));
+                // The light rechecks and block updates of the blocks the workers wrote are the level-wide effects
+                // of their tick, so they run before the server-thread fallback ticks of this batch observe the
+                // written state.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
                 failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
                 // The ownership publication is timed on its own inside the handoff, so the cost of the
@@ -2144,6 +2180,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                     try {
                         this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
                             for (final Entity entity : entities) {
+                                if (!group.batch().tryReserveBlockUpdates()) {
+                                    // The batch cannot reserve the block-write effects of this entity's tick, so
+                                    // the tick is refused before its body starts and runs on the server thread
+                                    // after the batch, where its writes need no record.
+                                    group.batch().addDeferredUpdateFallback(entity);
+                                    this.countRefusedDeferredBlockUpdate(RegionTickSlice.ENTITY_TICK);
+                                    continue;
+                                }
                                 if (failureObserver == null) {
                                     try {
                                         if (tickOwnedEntity(level, entity)) {
@@ -2242,6 +2286,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                     try {
                         this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
                             for (final Entity entity : tickable) {
+                                if (!group.batch().tryReserveBlockUpdates()) {
+                                    // The batch cannot reserve the block-write effects of this entity's tick, so
+                                    // the tick is refused before its body starts and runs on the server thread
+                                    // after the batch, where its writes need no record.
+                                    group.batch().addDeferredUpdateFallback(entity);
+                                    this.countRefusedDeferredBlockUpdate(RegionTickSlice.ENTITY_TICK);
+                                    continue;
+                                }
                                 if (failureObserver == null) {
                                     try {
                                         if (tickSelfDrivenEntity(level, entity, activation, group)) {
@@ -2422,8 +2474,9 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Ticks the entities whose region could not be leased safely, and the entities a worker handed back
-     * after a refused chunk request, on the server thread after the batch.
+     * Ticks the entities whose region could not be leased safely, the entities a worker handed back after a
+     * refused chunk request and the entities a worker refused before their body because of the deferred
+     * block-update bound, on the server thread after the batch.
      */
     private void tickFallbackEntities(RegionEntityTickBatch batch) {
         final ServerLevel level = batch.level();
@@ -2431,6 +2484,9 @@ public final class RegionThreadingEngine implements RegionThreading {
             this.tickEntityInline(level, entity);
         }
         for (final Entity entity : batch.chunkFallbackEntities()) {
+            this.tickEntityInline(level, entity);
+        }
+        for (final Entity entity : batch.deferredUpdateFallbackEntities()) {
             this.tickEntityInline(level, entity);
         }
     }
@@ -2493,7 +2549,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
 
-        final RegionBlockEntityTickBatch batch = new RegionBlockEntityTickBatch(level);
+        final RegionBlockEntityTickBatch batch = new RegionBlockEntityTickBatch(level, this.deferredBlockUpdateBudget);
         final TickBatchPublication publication = this.publishTickBatch(batch, level);
         if (publication == TickBatchPublication.LEVEL_CLOSED) {
             // The level clear completed after this snapshot was collected. Its region state is retired
@@ -2560,6 +2616,11 @@ public final class RegionThreadingEngine implements RegionThreading {
         } finally {
             final long handoffStart = attribution ? System.nanoTime() : 0L;
             try {
+                // The light rechecks and block updates of the blocks the tickers wrote are the level-wide effects
+                // of their ticker body, and that body runs before the removal of an item a hopper absorbed, so
+                // they run first. They are not one of the timed handoff steps: the step timers below split the
+                // removal, fallback and mutation work, and this segment is the vanilla publication of the batch.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
                 // Every handoff step is timed on its own when the attribution is enabled, so the deferred
                 // work of a batch is attributable per step instead of as one block.
                 final long removalStart = attribution ? System.nanoTime() : 0L;
@@ -2737,6 +2798,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     continue;
                                 }
                                 if (RegionWorkerScope.isNativeWorkerThread()) {
+                                    if (!group.batch().tryReserveBlockUpdates()) {
+                                        // The batch cannot reserve the block-write effects of this ticker, so
+                                        // the tick is refused before its body starts and runs on the server
+                                        // thread after the batch, where its writes need no record.
+                                        group.batch().addFallback(admission);
+                                        this.fallbackBlockEntityTicks.incrementAndGet();
+                                        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.DEFERRED_UPDATE_BUDGET, 1);
+                                        this.countRefusedDeferredBlockUpdate(RegionTickSlice.BLOCK_ENTITY_TICK);
+                                        continue;
+                                    }
                                     final long tickerStart = tickerTiming ? System.nanoTime() : 0L;
                                     try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
                                         ticker.tick();
@@ -2902,7 +2973,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
 
-        final RegionScheduledTickBatch<T> batch = new RegionScheduledTickBatch<>(level, phase);
+        final RegionScheduledTickBatch<T> batch = new RegionScheduledTickBatch<>(level, phase, this.deferredBlockUpdateBudget);
         final TickBatchPublication publication = this.publishTickBatch(batch, level);
         if (publication == TickBatchPublication.LEVEL_CLOSED) {
             // The level clear completed after this snapshot was collected. Its region state is retired and
@@ -2922,10 +2993,20 @@ public final class RegionThreadingEngine implements RegionThreading {
         // This thread owns the batch until it finished; a shutdown or unload requested from inside it
         // (fallback work included) cannot wait for a batch that only this thread can complete.
         batch.markExecutingOnCurrentThread();
+        // A scheduled callback that writes a block records its light recheck and block update for the barrier, so
+        // the batch admits a bounded number of ticks. The ticks beyond the bound run on the server thread after the
+        // workers finished, where their writes need no record.
+        final int admittedTickCount = Math.min(ticks.size(),
+                this.deferredBlockUpdateBudget / RegionTickSlice.SCHEDULED_TICK.reservationPerUnit());
+        final List<ScheduledTick<T>> admittedTicks = admittedTickCount == ticks.size() ? ticks : ticks.subList(0, admittedTickCount);
+        if (admittedTickCount < ticks.size()) {
+            batch.addFallback(ticks.subList(admittedTickCount, ticks.size()));
+            this.refusedDeferredBlockUpdates[RegionTickSlice.SCHEDULED_TICK.ordinal()].addAndGet(ticks.size() - admittedTickCount);
+        }
         Throwable failure = null;
         try {
             try {
-                this.leaseScheduledTickGroups(batch, ticks, callback, barrier);
+                this.leaseScheduledTickGroups(batch, admittedTicks, callback, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
@@ -2938,6 +3019,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
             }
         } finally {
+            // A scheduled callback that wrote a block recorded its light recheck and block update; they run before
+            // the server-thread fallback ticks of this phase observe the written state.
+            failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
             failure = runBatchCompletion(failure, () -> this.tickFallbackScheduledTicks(batch, fallbackCallback));
             failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.scheduledTickMutations()));
             batch.finish();
@@ -3118,7 +3202,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
 
-        final RegionChunkTickBatch batch = new RegionChunkTickBatch(level, randomTickSpeed);
+        final RegionChunkTickBatch batch = new RegionChunkTickBatch(level, randomTickSpeed, this.deferredBlockUpdateBudget);
         final TickBatchPublication publication = this.publishTickBatch(batch, level);
         if (publication == TickBatchPublication.LEVEL_CLOSED) {
             // The level clear completed after this collection. Its region state is retired and no batch may be
@@ -3169,7 +3253,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickSectionUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickRemovals(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickAdditions(batch));
-                failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickUpdates(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.applyChunkTickLightning(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackChunkTicks(batch));
                 failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
@@ -3297,7 +3381,6 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     this.currentChunkTickRandom.set(random);
                                     this.currentChunkTickPositionRandom.set(random);
                                     this.currentChunkTickLightning.set(group.batch().lightningStrikes());
-                                    this.currentChunkTickUpdates.set(group.batch().chunkTickUpdates());
                                     try {
                                         level.tickChunk(chunk.chunk(), randomTickSpeed);
                                         ++ticked[0];
@@ -3309,7 +3392,6 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         }
                                         this.truncatedChunkTicks.incrementAndGet();
                                     } finally {
-                                        this.currentChunkTickUpdates.remove();
                                         this.currentChunkTickLightning.remove();
                                         this.currentChunkTickPositionRandom.remove();
                                         this.currentChunkTickRandom.remove();
@@ -3359,6 +3441,25 @@ public final class RegionThreadingEngine implements RegionThreading {
      * that falls back produces the same selection as a chunk that is dispatched, and a retried chunk never
      * depends on which thread ticked it.
      */
+    /**
+     * Ticks one chunk inline on the server thread with the chunk's own random source.
+     * <p>
+     * A chunk that a plan refuses before its body has to select exactly the positions it would select on a
+     * worker, so the selection never depends on the dispatch decision or on the thread. The caller owns the
+     * refusal counter, because the reason differs per call site.
+     */
+    void tickChunkInline(ServerLevel level, LevelChunk chunk, int randomTickSpeed) {
+        final RandomSource random = RegionChunkTickEntry.of(chunk).random(level);
+        this.currentChunkTickRandom.set(random);
+        this.currentChunkTickPositionRandom.set(random);
+        try {
+            level.tickChunk(chunk, randomTickSpeed);
+        } finally {
+            this.currentChunkTickPositionRandom.remove();
+            this.currentChunkTickRandom.remove();
+        }
+    }
+
     private void tickChunkOnServerThread(ServerLevel level, RegionChunkTickEntry chunk, int randomTickSpeed) {
         if (this.regionizer.isLevelClosed(level)) {
             this.skippedChunkTicks.incrementAndGet();
@@ -3377,27 +3478,28 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Applies the light rechecks and block update publications the chunk tick workers deferred, in the order the
-     * chunk bodies recorded them.
+     * Applies the light rechecks and block update publications the worker groups of {@code batch} deferred, in the
+     * order the batch bodies recorded them, and attributes them to the slice of the batch.
      * <p>
      * Both effects are level-wide, not partitioned per region: the light engine of a level owns one set of queues
      * and one light thread, and the block update publication invalidates the level-wide path type cache and
-     * recomputes the paths of every navigating mob of the level. The workers therefore only recorded them, and
-     * this method runs the vanilla calls on the server thread, after the barrier and before the level's
-     * per-chunk broadcast.
+     * recomputes the paths of every navigating mob of the level. A worker of any slice therefore only recorded
+     * them, and this method runs the vanilla calls on the server thread, after the barrier of the batch that
+     * recorded them.
      * <p>
      * A level that closed while the batch ran drops the records instead of publishing block updates for a level
      * that no longer exists; every dropped record is counted. One failing record does not strand the ones behind
      * it, so the queue is always empty when this method returns.
      */
-    private void applyDeferredChunkTickUpdates(RegionChunkTickBatch batch) {
-        final RegionDeferredChunkTickUpdates updates = batch.chunkTickUpdates();
+    private void applyDeferredBlockUpdates(RegionTickBatch batch) {
+        final RegionDeferredBlockUpdates updates = batch.blockUpdates();
         if (updates.isEmpty()) {
             return;
         }
+        final int slice = batch.slice().ordinal();
         final ServerLevel level = batch.level();
         if (this.regionizer.isLevelClosed(level)) {
-            this.droppedDeferredChunkTickUpdates.addAndGet(updates.discard());
+            this.droppedDeferredBlockUpdates[slice].addAndGet(updates.discard());
             return;
         }
         final ServerChunkCache chunkSource = level.getChunkSource();
@@ -3405,10 +3507,10 @@ public final class RegionThreadingEngine implements RegionThreading {
         final int applied = updates.drain(update -> {
             try {
                 switch (update) {
-                    case RegionDeferredChunkTickUpdates.LightSectionStatus status -> chunkSource.getLightEngine()
+                    case RegionDeferredBlockUpdates.LightSectionStatus status -> chunkSource.getLightEngine()
                             .updateSectionStatus(status.pos(), status.empty());
-                    case RegionDeferredChunkTickUpdates.LightCheck check -> chunkSource.getLightEngine().checkBlock(check.pos());
-                    case RegionDeferredChunkTickUpdates.BlockUpdate blockUpdate -> level.sendBlockUpdated(blockUpdate.pos(),
+                    case RegionDeferredBlockUpdates.LightCheck check -> chunkSource.getLightEngine().checkBlock(check.pos());
+                    case RegionDeferredBlockUpdates.BlockUpdate blockUpdate -> level.sendBlockUpdated(blockUpdate.pos(),
                             blockUpdate.oldState(), blockUpdate.newState(), blockUpdate.flags());
                 }
             } catch (Throwable throwable) {
@@ -3419,7 +3521,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
             }
         });
-        this.deferredChunkTickUpdatesApplied.addAndGet(applied);
+        this.appliedDeferredBlockUpdates[slice].addAndGet(applied);
         if (failure[0] != null) {
             throwUnchecked(failure[0]);
         }
@@ -3497,6 +3599,41 @@ public final class RegionThreadingEngine implements RegionThreading {
     void countDeferredUpdateBudgetChunkTick() {
         this.deferredUpdateBudgetChunkTicks.incrementAndGet();
         this.fallbackChunkTicks.incrementAndGet();
+        this.countRefusedDeferredBlockUpdate(RegionTickSlice.CHUNK_TICK);
+    }
+
+    /**
+     * Counts one unit of {@code slice} that a batch refused before its body because it could not reserve the
+     * block-write effects of the unit; the unit ran on the server thread instead.
+     */
+    private void countRefusedDeferredBlockUpdate(RegionTickSlice slice) {
+        this.refusedDeferredBlockUpdates[slice.ordinal()].incrementAndGet();
+    }
+
+    /** {@return one counter per {@link RegionTickSlice}, indexed by the ordinal of the slice} */
+    private static AtomicLong[] newDeferredBlockUpdateCounters() {
+        final AtomicLong[] counters = new AtomicLong[RegionTickSlice.values().length];
+        for (int index = 0; index < counters.length; ++index) {
+            counters[index] = new AtomicLong();
+        }
+        return counters;
+    }
+
+    /** {@return a copy of {@code counters} as plain longs, indexed by the ordinal of the slice} */
+    private static long[] snapshot(AtomicLong[] counters) {
+        final long[] snapshot = new long[counters.length];
+        for (int index = 0; index < counters.length; ++index) {
+            snapshot[index] = counters[index].get();
+        }
+        return snapshot;
+    }
+
+    /** {@return the per-slice block-update counters of the diagnostics snapshot} */
+    private RegionThreadingDiagnostics.BlockUpdateCounters deferredBlockUpdateCounters() {
+        return new RegionThreadingDiagnostics.BlockUpdateCounters(
+                snapshot(this.appliedDeferredBlockUpdates),
+                snapshot(this.droppedDeferredBlockUpdates),
+                snapshot(this.refusedDeferredBlockUpdates));
     }
 
     private static void throwUnchecked(Throwable throwable) {
@@ -4996,8 +5133,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.lateChunkTicks.get(),
                 this.unleasedChunkTicks.get(),
                 this.chunkTickLightningStrikes.get(),
-                this.deferredChunkTickUpdatesApplied.get(),
-                this.droppedDeferredChunkTickUpdates.get(),
+                this.deferredBlockUpdateCounters(),
                 this.deferredUpdateBudgetChunkTicks.get(),
                 this.nonPartitionedChunkTicks.get(),
                 this.globalRegion.isRunning(),

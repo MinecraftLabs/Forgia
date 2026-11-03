@@ -50,6 +50,12 @@ import org.jetbrains.annotations.Nullable;
  * member of the graph on the server thread. The record therefore carries the whole self-and-passenger graph,
  * which is admitted whole or counted as dropped; the members the caller adds one by one (as
  * {@code addFreshEntityWithPassengers} does) are no-ops of the graph that already carries them.
+ * <p>
+ * An entity tick that writes a block - a placed block, a lit fire, a snow layer - records the light recheck and
+ * the block update publication of the write in the deferred queue every region batch shares, so the worker
+ * never drives the level-wide light engine or the level-wide block update publication. An entity whose
+ * reservation does not fit into that queue is refused before its body and ticked on the server thread after the
+ * batch.
  */
 @ApiStatus.Internal
 final class RegionEntityTickBatch extends RegionTickBatch {
@@ -64,6 +70,12 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * vanilla entity body has not run yet, so the handoff runs all of it for them.
      */
     private final List<Entity> selfDrivenFallbackEntities = Collections.synchronizedList(new ArrayList<>());
+    /**
+     * Entities a worker refused before their body because the batch could not reserve their deferred block
+     * writes. Their vanilla entity body has not run yet, so the handoff runs all of it on the server thread,
+     * where their writes need no record. The list is filled from the workers, so it is synchronized.
+     */
+    private final List<Entity> deferredUpdateFallbackEntities = Collections.synchronizedList(new ArrayList<>());
     /**
      * Entities a worker handed back after the chunk source refused a chunk it needed. They are ticked on the
      * server thread after the batch, like the entities whose region could not be leased. The list is filled
@@ -109,8 +121,8 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private final RegionDeferredEntityAdditions deferredAdditions = new RegionDeferredEntityAdditions(this);
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
-    RegionEntityTickBatch(ServerLevel level) {
-        super(level);
+    RegionEntityTickBatch(ServerLevel level, int blockUpdateEntryBudget) {
+        super(level, RegionTickSlice.ENTITY_TICK, blockUpdateEntryBudget);
     }
 
     /**
@@ -186,6 +198,23 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     List<Entity> chunkFallbackEntities() {
         synchronized (this.chunkFallbackEntities) {
             return List.copyOf(this.chunkFallbackEntities);
+        }
+    }
+
+    /**
+     * Records an entity whose tick a worker did not start because the batch could not reserve its deferred
+     * block writes; the server thread ticks it after the batch instead.
+     */
+    void addDeferredUpdateFallback(Entity entity) {
+        this.deferredUpdateFallbackEntities.add(entity);
+    }
+
+    /**
+     * Takes the entities a worker refused before their body because of the deferred block-update bound.
+     */
+    List<Entity> deferredUpdateFallbackEntities() {
+        synchronized (this.deferredUpdateFallbackEntities) {
+            return List.copyOf(this.deferredUpdateFallbackEntities);
         }
     }
 

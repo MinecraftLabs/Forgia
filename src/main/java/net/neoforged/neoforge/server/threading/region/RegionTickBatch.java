@@ -29,6 +29,12 @@ import org.jetbrains.annotations.ApiStatus;
  * Subclasses add their region groups through {@link #addTask(String, Runnable)}; the work is wrapped by
  * {@link #groupWork(Runnable)} so a group the executor rejected and that therefore runs inline on the
  * publishing thread still marks that thread as executing this batch.
+ * <p>
+ * The batch also owns the deferred block-write effects of its groups ({@link RegionDeferredBlockUpdates}).
+ * {@link #groupWork(Runnable)} installs the queue of the batch for the duration of every group, so a worker of
+ * any slice - block entity, entity, chunk or scheduled tick - records the light rechecks and the block update
+ * publications of the blocks it writes instead of driving the level-wide light engine and the level-wide block
+ * update publication itself, and the completion chain of the batch applies them on the server thread.
  */
 @ApiStatus.Internal
 abstract class RegionTickBatch {
@@ -39,8 +45,18 @@ abstract class RegionTickBatch {
      * handoff.
      */
     private static final ThreadLocal<RegionTickBatch> CURRENT = new ThreadLocal<>();
+    /**
+     * The deferred block-write effects of the batch whose group executes on the current thread. It is set for
+     * the duration of every group, including a group the executor rejected and that therefore runs inline on the
+     * publishing thread, and it is {@code null} everywhere else - in particular on the server thread that
+     * publishes the batch and on the server thread that applies the records at the barrier, so a block write
+     * outside a group publishes inline.
+     */
+    private static final ThreadLocal<RegionDeferredBlockUpdates> CURRENT_BLOCK_UPDATES = new ThreadLocal<>();
 
     private final ServerLevel level;
+    private final RegionTickSlice slice;
+    private final RegionDeferredBlockUpdates blockUpdates;
     private final RegionTaskBatch tasks = new RegionTaskBatch();
     private final RegionTaskBatch.Barrier groupBarrier = RegionTaskBatch.Barrier.open();
     private final CountDownLatch finished = new CountDownLatch(1);
@@ -55,8 +71,10 @@ abstract class RegionTickBatch {
      */
     private long submitNanos;
 
-    RegionTickBatch(ServerLevel level) {
+    RegionTickBatch(ServerLevel level, RegionTickSlice slice, int blockUpdateEntryBudget) {
         this.level = level;
+        this.slice = slice;
+        this.blockUpdates = new RegionDeferredBlockUpdates(blockUpdateEntryBudget);
     }
 
     /**
@@ -66,8 +84,36 @@ abstract class RegionTickBatch {
         return CURRENT.get();
     }
 
+    /**
+     * {@return the deferred block-write effects of the batch whose group executes on the current thread, or
+     * {@code null} outside a group}
+     */
+    static RegionDeferredBlockUpdates currentBlockUpdates() {
+        return CURRENT_BLOCK_UPDATES.get();
+    }
+
     final ServerLevel level() {
         return this.level;
+    }
+
+    /** {@return the slice of the level tick this batch executes} */
+    final RegionTickSlice slice() {
+        return this.slice;
+    }
+
+    /** {@return the block-write effects the groups of this batch deferred} */
+    final RegionDeferredBlockUpdates blockUpdates() {
+        return this.blockUpdates;
+    }
+
+    /**
+     * Reserves the entries of one unit this batch is about to admit to a worker group.
+     *
+     * @return {@code false} when the unit does not fit into the bound of this batch, so the caller has to refuse
+     *         it before its body starts and run it on the server thread instead
+     */
+    final boolean tryReserveBlockUpdates() {
+        return this.blockUpdates.tryReserve(this.slice);
     }
 
     /**
@@ -110,14 +156,17 @@ abstract class RegionTickBatch {
     }
 
     /**
-     * Wraps group work so it marks the executing thread as the owner of this batch.
+     * Wraps group work so it marks the executing thread as the owner of this batch and installs the deferred
+     * block-write queue of the batch, which every slice defers into.
      */
     final Runnable groupWork(Runnable work) {
         return () -> {
             final boolean alreadyExecuting = Boolean.TRUE.equals(this.executing.get());
             final RegionTickBatch previousBatch = CURRENT.get();
+            final RegionDeferredBlockUpdates previousUpdates = CURRENT_BLOCK_UPDATES.get();
             this.executing.set(Boolean.TRUE);
             CURRENT.set(this);
+            CURRENT_BLOCK_UPDATES.set(this.blockUpdates);
             try {
                 work.run();
             } finally {
@@ -131,6 +180,11 @@ abstract class RegionTickBatch {
                     CURRENT.set(previousBatch);
                 } else {
                     CURRENT.remove();
+                }
+                if (previousUpdates != null) {
+                    CURRENT_BLOCK_UPDATES.set(previousUpdates);
+                } else {
+                    CURRENT_BLOCK_UPDATES.remove();
                 }
             }
         };

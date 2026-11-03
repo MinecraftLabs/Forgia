@@ -416,11 +416,11 @@
  
      @Override
      public void sendBlockUpdated(BlockPos p_8755_, BlockState p_8756_, BlockState p_8757_, int p_8758_) {
-+        // Neo: a region chunk tick worker may not publish a block update itself. The publication marks the changed
-+        // sections of the chunk holder, invalidates the level-wide path type cache and recomputes the paths of
-+        // every navigating mob of the level - a mob that can live in any region. The worker records the write and
-+        // the server thread publishes it at the batch barrier, before the level's per-chunk broadcast.
-+        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickBlockUpdate(p_8755_, p_8756_, p_8757_, p_8758_)) {
++        // Neo: a region worker of any slice may not publish a block update itself. The publication marks the
++        // changed sections of the chunk holder, invalidates the level-wide path type cache and recomputes the
++        // paths of every navigating mob of the level - a mob that can live in any region. The worker records the
++        // write and the server thread publishes it at the batch barrier.
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBlockUpdate(p_8755_, p_8756_, p_8757_, p_8758_)) {
 +            return;
 +        }
 +

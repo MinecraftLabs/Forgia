@@ -38,7 +38,11 @@ import org.jetbrains.annotations.ApiStatus;
  * entity's own state on the worker and the barrier runs the level callback on the server thread.
  * <p>
  * The batch also carries the two server-owned structures a block-entity tick can reach through a neighbor
- * update: the deferred mutations of {@code LevelTicks} and the removal records of the ownership lease.
+ * update: the deferred mutations of {@code LevelTicks} and the removal records of the ownership lease. A ticker
+ * that writes a block - its own state, the container it reads - records the light recheck and the block update
+ * publication of the write in the deferred queue every region batch shares, so the worker never drives the
+ * level-wide light engine or the level-wide block update publication. A ticker whose reservation does not fit
+ * into that queue is refused before its body and ticked on the server thread after the batch.
  */
 @ApiStatus.Internal
 final class RegionBlockEntityTickBatch extends RegionTickBatch {
@@ -72,8 +76,8 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
     private final java.util.concurrent.atomic.AtomicLong firstGroupStartNanos = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong lastGroupEndNanos = new java.util.concurrent.atomic.AtomicLong();
 
-    RegionBlockEntityTickBatch(ServerLevel level) {
-        super(level);
+    RegionBlockEntityTickBatch(ServerLevel level, int blockUpdateEntryBudget) {
+        super(level, RegionTickSlice.BLOCK_ENTITY_TICK, blockUpdateEntryBudget);
     }
 
     /**

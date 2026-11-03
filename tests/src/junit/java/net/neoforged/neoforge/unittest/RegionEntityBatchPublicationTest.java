@@ -52,6 +52,11 @@ import org.junit.jupiter.api.Timeout;
 @Timeout(60)
 class RegionEntityBatchPublicationTest {
     private static final String ENTITY_BATCH_TYPE = "net.neoforged.neoforge.server.threading.region.RegionEntityTickBatch";
+    /**
+     * Entries the batch reserves for the deferred block updates. The seams under test defer no block write, so
+     * the production bound is used.
+     */
+    private static final int DEFERRED_BLOCK_UPDATE_ENTRIES = 1 << 16;
     private static final String REGIONIZER_TYPE = "net.neoforged.neoforge.server.threading.region.ThreadedRegionizer";
     private static final String OWNER_MOVE_TYPE = REGIONIZER_TYPE + "$OwnerMove";
 
@@ -71,7 +76,7 @@ class RegionEntityBatchPublicationTest {
         try {
             final Class<?> regionizerType = Class.forName(REGIONIZER_TYPE);
             OWNER_MOVE = accessible(Class.forName(OWNER_MOVE_TYPE).getDeclaredConstructor(Entity.class, RegionCoordinate.class));
-            ENTITY_BATCH = accessible(Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class));
+            ENTITY_BATCH = accessible(Class.forName(ENTITY_BATCH_TYPE).getDeclaredConstructor(ServerLevel.class, int.class));
             PUBLISH_ENTITY_MOVES = accessible(regionizerType.getDeclaredMethod("publishEntityMoves", List.class));
             REGIONIZER_REGION_FOR = accessible(regionizerType.getDeclaredMethod("regionFor", Entity.class));
             REGION_COORDINATE = accessible(Class.forName("net.neoforged.neoforge.server.threading.region.RegionState").getDeclaredMethod("coordinate"));
@@ -462,7 +467,7 @@ class RegionEntityBatchPublicationTest {
     }
 
     private Object newBatch() throws ReflectiveOperationException {
-        return ENTITY_BATCH.newInstance(this.level);
+        return ENTITY_BATCH.newInstance(this.level, DEFERRED_BLOCK_UPDATE_ENTRIES);
     }
 
     @SuppressWarnings("unchecked")

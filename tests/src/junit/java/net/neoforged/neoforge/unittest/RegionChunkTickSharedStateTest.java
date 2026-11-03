@@ -76,6 +76,7 @@ import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
+import net.neoforged.neoforge.server.threading.region.RegionTickSlice;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -133,7 +134,7 @@ class RegionChunkTickSharedStateTest {
         final LevelChunk chunk = tickedChunk(INTERIOR_CHUNK, pos -> {
             written.add(pos);
             // The production seam: a chunk tick worker records the publication instead of publishing it.
-            assertTrue(RegionThreadingHooks.deferChunkTickBlockUpdate(pos, Blocks.AIR.defaultBlockState(),
+            assertTrue(RegionThreadingHooks.deferBlockUpdate(pos, Blocks.AIR.defaultBlockState(),
                     Blocks.GLOWSTONE.defaultBlockState(), 3), "a chunk tick worker has to defer the publication");
         });
         final RegionChunkTickPlan plan = this.beginPlan(level);
@@ -145,17 +146,17 @@ class RegionChunkTickSharedStateTest {
         assertEquals(written, published, "every deferred write has to be published once, in recording order");
         assertTrue(publishThreads.stream().allMatch(name -> name.equals(Thread.currentThread().getName())),
                 () -> "the publication has to run on the server thread: " + publishThreads);
-        assertEquals(RANDOM_TICK_SPEED, this.engine.diagnostics().deferredChunkTickUpdatesApplied());
-        assertEquals(0L, this.engine.diagnostics().droppedDeferredChunkTickUpdates());
+        assertEquals(RANDOM_TICK_SPEED, this.engine.diagnostics().deferredBlockUpdates().applied(RegionTickSlice.CHUNK_TICK));
+        assertEquals(0L, this.engine.diagnostics().deferredBlockUpdates().dropped(RegionTickSlice.CHUNK_TICK));
     }
 
     @Test
     void blockUpdateAndLightRecheckAreInlineOutsideAChunkTickGroup() {
         mockLevel();
-        assertFalse(RegionThreadingHooks.deferChunkTickBlockUpdate(BlockPos.ZERO, Blocks.AIR.defaultBlockState(),
+        assertFalse(RegionThreadingHooks.deferBlockUpdate(BlockPos.ZERO, Blocks.AIR.defaultBlockState(),
                 Blocks.GLOWSTONE.defaultBlockState(), 3), "the server thread publishes a block update inline");
-        assertFalse(RegionThreadingHooks.deferChunkTickLightCheck(BlockPos.ZERO), "the server thread rechecks light inline");
-        assertFalse(RegionThreadingHooks.deferChunkTickLightSectionStatus(BlockPos.ZERO, false),
+        assertFalse(RegionThreadingHooks.deferLightCheck(BlockPos.ZERO), "the server thread rechecks light inline");
+        assertFalse(RegionThreadingHooks.deferLightSectionStatus(BlockPos.ZERO, false),
                 "the server thread updates the light section status inline");
     }
 
@@ -171,9 +172,9 @@ class RegionChunkTickSharedStateTest {
         final List<BlockPos> written = new CopyOnWriteArrayList<>();
         final LevelChunk chunk = tickedChunk(INTERIOR_CHUNK, pos -> {
             written.add(pos);
-            assertTrue(RegionThreadingHooks.deferChunkTickLightSectionStatus(pos, false),
+            assertTrue(RegionThreadingHooks.deferLightSectionStatus(pos, false),
                     "a chunk tick worker has to defer the light section status change");
-            assertTrue(RegionThreadingHooks.deferChunkTickLightCheck(pos), "a chunk tick worker has to defer the light recheck");
+            assertTrue(RegionThreadingHooks.deferLightCheck(pos), "a chunk tick worker has to defer the light recheck");
         });
         final RegionChunkTickPlan plan = this.beginPlan(level);
 
@@ -181,7 +182,7 @@ class RegionChunkTickSharedStateTest {
         plan.executeAndAwait(PARKING_BARRIER);
 
         assertEquals(2 * RANDOM_TICK_SPEED, engineCalls.size(), "every write has to hand over its status change and its recheck");
-        assertEquals(2 * RANDOM_TICK_SPEED, this.engine.diagnostics().deferredChunkTickUpdatesApplied());
+        assertEquals(2 * RANDOM_TICK_SPEED, this.engine.diagnostics().deferredBlockUpdates().applied(RegionTickSlice.CHUNK_TICK));
         assertTrue(engineThreads.stream().allMatch(name -> name.equals(Thread.currentThread().getName())),
                 () -> "the light engine may only be driven from the server thread: " + engineThreads);
         final List<String> expected = new ArrayList<>();
@@ -233,7 +234,7 @@ class RegionChunkTickSharedStateTest {
         final CountDownLatch ticking = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final LevelChunk chunk = tickedChunk(INTERIOR_CHUNK, pos -> {
-            assertTrue(RegionThreadingHooks.deferChunkTickLightCheck(pos), "the recheck has to be recorded");
+            assertTrue(RegionThreadingHooks.deferLightCheck(pos), "the recheck has to be recorded");
             ticking.countDown();
             awaitOrFail(release, "the chunk tick was never released");
         });
@@ -260,9 +261,9 @@ class RegionChunkTickSharedStateTest {
         assertTrue(failures.isEmpty(), () -> "batch failed: " + failures);
         assertFalse(batchThread.isAlive(), "the chunk tick batch never completed");
         assertFalse(shutdownThread.isAlive(), "the engine shutdown never returned");
-        assertEquals(RANDOM_TICK_SPEED, this.engine.diagnostics().deferredChunkTickUpdatesApplied(),
+        assertEquals(RANDOM_TICK_SPEED, this.engine.diagnostics().deferredBlockUpdates().applied(RegionTickSlice.CHUNK_TICK),
                 "the barrier has to drain the deferred queue before the level closes");
-        assertEquals(0L, this.engine.diagnostics().droppedDeferredChunkTickUpdates());
+        assertEquals(0L, this.engine.diagnostics().deferredBlockUpdates().dropped(RegionTickSlice.CHUNK_TICK));
         verify(delegated, times(RANDOM_TICK_SPEED)).checkBlock(any());
         assertEquals(0, this.engine.diagnostics().runningRegionCount());
     }
@@ -349,8 +350,8 @@ class RegionChunkTickSharedStateTest {
         }
         real.runLightUpdates();
         final Map<Long, String> after = lightArrays(real, regionChunks);
-        final long applied = this.engine.diagnostics().deferredChunkTickUpdatesApplied();
-        final long dropped = this.engine.diagnostics().droppedDeferredChunkTickUpdates();
+        final long applied = this.engine.diagnostics().deferredBlockUpdates().applied(RegionTickSlice.CHUNK_TICK);
+        final long dropped = this.engine.diagnostics().deferredBlockUpdates().dropped(RegionTickSlice.CHUNK_TICK);
         RegionThreadingManager.clear();
         return new LightRun(List.copyOf(written), List.copyOf(writeThreads), before, after, List.copyOf(engineThreads),
                 List.copyOf(engineCalls), serverThread, applied, dropped, !before.equals(after));

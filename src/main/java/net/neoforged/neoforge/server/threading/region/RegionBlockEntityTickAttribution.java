@@ -161,7 +161,12 @@ public final class RegionBlockEntityTickAttribution {
         /**
          * The ticker requested a chunk the worker may not load, so it was ticked on the server thread.
          */
-        CHUNK_UNAVAILABLE
+        CHUNK_UNAVAILABLE,
+        /**
+         * The batch could not reserve the block-write effects of the ticker, so it was refused before its body
+         * and ticked on the server thread after the batch.
+         */
+        DEFERRED_UPDATE_BUDGET
     }
 
     /**

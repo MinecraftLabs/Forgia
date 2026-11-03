@@ -29,9 +29,9 @@
                  boolean flag1 = levelchunksection.hasOnlyAir();
                  if (flag != flag1) {
 -                    this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
-+                    // Neo: a region chunk tick worker may not drive the light engine of the level itself. It records
-+                    // the section status change and the server thread applies it at the batch barrier.
-+                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickLightSectionStatus(p_62865_, flag1)) {
++                    // Neo: a region worker may not drive the light engine of the level itself. It records the
++                    // section status change and the server thread applies it at the batch barrier.
++                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightSectionStatus(p_62865_, flag1)) {
 +                        this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
 +                    }
                  }
@@ -44,7 +44,7 @@
 -                    this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
 +                    // Neo: same for the recheck of one position; the sky light sources above are per chunk and stay
 +                    // on the worker.
-+                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickLightCheck(p_62865_)) {
++                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightCheck(p_62865_)) {
 +                        this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
 +                    }
                      profilerfiller.pop();

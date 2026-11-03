@@ -72,6 +72,13 @@ import java.util.List;
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
  * diagnostic consumer read the same value the engine and the physical section partitions use.
  * <p>
+ * The per-slice block-update counters report the light rechecks and block update publications every region batch
+ * defers: one batch of the block-entity, entity, chunk or scheduled tick slice records the writes of its workers
+ * and the server thread applies them at its barrier, because the light engine and the block update publication
+ * of a level are level-wide. {@link BlockUpdateCounters} reports the records each slice applied, the records it
+ * dropped because its level closed and the units it refused before their body because the batch could not
+ * reserve them.
+ * <p>
  * The four block-entity chunk counters report the chunks the chunk-indexed plan did not hand to a worker, by
  * reason. A non-ticking chunk is out of block ticking range or the tick rate is frozen, a chunk whose entities
  * are still loading keeps the vanilla skip, and a chunk that is no longer loaded has no snapshot at all; none
@@ -156,8 +163,7 @@ public record RegionThreadingDiagnostics(
         long lateChunkTicks,
         long unleasedChunkTicks,
         long chunkTickLightningStrikes,
-        long deferredChunkTickUpdatesApplied,
-        long droppedDeferredChunkTickUpdates,
+        BlockUpdateCounters deferredBlockUpdates,
         long deferredUpdateBudgetChunkTicks,
         long nonPartitionedChunkTicks,
         boolean globalRegionRunning,
@@ -205,4 +211,50 @@ public record RegionThreadingDiagnostics(
         long unindexedEntityTickStarts,
         long entityTickIndexFallbacks,
         RegionMetricsSummary regionMetrics,
-        List<RegionTickSnapshot> regionTicks) {}
+        List<RegionTickSnapshot> regionTicks) {
+    /**
+     * The light rechecks and block update publications the batches of the level deferred, counted per slice.
+     * <p>
+     * An applied record is one vanilla effect the barrier ran on the server thread: the light section status
+     * change, the light recheck or the block update publication of one block write. A dropped record never
+     * completed - the level identity closed before the barrier applied it - and no record is ever silently
+     * skipped. A refused unit is one chunk, ticker, entity or scheduled tick that the batch could not reserve
+     * and that therefore ran on the server thread before its body started, where its writes need no record. The
+     * three counts are indexed by {@link RegionTickSlice#ordinal()}.
+     *
+     * @param applied the records each slice applied
+     * @param dropped the records each slice dropped
+     * @param refused the units each slice refused before their body
+     */
+    public record BlockUpdateCounters(long[] applied, long[] dropped, long[] refused) {
+        /** {@return the records the barrier of {@code slice} applied} */
+        public long applied(RegionTickSlice slice) {
+            return this.applied[slice.ordinal()];
+        }
+
+        /** {@return the records of {@code slice} that were never applied because their level closed} */
+        public long dropped(RegionTickSlice slice) {
+            return this.dropped[slice.ordinal()];
+        }
+
+        /** {@return the units of {@code slice} that were refused before their body} */
+        public long refused(RegionTickSlice slice) {
+            return this.refused[slice.ordinal()];
+        }
+
+        @Override
+        public String toString() {
+            final StringBuilder summary = new StringBuilder();
+            for (final RegionTickSlice slice : RegionTickSlice.values()) {
+                if (!summary.isEmpty()) {
+                    summary.append(", ");
+                }
+                summary.append(slice.name().toLowerCase(java.util.Locale.ROOT))
+                        .append('=').append(this.applied(slice))
+                        .append('/').append(this.dropped(slice))
+                        .append('/').append(this.refused(slice));
+            }
+            return summary.toString();
+        }
+    }
+}
