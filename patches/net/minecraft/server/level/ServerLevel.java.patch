@@ -279,7 +279,7 @@
      }
  
      private boolean addEntity(Entity p_8873_) {
-+        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerLevel.addEntity");
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityAdditionAccess("ServerLevel.addEntity");
          if (p_8873_.isRemoved()) {
              LOGGER.warn("Tried to add entity {} but it was marked as removed already", EntityType.getKey(p_8873_.getType()));
              return false;
@@ -297,7 +297,7 @@
      public boolean tryAddFreshEntityWithPassengers(Entity p_8861_) {
 +        // Neo: the duplicate precheck reads the manager's UUID admission set, so the guard has to run
 +        // before it and before any passenger is added.
-+        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerLevel.tryAddFreshEntityWithPassengers");
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityAdditionAccess("ServerLevel.tryAddFreshEntityWithPassengers");
          if (p_8861_.getSelfAndPassengers().map(Entity::getUUID).anyMatch(this.entityManager::isLoaded)) {
              return false;
          } else {

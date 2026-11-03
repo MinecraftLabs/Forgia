@@ -543,14 +543,49 @@
      }
  
      public void checkDespawn() {
-@@ -3412,6 +_,7 @@
+@@ -3412,6 +_,12 @@
  
      @Override
      public final void setRemoved(Entity.RemovalReason p_146876_) {
 +        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setRemoved");
++        // Neo: a leased worker may only remove an entity it owns, and only by recording the removal. The
++        // level callback is the server-owned storage effect of the removal (section membership, tracking,
++        // identity ledger, region index), so the batch barrier runs it on the server thread. The record is
++        // taken before the entity's own state changes, so a refused deferral leaves the entity unremoved.
++        final boolean deferred = net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferEntityRemoval(this, this.levelCallback, p_146876_);
          if (this.removalReason == null) {
              this.removalReason = p_146876_;
          }
+@@ -3421,7 +_,9 @@
+         }
+ 
+         this.getPassengers().forEach(Entity::stopRiding);
+-        this.levelCallback.onRemove(p_146876_);
++        if (!deferred) {
++            this.levelCallback.onRemove(p_146876_);
++        }
+     }
+ 
+     protected void unsetRemoved() {
+@@ -3433,6 +_,18 @@
+         this.levelCallback = p_146849_;
+     }
+ 
++    /**
++     * Neo: the level callback of this entity.
++     * <p>
++     * The section manager replaces the callback with {@link EntityInLevelCallback#NULL} when its removal
++     * completed, so the entity batch barrier compares the callback a worker recorded for a deferred removal
++     * with this one to tell a pending removal from one the server thread already applied. The read is a field
++     * read of the entity itself, not a storage access.
++     */
++    public final EntityInLevelCallback getLevelCallback() {
++        return this.levelCallback;
++    }
++
+     @Override
+     public boolean shouldBeSaved() {
+         if (this.removalReason != null && !this.removalReason.shouldSave()) {
 @@ -3449,6 +_,133 @@
  
      public boolean mayInteract(Level p_146843_, BlockPos p_146844_) {

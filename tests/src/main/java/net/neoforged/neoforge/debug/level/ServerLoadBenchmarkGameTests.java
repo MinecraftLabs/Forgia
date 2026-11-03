@@ -8,7 +8,9 @@ package net.neoforged.neoforge.debug.level;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -39,6 +41,7 @@ import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.tick.EntityTickEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
@@ -142,6 +145,24 @@ public class ServerLoadBenchmarkGameTests {
      */
     static final String ZOMBIE_COUNT_PROPERTY = "neoforge.serverBenchmarkZombies";
     /**
+     * System property that drives zombie deaths in the entity worker workload: the number of zombies killed
+     * every {@value #DEATH_INTERVAL_TICKS} ticks. Each death starts inside the tick of its own zombie, so the
+     * loot spawn and the removal run on the thread that ticks the entity. Unset or {@code 0} keeps the
+     * population alive for the whole window, which is the workload every earlier measurement used.
+     */
+    static final String ZOMBIE_DEATHS_PROPERTY = "neoforge.serverBenchmarkZombieDeaths";
+    /** Ticks between two batches of driven zombie deaths. */
+    private static final int DEATH_INTERVAL_TICKS = 10;
+    /** Zombies killed every {@value #DEATH_INTERVAL_TICKS} ticks when {@value #ZOMBIE_DEATHS_PROPERTY} is unset. */
+    private static final int ENTITY_WORKER_ZOMBIE_DEATHS = 0;
+    /**
+     * System property that turns the mob loot rule off for the entity worker window. A death then fails on the
+     * experience orb it still spawns instead of on its loot table, which isolates the cost of the deferred
+     * removal from the crash report the shared random source builds when two workers roll loot at once.
+     * Unset keeps the vanilla rule.
+     */
+    static final String ZOMBIE_LOOT_PROPERTY = "neoforge.serverBenchmarkZombieLoot";
+    /**
      * Message prefix of {@code RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess}. The suffix
      * is the operation the guard rejected, so the blocker table is keyed by that operation.
      */
@@ -155,7 +176,7 @@ public class ServerLoadBenchmarkGameTests {
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -314,7 +335,8 @@ public class ServerLoadBenchmarkGameTests {
             final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
             final List<ChunkPos> grid = gridChunks(origin);
             final List<Zombie> zombies = new ArrayList<>(entityWorkerZombieCount());
-            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
+            final ZombieDeathDriver deathDriver = new ZombieDeathDriver(level, zombies, entityWorkerZombieDeaths());
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, deathDriver);
             final EntityWorkerBlockers blockers = new EntityWorkerBlockers();
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
             final AtomicReference<RegionEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionEntityTickAttribution.snapshot());
@@ -322,10 +344,13 @@ public class ServerLoadBenchmarkGameTests {
             final AtomicBoolean cleaned = new AtomicBoolean();
             final GameRules.BooleanValue daylight = level.getGameRules().getRule(GameRules.RULE_DAYLIGHT);
             final boolean previousDaylight = daylight.get();
+            final GameRules.BooleanValue mobLoot = level.getGameRules().getRule(GameRules.RULE_DOMOBLOOT);
+            final boolean previousMobLoot = mobLoot.get();
             helper.addEndListener(passed -> {
                 if (cleaned.compareAndSet(false, true)) {
                     NeoForge.EVENT_BUS.unregister(sampler);
-                    cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, Optional.ofNullable(replaced.get()));
+                    NeoForge.EVENT_BUS.unregister(deathDriver);
+                    cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
                 }
             });
 
@@ -338,26 +363,34 @@ public class ServerLoadBenchmarkGameTests {
                         // Zombies burn in daylight, so the window runs at night like the entity workload.
                         daylight.set(false, level.getServer());
                         level.setDayTime(18000L);
+                        mobLoot.set(entityWorkerZombieLoot(), level.getServer());
                         spawnZombies(level, grid, origin, zombies, helper);
                     })
                     .thenExecute(() -> {
                         replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()).orElse(null));
                         // The attribution is reported per measured tick, so it is reset when the warmup
                         // ends and the warmup itself stays unmeasured.
-                        sampler.onMeasuredWindowStart(RegionEntityTickAttribution::reset);
+                        sampler.onMeasuredWindowStart(() -> {
+                            RegionEntityTickAttribution.reset();
+                            deathDriver.markMeasuredWindowStart();
+                        });
                         RegionEntityTickAttribution.setEnabled(true);
                         before.set(RegionThreadingHooks.diagnostics());
                         attributionBefore.set(RegionEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
+                        // The death driver hurts a zombie from inside its own tick, so it has to be a bus
+                        // listener: the entity tick of a worker profile runs on the region worker.
+                        NeoForge.EVENT_BUS.register(deathDriver);
                     })
                     .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 1)
                     .thenExecute(() -> {
                         NeoForge.EVENT_BUS.unregister(sampler);
+                        NeoForge.EVENT_BUS.unregister(deathDriver);
                         // The counters of the diagnostic engine are read before it is replaced again.
-                        reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), zombies, blockers, grid.size());
+                        reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), zombies, blockers, deathDriver, grid.size());
                         if (cleaned.compareAndSet(false, true)) {
-                            cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, Optional.ofNullable(replaced.get()));
+                            cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
                         }
                     })
                     .thenSucceed();
@@ -424,6 +457,23 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static int entityWorkerZombieCount() {
         return intProperty(ZOMBIE_COUNT_PROPERTY, ENTITY_WORKER_ZOMBIE_COUNT);
+    }
+
+    /**
+     * {@return the number of zombies the entity worker workload kills every
+     * {@value #DEATH_INTERVAL_TICKS} ticks, {@value #ENTITY_WORKER_ZOMBIE_DEATHS} unless
+     * {@value #ZOMBIE_DEATHS_PROPERTY} overrides it}
+     */
+    private static int entityWorkerZombieDeaths() {
+        return intProperty(ZOMBIE_DEATHS_PROPERTY, ENTITY_WORKER_ZOMBIE_DEATHS);
+    }
+
+    /**
+     * {@return false when {@value #ZOMBIE_LOOT_PROPERTY} turns the mob loot rule off for the window}
+     */
+    private static boolean entityWorkerZombieLoot() {
+        final String configured = System.getProperty(ZOMBIE_LOOT_PROPERTY);
+        return configured == null || configured.isBlank() || Boolean.parseBoolean(configured.trim());
     }
 
     /**
@@ -718,12 +768,145 @@ public class ServerLoadBenchmarkGameTests {
         final int count = entityWorkerZombieCount();
         for (int index = 0; index < count; index++) {
             final ChunkPos chunk = grid.get(index % grid.size());
-            final Zombie zombie = new Zombie(EntityType.ZOMBIE, level);
-            zombie.moveTo(chunk.getMinBlockX() + 8.5, origin.getY() + 2, chunk.getMinBlockZ() + 8.5, random.nextFloat() * 360.0F, 0.0F);
-            // Without a nearby player a mob despawns; the diagnostic needs the population to stay put.
-            zombie.setPersistenceRequired();
+            final Zombie zombie = newZombie(level, new BlockPos(chunk.getMinBlockX() + 8, origin.getY() + 2, chunk.getMinBlockZ() + 8), random);
             helper.assertTrue(level.addFreshEntity(zombie), "the entity worker diagnostics could not spawn a benchmark zombie");
             zombies.add(zombie);
+        }
+    }
+
+    /**
+     * {@return one benchmark zombie at {@code pos}, not yet added to the level}
+     * <p>
+     * Without a nearby player a mob despawns; the diagnostic needs the population to stay put.
+     */
+    private static Zombie newZombie(ServerLevel level, BlockPos pos, RandomSource random) {
+        final Zombie zombie = new Zombie(EntityType.ZOMBIE, level);
+        zombie.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, random.nextFloat() * 360.0F, 0.0F);
+        zombie.setPersistenceRequired();
+        return zombie;
+    }
+
+    /**
+     * Drives the zombie deaths of the entity worker workload.
+     * <p>
+     * A scheduled zombie is hurt from inside its own tick, so the death, the loot spawn of the death and the
+     * removal of the dying entity all run on the thread that ticks the entity: the region worker in a worker
+     * profile and the server thread in the reference profile. The loot spawn is the entity addition the
+     * ownership lease still rejects, so one driven death reports one rejected entity tick and one
+     * {@code entityAddRejectedOnWorker} count; the removal twenty ticks later is the deferred removal. The
+     * population is kept at its size by replacing a dead or dying zombie on the server thread with a fresh one
+     * at the same position, so every profile ticks the same number of entities and the row stays comparable
+     * with the runs that drive no deaths at all.
+     */
+    private static final class ZombieDeathDriver implements Runnable {
+        private final ServerLevel level;
+        private final List<Zombie> zombies;
+        /** Zombies whose death is due at their next tick; the identity set is written by workers and the server thread. */
+        private final Set<Zombie> scheduled = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+        private final int deathsPerInterval;
+        private final RandomSource random = RandomSource.create(0xDEADBEEFL);
+        private int intervalCountdown = DEATH_INTERVAL_TICKS;
+        private int nextSlot;
+        private int deaths;
+        private int replacements;
+        private int removedReplacements;
+        private int failedReplacements;
+        private int deathsAtWindowStart;
+        private int replacementsAtWindowStart;
+        private int removedReplacementsAtWindowStart;
+        private int failedReplacementsAtWindowStart;
+
+        ZombieDeathDriver(ServerLevel level, List<Zombie> zombies, int deathsPerInterval) {
+            this.level = level;
+            this.zombies = zombies;
+            this.deathsPerInterval = deathsPerInterval;
+        }
+
+        /**
+         * Schedules the deaths of this interval and replaces the zombies that died. Runs on the server thread
+         * at the head of the server tick, so a zombie scheduled here is ticked later in the same tick.
+         */
+        @Override
+        public void run() {
+            this.replaceDeadZombies();
+            if (this.deathsPerInterval <= 0 || this.zombies.isEmpty()) {
+                return;
+            }
+            if (--this.intervalCountdown > 0) {
+                return;
+            }
+            this.intervalCountdown = DEATH_INTERVAL_TICKS;
+            for (int index = 0; index < this.deathsPerInterval; index++) {
+                final Zombie zombie = this.zombies.get(this.nextSlot++ % this.zombies.size());
+                if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+                    this.scheduled.add(zombie);
+                }
+            }
+        }
+
+        /**
+         * Hurts the scheduled zombie inside its own tick, on the thread that ticks it. The vanilla death runs
+         * the loot spawn and marks the entity dead; the entity then removes itself twenty ticks later, also on
+         * the ticking thread, which is exactly the gameplay death the removal deferral has to carry.
+         */
+        @SubscribeEvent
+        public void onEntityTickPre(EntityTickEvent.Pre event) {
+            if (!(event.getEntity() instanceof Zombie zombie) || !this.scheduled.remove(zombie)) {
+                return;
+            }
+            if (zombie.isRemoved() || zombie.isDeadOrDying()) {
+                return;
+            }
+            this.deaths++;
+            zombie.hurt(zombie.damageSources().generic(), Float.MAX_VALUE);
+        }
+
+        private void replaceDeadZombies() {
+            for (int index = 0; index < this.zombies.size(); index++) {
+                final Zombie zombie = this.zombies.get(index);
+                if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+                    continue;
+                }
+                final boolean removed = zombie.isRemoved();
+                final Zombie replacement = newZombie(this.level, zombie.blockPosition(), this.random);
+                if (!this.level.addFreshEntity(replacement)) {
+                    this.failedReplacements++;
+                    continue;
+                }
+                this.zombies.set(index, replacement);
+                this.replacements++;
+                if (removed) {
+                    this.removedReplacements++;
+                }
+            }
+        }
+
+        /**
+         * Marks the start of the measured window, so the reported deaths and replacements are the ones the
+         * measured ticks produced and stay comparable with the counters of the same window.
+         */
+        void markMeasuredWindowStart() {
+            this.deathsAtWindowStart = this.deaths;
+            this.replacementsAtWindowStart = this.replacements;
+            this.removedReplacementsAtWindowStart = this.removedReplacements;
+            this.failedReplacementsAtWindowStart = this.failedReplacements;
+        }
+
+        int deathsInWindow() {
+            return this.deaths - this.deathsAtWindowStart;
+        }
+
+        int replacementsInWindow() {
+            return this.replacements - this.replacementsAtWindowStart;
+        }
+
+        /** Replacements of a zombie that was already removed, i.e. a removal that completed without a driven death. */
+        int removedReplacementsInWindow() {
+            return this.removedReplacements - this.removedReplacementsAtWindowStart;
+        }
+
+        int failedReplacementsInWindow() {
+            return this.failedReplacements - this.failedReplacementsAtWindowStart;
         }
     }
 
@@ -733,7 +916,7 @@ public class ServerLoadBenchmarkGameTests {
      * Runs from the measured window and from the end listener, so a failing or timing-out test never leaves
      * the diagnostic engine installed or the grid forced.
      */
-    private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Zombie> zombies, GameRules.BooleanValue daylight, boolean previousDaylight, Optional<InstalledEngine> replaced) {
+    private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Zombie> zombies, GameRules.BooleanValue daylight, boolean previousDaylight, GameRules.BooleanValue mobLoot, boolean previousMobLoot, Optional<InstalledEngine> replaced) {
         RegionEntityTickAttribution.setEnabled(false);
         for (Zombie zombie : zombies) {
             zombie.discard();
@@ -741,6 +924,7 @@ public class ServerLoadBenchmarkGameTests {
         zombies.clear();
         replaced.ifPresent(ServerLoadBenchmarkGameTests::restoreConfiguredEngine);
         daylight.set(previousDaylight, level.getServer());
+        mobLoot.set(previousMobLoot, level.getServer());
         releaseChunks(level, grid, ENTITY_TICKING_TICKET_RADIUS);
     }
 
@@ -821,7 +1005,7 @@ public class ServerLoadBenchmarkGameTests {
      * slices (the {@code sliceSamples} column), so each one is the per-tick wall time of that segment. A
      * segment that never ran in the window reports {@code 0}, and a window without slices reports {@code -1}.
      */
-    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionEntityTickAttribution.Snapshot attributionBefore, RegionEntityTickAttribution.Snapshot attributionAfter, List<Zombie> zombies, EntityWorkerBlockers blockers, int chunks) {
+    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionEntityTickAttribution.Snapshot attributionBefore, RegionEntityTickAttribution.Snapshot attributionAfter, List<Zombie> zombies, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, int chunks) {
         final long[] sorted = sampler.sortedSamples();
         helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
         final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
@@ -845,12 +1029,16 @@ public class ServerLoadBenchmarkGameTests {
                 + " chunkPreloadMargin=" + RegionThreadingEngine.entityTickChunkMargin()
                 + " entityTickMode=" + entityTickMode(after)
                 + " zombieSurvivors=" + survivors + "/" + zombies.size()
+                + " zombieDeaths=" + deathDriver.deathsInWindow()
+                + " zombieReplacements=" + deathDriver.replacementsInWindow()
+                + " removedReplacements=" + deathDriver.removedReplacementsInWindow()
+                + " failedReplacements=" + deathDriver.failedReplacementsInWindow()
                 + " regionMismatches=" + mismatches
                 + " entityTickFailures=" + blockers.failureCount()
                 + " distinctBlockers=" + blockers.blockerCount()
                 + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -895,7 +1083,13 @@ public class ServerLoadBenchmarkGameTests {
                 millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
                 millisPerSlice(attributionAfter.deferredPublicationNanos() - attributionBefore.deferredPublicationNanos(), slices),
                 millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
-                slices);
+                slices,
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityRemovalsApplied),
+                delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityRemovals),
+                delta(before, after, RegionThreadingDiagnostics::repeatedDeferredEntityRemovals),
+                delta(before, after, RegionThreadingDiagnostics::entityAddRejectedOnWorker),
+                deathDriver.deathsInWindow(),
+                deathDriver.replacementsInWindow());
         System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);
         blockers.printBlockers();
     }

@@ -55,11 +55,39 @@ class RegionEntityOwnershipLeaseTest {
         try (RegionEntityOwnershipScope lease = openLease(owned)) {
             // Entity.teleportTo is the cross-level teleport: it changes level, identity and storage.
             assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.teleportTo"));
-            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.discard"));
-            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.remove"));
-            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.setRemoved"));
             assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "BlockAttachedEntity.move"));
             assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "ServerPlayer.teleportTo"));
+            // The subclass removals run entity additions or foreign mutations before the removal funnel.
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Slime.remove"));
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Boat.remove"));
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "FishingHook.remove"));
+        }
+    }
+
+    @Test
+    void leaseGrantsTheRemovalsOfAnOwnedEntityThatIsNotAddedToALevel() throws ReflectiveOperationException {
+        final Entity owned = mock(Entity.class);
+        try (RegionEntityOwnershipScope lease = openLease(owned)) {
+            // A removal of an entity that is not added to a level has no server-owned effect: its level
+            // callback is the NULL callback, so the lease grants the removal itself.
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.discard"));
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.remove"));
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "Entity.setRemoved"));
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, owned, "LivingEntity.remove"));
+        }
+    }
+
+    @Test
+    void leaseOfANonWorkerThreadNeverGrantsTheRemovalOfAnAddedEntity() throws ReflectiveOperationException {
+        final Entity added = mock(Entity.class);
+        when(added.isAddedToLevel()).thenReturn(true);
+        try (RegionEntityOwnershipScope lease = openLease(added)) {
+            // The level callback of the removal is only granted because a native region worker defers it to
+            // the batch barrier. This lease is opened on the test thread, which defers nothing.
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "Entity.discard"));
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "Entity.remove"));
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "Entity.setRemoved"));
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "LivingEntity.remove"));
         }
     }
 

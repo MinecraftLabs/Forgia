@@ -237,35 +237,26 @@ class RegionEntitySectionDeferralTest {
     }
 
     @Test
-    void removalAndCrossLevelTeleportOfAnOwnedAddedEntityStayRejected() {
+    void crossLevelTeleportOfAnOwnedAddedEntityStaysRejected() {
         this.installEngine(1, true);
         final ServerLevel level = this.mockLevel();
         final PersistentEntitySectionManager<Entity> manager = newGuardedManager();
         final List<String> attempts = new CopyOnWriteArrayList<>();
-        final TestEntity entity = new TestEntity(level, self -> {
-            recordAttempt(attempts, self::discard);
-            recordAttempt(attempts, () -> self.remove(Entity.RemovalReason.KILLED));
-            recordAttempt(attempts, () -> self.setRemoved(Entity.RemovalReason.DISCARDED));
-            recordAttempt(attempts, () -> self.teleportTo(level, FAR_POSITION.getX(), FAR_POSITION.getY(), FAR_POSITION.getZ(), Set.of(), 0.0F, 0.0F));
-        });
+        final TestEntity entity = new TestEntity(level, self -> recordAttempt(attempts, () -> self.teleportTo(level, FAR_POSITION.getX(), FAR_POSITION.getY(), FAR_POSITION.getZ(), Set.of(), 0.0F, 0.0F)));
         admit(manager, entity);
 
         final RegionEntityTickPlan plan = this.plan(level);
         assertTrue(plan.accept(entity));
         plan.executeAndAwait();
 
-        assertEquals(4, attempts.size());
-        assertTrue(attempts.get(0).contains("Entity.discard"), attempts.toString());
-        assertTrue(attempts.get(1).contains("Entity.remove"), attempts.toString());
-        assertTrue(attempts.get(2).contains("Entity.setRemoved"), attempts.toString());
-        assertTrue(attempts.get(3).contains("Entity.teleportTo"), attempts.toString());
-        assertFalse(entity.isRemoved(), "a rejected removal must not remove the entity");
-        assertNull(entity.getRemovalReason(), "a rejected removal must not change the removal reason");
+        assertEquals(1, attempts.size());
+        assertTrue(attempts.get(0).contains("Entity.teleportTo"), attempts.toString());
+        assertFalse(entity.isRemoved(), "a rejected teleport must not remove the entity");
         assertEquals(SOURCE_POSITION, entity.blockPosition(), "a rejected teleport must not move the entity");
         assertEquals(sectionKeyOf(SOURCE_POSITION), sectionKey(entity));
         assertEquals(List.of(), this.chunkRequests, "a rejected mutation must not defer a chunk acquisition");
         assertEquals(0L, this.engine.diagnostics().deferredEntitySectionUpdatesApplied());
-        assertEquals(4L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
+        assertEquals(1L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
     }
 
     @Test

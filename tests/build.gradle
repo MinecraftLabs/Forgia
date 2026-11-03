@@ -134,6 +134,12 @@ runs {
             // Measurement runs pass -PserverBenchmarkZombies=N to vary the population of the entity worker
             // workload without editing the test; unset keeps the default population of the test.
             systemProperty("neoforge.serverBenchmarkZombies", providers.gradleProperty("serverBenchmarkZombies").getOrElse("64"))
+            // Measurement runs pass -PserverBenchmarkZombieDeaths=N to drive N zombie deaths every 10 ticks
+            // of the entity worker workload; unset keeps the population alive for the whole window.
+            systemProperty("neoforge.serverBenchmarkZombieDeaths", providers.gradleProperty("serverBenchmarkZombieDeaths").getOrElse("0"))
+            // Measurement runs pass -PserverBenchmarkZombieLoot=false to turn the mob loot rule off for the
+            // entity worker window; unset keeps the vanilla rule.
+            systemProperty("neoforge.serverBenchmarkZombieLoot", providers.gradleProperty("serverBenchmarkZombieLoot").getOrElse("true"))
             // Measurement runs pass -PgameTestFilter=benchmarkFurnace,benchmarkEntity so only the
             // benchmark batches run instead of the whole GameTest suite. Unset keeps every test.
             systemProperty("neoforge.gameTestServer.filter", providers.gradleProperty("gameTestFilter").getOrElse(""))

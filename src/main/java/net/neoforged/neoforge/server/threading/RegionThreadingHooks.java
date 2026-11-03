@@ -180,6 +180,28 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Rejects the admission of a new entity into a level issued from a native region worker.
+     * <p>
+     * Adding an entity writes the level's UUID admission set, the visible lookup, the entity section and the
+     * ticking list, so it is server-owned storage and stays rejected for a worker even while its entity tick
+     * lease owns the entities it ticks. The rejection is counted in
+     * {@link RegionThreadingDiagnostics#entityAddRejectedOnWorker()} before it throws, so the rate of entity
+     * additions a worker attempted - death loot, experience orbs, projectiles, a spawn - is observable next
+     * to the removal counters. A spawn whose new entity is constructed on the worker is rejected one step
+     * earlier, at the position write of the constructor, and is counted there. Entity addition is not part of
+     * the ownership lease.
+     *
+     * @throws IllegalStateException when the caller is a native region worker
+     */
+    public static void assertServerEntityAdditionAccess(String operation) {
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return;
+        }
+        RegionOwnershipViolationHandler.recordEntityAdditionRejection();
+        RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
      * Defers the server-owned level effects of a worker entity move to the entity batch barrier.
      * <p>
      * {@code Entity.setPosRaw} of an entity that is added to a level reaches two server-owned level effects
@@ -203,6 +225,30 @@ public final class RegionThreadingHooks {
      */
     public static boolean deferEntitySectionUpdate(Entity entity, EntityInLevelCallback callback, double x, double y, double z) {
         return RegionEntityOwnershipScope.deferEntitySectionUpdate(entity, callback, x, y, z);
+    }
+
+    /**
+     * Defers the server-owned storage effect of a worker entity removal to the entity batch barrier.
+     * <p>
+     * {@code Entity.setRemoved} sets the entity's own removal state and then runs its level callback, which
+     * removes the entity from the level's section storage, stops its tracking and ticking, retires its
+     * identity in the ledger and publishes the departure that retires its region mapping. A native region
+     * worker must run none of that, so this hook records the removal for the barrier of the worker's entity
+     * batch, which applies the callback on the server thread. The entity is already removed for the rest of
+     * the worker tick, because {@link Entity#isRemoved()} reads the state the caller set.
+     * <p>
+     * Only a native region worker whose active lease owns {@code entity} and whose batch still accepts
+     * deferred removals records anything. The server thread, the client, every ordinary thread, a foreign
+     * entity, a lease that outlived its batch and an entity that is not added to a level answer
+     * {@code false} and keep the inline vanilla callback.
+     *
+     * @param entity   the entity that is being removed
+     * @param callback the entity's level callback, the exact object the inline vanilla removal would invoke
+     * @param reason   the removal reason the entity was marked with
+     * @return {@code true} when the caller must skip the level callback, because the barrier runs it instead
+     */
+    public static boolean deferEntityRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+        return RegionEntityOwnershipScope.deferEntityRemoval(entity, callback, reason);
     }
 
     /**

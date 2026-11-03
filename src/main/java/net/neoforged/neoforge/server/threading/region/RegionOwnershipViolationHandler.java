@@ -16,6 +16,7 @@ import org.jetbrains.annotations.ApiStatus;
 public final class RegionOwnershipViolationHandler {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final AtomicLong VIOLATION_COUNT = new AtomicLong();
+    private static final AtomicLong ENTITY_ADDITION_REJECTION_COUNT = new AtomicLong();
     private static final Set<String> REPORTED_STORAGE_ACCESSES = ConcurrentHashMap.newKeySet();
 
     private RegionOwnershipViolationHandler() {}
@@ -51,7 +52,23 @@ public final class RegionOwnershipViolationHandler {
         return VIOLATION_COUNT.get();
     }
 
+    /**
+     * Counts the entity admission of a native region worker that was rejected before it wrote any storage.
+     * <p>
+     * The count is separate from {@link #violationCount()} so the additions a worker attempted - death loot,
+     * experience orbs, projectiles, a spawn - stay observable after the removals of an owned entity became
+     * grantable. Every counted addition is also a storage violation, because the guard throws.
+     */
+    public static void recordEntityAdditionRejection() {
+        ENTITY_ADDITION_REJECTION_COUNT.incrementAndGet();
+    }
+
+    static long entityAdditionRejectionCount() {
+        return ENTITY_ADDITION_REJECTION_COUNT.get();
+    }
+
     static void reset() {
         VIOLATION_COUNT.set(0L);
+        ENTITY_ADDITION_REJECTION_COUNT.set(0L);
     }
 }

@@ -234,6 +234,24 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong appliedDeferredSectionUpdateCount = new AtomicLong();
     private final AtomicLong droppedDeferredSectionUpdateCount = new AtomicLong();
     /**
+     * Deferred removals a barrier applied on the server thread. One applied removal is one level callback of
+     * the removal: the section membership, the tracking and ticking callbacks, the identity ledger and the
+     * region index of the entity are written exactly like a server-thread removal.
+     */
+    private final AtomicLong appliedDeferredRemovalCount = new AtomicLong();
+    /**
+     * Deferred removals that did not complete: the engine shut down (including the removals a shut-down batch
+     * releases without applying), the level identity closed, or the level callback threw. A dropped removal
+     * never leaves a half-applied removal behind.
+     */
+    private final AtomicLong droppedDeferredRemovalCount = new AtomicLong();
+    /**
+     * Removal requests that were no-ops: the entity was already recorded in the same batch, its removal had
+     * already been applied by the server thread, it was revived, it left the level or its level changed. A
+     * repeat is never a second removal.
+     */
+    private final AtomicLong repeatedDeferredRemovalCount = new AtomicLong();
+    /**
      * Serializes region drain activation with lifecycle cleanup. A drain holds the read lock only while
      * it checks the lifecycle state and marks the lease or worker submission; shutdown and level clear
      * hold the write lock for the complete cleanup, so an activation either wins and is awaited or is
@@ -1189,6 +1207,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // vanilla effects of the move itself, so they run before any other server-thread work observes
                 // the entity and before the ownership handoff of the batch commits a new region.
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
+                // The removal of an owned entity is the other vanilla storage effect a worker may defer. It
+                // runs after the section updates, so the removal removes the entity from the section it was
+                // published in, and before the ownership publication, so the handoff observes the removed
+                // entity and publishes its departure instead of a region mapping.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityRemovals(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
                 failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
                 // The ownership publication is timed on its own inside the handoff, so the cost of the
@@ -2836,17 +2859,83 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Closes the deferred section seam of every active entity batch when shutdown starts.
+     * Applies the removals of an owned entity that a worker deferred to the barrier.
+     * <p>
+     * A worker that removes an entity it owns writes only the entity's own removal state; the level callback
+     * of the removal is server-owned storage, so it runs here on the server thread. The callback is the normal
+     * removal path: it publishes the departure in the identity ledger, removes the entity from its section,
+     * stops its ticking and tracking (which fires {@code EntityLeaveLevelEvent} and retires the region mapping),
+     * runs the destruction callback and clears the entity's level callback. Applying it here therefore leaves
+     * the storage, the identity ledger, the tracking state and the region index exactly as a server-thread
+     * removal does.
+     * <p>
+     * The step runs after the deferred section updates, so a removal removes the entity from the section its
+     * final position was published in, and before the deferred ownership publication, so the handoff observes
+     * the removed entity and publishes its departure instead of a region mapping.
+     * <p>
+     * An entry that cannot be applied is a counted no-op and never touches storage: the entity was revived
+     * ({@code !isRemoved()}), the server thread already applied the removal (the section manager replaced the
+     * level callback the worker recorded), the entity left the level, or its level changed. A callback that throws drops and counts that one entry and leaves the entries behind it
+     * untouched, because they name other entities; the first failure is rethrown afterwards through the same
+     * completion path as every other server-thread step.
+     */
+    private void applyDeferredEntityRemovals(RegionEntityTickBatch batch) {
+        final RegionEntityTickBatch.RemovalDrain drain = batch.drainDeferredRemovals();
+        this.repeatedDeferredRemovalCount.addAndGet(drain.repeats());
+        if (drain.removals().isEmpty()) {
+            return;
+        }
+        final ServerLevel level = batch.level();
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isRemovalSeamClosed()) {
+            this.droppedDeferredRemovalCount.addAndGet(drain.removals().size());
+            return;
+        }
+        Throwable failure = null;
+        for (final RegionEntityTickBatch.DeferredEntityRemoval removal : drain.removals()) {
+            final Entity entity = removal.entity();
+            if (!entity.isRemoved()
+                    || !entity.isAddedToLevel()
+                    || entity.level() != level
+                    || entity.getLevelCallback() != removal.callback()) {
+                // The removal was already applied by the server thread (the section manager replaced the
+                // level callback it recorded with the NULL callback), the entity was revived, its level
+                // changed or it left the level: the deferred removal is a no-op, never a second removal.
+                this.repeatedDeferredRemovalCount.incrementAndGet();
+                continue;
+            }
+            try {
+                removal.callback().onRemove(removal.reason());
+                this.appliedDeferredRemovalCount.incrementAndGet();
+            } catch (Throwable throwable) {
+                this.droppedDeferredRemovalCount.incrementAndGet();
+                if (failure == null) {
+                    failure = throwable;
+                } else {
+                    failure.addSuppressed(throwable);
+                }
+            }
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /**
+     * Closes the deferred seams of every active entity batch when shutdown starts.
      * <p>
      * A shut-down engine never runs a barrier again, so a batch that still ticks must not accept another
-     * section update: the next worker move is refused by the storage guard instead of being granted and
-     * dropped. The updates that already wait are released and counted, so no entity reference stays
-     * reachable from the batch and nothing is applied after the shutdown.
+     * section update or another removal: the next worker move or removal is refused by the storage guard
+     * instead of being granted and dropped. The updates and removals that already wait are released and
+     * counted, so no entity reference stays reachable from the batch and nothing is applied after the
+     * shutdown.
      */
-    private void closeDeferredSectionSeams() {
+    private void closeDeferredSeams() {
         for (final RegionTickBatch active : this.activeTickBatches) {
             if (active instanceof RegionEntityTickBatch entityBatch) {
                 this.droppedDeferredSectionUpdateCount.addAndGet(entityBatch.closeDeferredSectionUpdates());
+                final RegionEntityTickBatch.RemovalDrain releasedRemovals = entityBatch.closeDeferredRemovals();
+                this.droppedDeferredRemovalCount.addAndGet(releasedRemovals.removals().size());
+                this.repeatedDeferredRemovalCount.addAndGet(releasedRemovals.repeats());
             }
         }
     }
@@ -3495,6 +3584,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.retriedDeferredEntityMoveCount.get(),
                 this.appliedDeferredSectionUpdateCount.get(),
                 this.droppedDeferredSectionUpdateCount.get(),
+                this.appliedDeferredRemovalCount.get(),
+                this.droppedDeferredRemovalCount.get(),
+                this.repeatedDeferredRemovalCount.get(),
+                RegionOwnershipViolationHandler.entityAdditionRejectionCount(),
                 RegionWorkerChunkUnavailableException.refusalCount(),
                 this.chunkFallbackEntityTicks.get(),
                 this.chunkPreloadRefusedEntityTicks.get(),
@@ -3541,9 +3634,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.entityTransferJournal.clear();
                     this.pendingDeferredEntityMoves.clear();
                 }
-                // Close the section seam before waiting for the batches: a worker of a batch that still runs
-                // must be refused from now on, and the updates that already wait are released.
-                this.closeDeferredSectionSeams();
+                // Close the deferred seams before waiting for the batches: a worker of a batch that still runs
+                // must be refused from now on, and the updates and removals that already wait are released.
+                this.closeDeferredSeams();
                 this.awaitActiveTickBatches(null);
                 this.awaitSubmittedRegionTasks(null);
                 // Drain work whose worker submission was rejected while the pool was closing. No new worker

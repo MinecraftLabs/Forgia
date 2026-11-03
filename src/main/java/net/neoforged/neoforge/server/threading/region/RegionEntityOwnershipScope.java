@@ -28,12 +28,12 @@ import org.jetbrains.annotations.Nullable;
  * re-entrant in the strict stack order of its opening.
  * <p>
  * This is field-level ownership of the entities a group ticks, not entity storage ownership. Only the
- * vanilla mutations listed in {@link #GRANTABLE_OPERATIONS} are granted; removal, level admission,
- * subclass mutations that run additional side effects and every guard without an entity argument stay
- * rejected. The lease makes no atomicity claim about entity storage, tracking, cross-region reads, chunk
- * state or the vanilla section index: those keep their server-thread handoff and their storage guard. The
- * only storage read the lease adds is the region-scoped range query of its own physical bucket; see
- * {@link RegionScopedEntityQuery}.
+ * vanilla mutations listed in {@link #GRANTABLE_OPERATIONS} and the removals listed in
+ * {@link #GRANTABLE_REMOVAL_OPERATIONS} are granted; level admission, subclass mutations that run additional
+ * side effects and every guard without an entity argument stay rejected. The lease makes no atomicity claim
+ * about entity storage, tracking, cross-region reads, chunk state or the vanilla section index: those keep
+ * their server-thread handoff and their storage guard. The only storage read the lease adds is the
+ * region-scoped range query of its own physical bucket; see {@link RegionScopedEntityQuery}.
  * <p>
  * A position change of an entity that is <em>added to a level</em> also reaches two server-owned level
  * effects after it wrote the position and bounds: {@code EntityInLevelCallback#onMove} - for a real entity
@@ -46,16 +46,24 @@ import org.jetbrains.annotations.Nullable;
  * the caller is not a native worker - the move keeps today's refusal. {@code Entity#isAddedToLevel()} is
  * the Neo marker that the server sets when it admits an entity and clears when the entity leaves the
  * level, so it is exactly the population whose position change needs the deferral.
+ * <p>
+ * A removal of an entity added to the level is the second mutation with a server-owned effect: the vanilla
+ * removal sets the entity's own removal state and then runs its level callback, which removes the entity
+ * from the level's storage. The lease therefore grants a removal only when the batch can defer that
+ * callback: the worker records it with
+ * {@link #deferEntityRemoval(Entity, EntityInLevelCallback, Entity.RemovalReason)} and the barrier applies it
+ * on the server thread. The entity is removed for the rest of the worker tick, because the worker itself set
+ * the removal state. A removal of an entity that is not added to a level has no server-owned effect and
+ * needs no deferral.
  */
 @ApiStatus.Internal
 public final class RegionEntityOwnershipScope implements AutoCloseable {
     /**
      * The vanilla entity mutations a lease may grant.
      * <p>
-     * This is an allowlist, not a denylist. Removal ({@code Entity.discard}, {@code Entity.remove},
-     * {@code Entity.setRemoved} and every subclass override of them), {@code Entity.teleportTo} (the
-     * cross-level teleport, which changes level, identity and storage), the subclass mutations that run
-     * additional side effects ({@code BlockAttachedEntity.move/setPos} kill and re-anchor the entity,
+     * This is an allowlist, not a denylist. {@code Entity.teleportTo} (the cross-level teleport, which
+     * changes level, identity and storage), the subclass mutations that run additional side effects
+     * ({@code BlockAttachedEntity.move/setPos} kill and re-anchor the entity,
      * {@code ServerPlayer.teleportTo/dismountTo/teleportRelative} touch the connection and the chunk source)
      * and every guard without an entity argument stay rejected for an owned entity. A guarded operation
      * therefore stays rejected until it is listed here on purpose.
@@ -65,6 +73,26 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
             "Entity.move",
             "Entity.moveTo",
             "Entity.setPosRaw");
+
+    /**
+     * The vanilla entity removals a lease may grant.
+     * <p>
+     * Every removal entry point funnels into {@code Entity.setRemoved}, so these four names are the whole
+     * removal path of an ordinary entity: {@code discard}, the virtual {@code remove} of {@code Entity} and of
+     * {@code LivingEntity} (which runs the mob effect callbacks and clears the brain before the removal), and
+     * the {@code setRemoved} funnel itself. A grant never runs the level callback on the worker: the removal
+     * is recorded for the batch barrier instead, which applies the callback on the server thread.
+     * <p>
+     * The subclass overrides stay rejected on purpose: {@code Slime.remove} splits into new entities,
+     * {@code Boat.remove}, {@code ChestBoat.remove} and {@code AbstractMinecartContainer.remove} spawn their
+     * contents and {@code FishingHook.remove} reels the hooked entity in. Each of them runs an entity addition
+     * or a foreign mutation before it reaches the funnel, and entity addition is not part of this lease.
+     */
+    private static final Set<String> GRANTABLE_REMOVAL_OPERATIONS = Set.of(
+            "Entity.discard",
+            "Entity.remove",
+            "Entity.setRemoved",
+            "LivingEntity.remove");
 
     private static final ThreadLocal<RegionEntityOwnershipScope> CURRENT = new ThreadLocal<>();
     private static final ThreadLocal<Long> CURRENT_LEASE_ID = new ThreadLocal<>();
@@ -107,16 +135,22 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      * <p>
      * The mutation is granted only while a lease is active, its lease id is the newest one of the current
      * thread, its level is the entity's level, the operation is one of the
-     * {@linkplain #GRANTABLE_OPERATIONS grantable vanilla mutations}, the entity is not removed and the
-     * group owns it. An entity that is added to a level is granted only when the lease can defer its
-     * section publication and its target chunk acquisition to the batch barrier, because the vanilla body
-     * reaches both after it wrote the position. Anything else keeps the caller on the storage guard, which
-     * names the operation and throws before the mutation runs.
+     * {@linkplain #GRANTABLE_OPERATIONS grantable vanilla mutations} or one of the
+     * {@linkplain #GRANTABLE_REMOVAL_OPERATIONS grantable removals}, and the group owns the entity. A field
+     * mutation additionally needs the entity not to be removed; a removal of an entity that is already
+     * removed stays granted, because the vanilla entry point re-enters the removal of an entity a previous
+     * removal marked and the batch turns the repeat into a counted no-op. An entity that is added to a level
+     * is granted only when the lease can defer the server-owned effect of the mutation to the batch barrier -
+     * the section publication and the target chunk acquisition of a position change, the level callback of a
+     * removal - because the vanilla body reaches them after it wrote the entity's own state. Anything else
+     * keeps the caller on the storage guard, which names the operation and throws before the mutation runs.
      * <p>
      * The call records the decision for the entity worker diagnostics: a grant counts an allowance, a
      * refusal under the active lease counts an ownership rejection. Nothing is counted without an active
      * lease, because such a caller never had an ownership decision - the storage guard rejected it and
-     * counted the violation.
+     * counted the violation. A refusal of a mutation of an entity that is neither added to the level nor
+     * owned by the lease is also counted as a rejected entity spawn, because the vanilla entity constructor
+     * writes the position of a new entity before the entity is added to the level.
      */
     public static boolean grantsEntityMutation(ServerLevel level, Entity entity, String operation) {
         final RegionEntityOwnershipScope scope = CURRENT.get();
@@ -124,15 +158,39 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
             return false;
         }
         if (scope.coordinate.level() == level
-                && GRANTABLE_OPERATIONS.contains(operation)
-                && !entity.isRemoved()
                 && scope.group.owns(entity)
-                && (!entity.isAddedToLevel() || defersSectionUpdate(entity))) {
+                && grantsOperation(scope, entity, operation)) {
             ALLOWED_MUTATION_COUNT.incrementAndGet();
             return true;
         }
+        if (scope.coordinate.level() == level && !entity.isAddedToLevel() && !scope.group.owns(entity)) {
+            // The vanilla entity constructor writes the position of a new entity before the entity is added to
+            // the level, so a rejected mutation of an entity that is neither in the level nor owned by the lease
+            // is a worker-side entity spawn - death loot, an experience orb, a projectile. It is counted
+            // separately, so the remaining spawn rate stays observable next to the removal counters.
+            RegionOwnershipViolationHandler.recordEntityAdditionRejection();
+        }
         REJECTED_MUTATION_COUNT.incrementAndGet();
         return false;
+    }
+
+    /**
+     * {@return true when {@code operation} on {@code entity} is granted under the active lease {@code scope}}
+     * <p>
+     * A removal is granted when the lease can defer its level callback - an entity that is not added to a
+     * level has no server-owned effect to defer. A field mutation is granted when the entity is not removed
+     * and the lease can defer its section publication and target chunk acquisition. Every other operation
+     * stays rejected.
+     */
+    private static boolean grantsOperation(RegionEntityOwnershipScope scope, Entity entity, String operation) {
+        if (GRANTABLE_REMOVAL_OPERATIONS.contains(operation)) {
+            // Only a native worker defers, so only a native worker is granted the removal of an added entity.
+            return !entity.isAddedToLevel()
+                    || (RegionWorkerScope.isNativeWorkerThread() && scope.group.batch().acceptsDeferredRemovals());
+        }
+        return GRANTABLE_OPERATIONS.contains(operation)
+                && !entity.isRemoved()
+                && (!entity.isAddedToLevel() || defersSectionUpdate(entity));
     }
 
     /**
@@ -235,6 +293,38 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     private static boolean defersSectionUpdate(Entity entity) {
         final RegionEntityOwnershipScope scope = sectionUpdateOwner(entity);
         return scope != null && scope.group.batch().acceptsDeferredSectionUpdates();
+    }
+
+    /**
+     * Defers the level callback of the removal of {@code entity} to the batch barrier.
+     * <p>
+     * The worker records the callback the inline vanilla removal would have invoked and the removal reason;
+     * the barrier runs the callback on the server thread, so the section membership, the tracking and ticking
+     * callbacks, the identity ledger and the region index are written exactly as they are for a server-thread
+     * removal. The entity's own removal state is written by the caller, so the rest of the worker tick sees a
+     * removed entity.
+     * <p>
+     * Nothing is recorded outside a lease that owns the entity: the server thread, the client, every ordinary
+     * thread, a foreign entity and a lease that outlived its batch answer {@code false} and keep the inline
+     * vanilla callback. An entity that is not added to a level answers {@code false} as well, because its
+     * level callback is the {@code NULL} callback and the removal has no server-owned effect.
+     *
+     * @param entity   the entity that is being removed
+     * @param callback the entity's level callback, the exact object the inline vanilla removal would invoke
+     * @param reason   the removal reason the entity is being marked with
+     * @return {@code true} when the caller must skip the level callback, because the barrier runs it instead
+     */
+    public static boolean deferEntityRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null
+                || !scope.isActive()
+                || !RegionWorkerScope.isNativeWorkerThread()
+                || !scope.group.owns(entity)
+                || !entity.isAddedToLevel()
+                || callback == EntityInLevelCallback.NULL) {
+            return false;
+        }
+        return scope.group.batch().deferRemoval(entity, callback, reason);
     }
 
     /**

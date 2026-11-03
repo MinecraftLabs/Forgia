@@ -75,8 +75,10 @@ import org.junit.jupiter.api.Timeout;
  * server-owned level effects - the section-manager {@code onMove} publication and the target chunk
  * acquisition - to the entity batch barrier; the {@code addedEntity...} test admits an entity to a real
  * {@link PersistentEntitySectionManager} and proves that the worker publishes nothing before the barrier
- * and that the barrier publishes the section of the final position. Removal and the cross-level teleport
- * stay rejected before any mutation, for an added entity as well.
+ * and that the barrier publishes the section of the final position. A removal of an owned entity is granted
+ * as well: it only writes the entity's own removal state and defers its level callback, which
+ * {@code RegionEntityRemovalDeferralTest} covers against a real section manager. The cross-level teleport
+ * stays rejected before any mutation.
  */
 @Timeout(30)
 class RegionEntityOwnershipTest {
@@ -276,12 +278,16 @@ class RegionEntityOwnershipTest {
     }
 
     @Test
-    void removalOfAnOwnedEntityStaysRejectedOnItsWorker() {
+    void removalOfAnOwnedEntityIsGrantedAndOnlyChangesItsOwnState() {
         this.installEngine(1, true);
         final ServerLevel level = mockLevel();
         final List<String> removalAttempts = new CopyOnWriteArrayList<>();
+        final List<Boolean> removedOnWorker = new CopyOnWriteArrayList<>();
+        // This entity is not added to a level, so its removal has no server-owned effect and needs no
+        // deferral; the granted removal only writes the entity's own removal state.
         final TestEntity entity = new TestEntity(level, self -> {
             recordAttempt(removalAttempts, self::discard);
+            removedOnWorker.add(self.isRemoved());
             recordAttempt(removalAttempts, () -> self.remove(Entity.RemovalReason.KILLED));
             recordAttempt(removalAttempts, () -> self.setRemoved(Entity.RemovalReason.DISCARDED));
         });
@@ -290,15 +296,16 @@ class RegionEntityOwnershipTest {
         assertTrue(plan.accept(entity));
         plan.executeAndAwait();
 
-        assertEquals(3, removalAttempts.size());
-        assertTrue(removalAttempts.get(0).contains("Entity.discard"), removalAttempts.toString());
-        assertTrue(removalAttempts.get(1).contains("Entity.remove"), removalAttempts.toString());
-        assertTrue(removalAttempts.get(2).contains("Entity.setRemoved"), removalAttempts.toString());
-        assertNull(entity.getRemovalReason(), "a rejected removal must not change the removal reason");
-        assertFalse(entity.isRemoved());
+        assertEquals(List.of("granted", "granted", "granted"), removalAttempts);
+        assertEquals(List.of(true), removedOnWorker, "the removal must be visible to the rest of the tick");
+        assertEquals(Entity.RemovalReason.DISCARDED, entity.getRemovalReason(),
+                "the first removal reason wins, exactly like the vanilla removal");
+        assertTrue(entity.isRemoved());
         assertEquals(1L, this.engine.diagnostics().entityTicksOnWorkers());
-        assertEquals(0L, this.engine.diagnostics().entityMutationsAllowedByOwnership());
-        assertEquals(3L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
+        assertEquals(6L, this.engine.diagnostics().entityMutationsAllowedByOwnership(),
+                "discard, remove and setRemoved are granted again for every removal that re-enters them");
+        assertEquals(0L, this.engine.diagnostics().entityMutationsRejectedByOwnership());
+        assertEquals(0L, this.engine.diagnostics().ownershipViolationCount());
     }
 
     @Test

@@ -37,6 +37,12 @@ import org.jetbrains.annotations.Nullable;
  * {@link EntityInLevelCallback#onMove()} publication of the entity section and the target chunk
  * acquisition are server-owned storage. The worker records one deferred section update per move instead,
  * and the barrier applies both effects on the server thread from the entity's final position.
+ * <p>
+ * A worker that removes an entity it owns cannot run the level callback of the removal either: it writes the
+ * entity's own removal state and records one deferred removal, and the barrier runs the callback on the
+ * server thread, so the section membership, the tracking and ticking callbacks, the identity ledger and the
+ * region index are written exactly like a server-thread removal. A removal of an entity that is already
+ * recorded is a counted no-op, so an entity is never removed twice.
  */
 @ApiStatus.Internal
 final class RegionEntityTickBatch extends RegionTickBatch {
@@ -67,6 +73,20 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private final List<DeferredSectionUpdate> deferredSectionUpdates = Collections.synchronizedList(new ArrayList<>());
     /** Set when the engine shuts down; guarded by the monitor of {@link #deferredSectionUpdates}. */
     private volatile boolean sectionUpdateSeamClosed;
+    /**
+     * Removals that a worker recorded for the barrier, keyed by entity identity.
+     * <p>
+     * The entity is its own key, so a repeat of the same removal is one hash lookup instead of a scan, and
+     * the first record is the removal that runs. The map is guarded by its own monitor, is only filled from
+     * workers, and is drained and cleared once per tick by the barrier, so it stays bounded by the entities
+     * removed in the current tick. Each entry keeps the level callback the inline vanilla removal would have
+     * invoked and the removal reason, so the barrier runs the normal removal path on the server thread.
+     */
+    private final IdentityHashMap<Entity, DeferredEntityRemoval> deferredRemovals = new IdentityHashMap<>();
+    /** Removal requests the batch turned into a no-op; guarded by the monitor of {@link #deferredRemovals}. */
+    private long repeatedRemovalCount;
+    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredRemovals}. */
+    private volatile boolean removalSeamClosed;
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level) {
@@ -241,6 +261,84 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     }
 
     /**
+     * {@return true when the barrier of this batch will still apply deferred removals}
+     * <p>
+     * The level callback of a removal is server-owned storage, so it may only be deferred to a barrier that
+     * still runs. A batch that already completed its barrier, or whose seam was closed because the engine shut
+     * down, cannot defer it and keeps the storage refusal instead of letting a worker remove an entity whose
+     * storage removal nobody applies.
+     */
+    boolean acceptsDeferredRemovals() {
+        return !this.isRemovalSeamClosed() && !this.isComplete();
+    }
+
+    /**
+     * {@return true when this batch no longer accepts or applies deferred removals}
+     */
+    boolean isRemovalSeamClosed() {
+        return this.removalSeamClosed;
+    }
+
+    /**
+     * Records the level callback of one removal that a worker deferred to the barrier.
+     * <p>
+     * The first removal of an entity is the one that runs. A repeat - the vanilla entry point removing an
+     * entity that a previous removal already marked, which reaches the same funnel again - is a counted no-op,
+     * so the entity is never removed twice.
+     *
+     * @param entity   the entity that is being removed
+     * @param callback the level callback the inline vanilla removal would have invoked
+     * @param reason   the removal reason the entity is being marked with
+     * @return {@code false} when the seam was closed or the barrier already completed, so the removal can
+     *         never be applied and the caller has to keep the storage refusal
+     */
+    boolean deferRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {
+        synchronized (this.deferredRemovals) {
+            if (this.removalSeamClosed || this.isComplete()) {
+                return false;
+            }
+            if (this.deferredRemovals.containsKey(entity)) {
+                this.repeatedRemovalCount++;
+                return true;
+            }
+            this.deferredRemovals.put(entity, new DeferredEntityRemoval(entity, callback, reason));
+            return true;
+        }
+    }
+
+    /**
+     * Stops accepting deferred removals and releases the ones that already wait.
+     * <p>
+     * Called when the engine shuts down: the barrier of this batch will never apply a removal again, so a
+     * worker that still ticks must be refused instead of granted, and the released removals must not keep an
+     * entity reference alive.
+     *
+     * @return the released removals and the repeats that were counted but not applied
+     */
+    RemovalDrain closeDeferredRemovals() {
+        synchronized (this.deferredRemovals) {
+            this.removalSeamClosed = true;
+            return this.drainRemovals();
+        }
+    }
+
+    /**
+     * Takes the deferred removals that wait for the end of the batch.
+     */
+    RemovalDrain drainDeferredRemovals() {
+        synchronized (this.deferredRemovals) {
+            return this.drainRemovals();
+        }
+    }
+
+    private RemovalDrain drainRemovals() {
+        final RemovalDrain drain = new RemovalDrain(List.copyOf(this.deferredRemovals.values()), this.repeatedRemovalCount);
+        this.deferredRemovals.clear();
+        this.repeatedRemovalCount = 0L;
+        return drain;
+    }
+
+    /**
      * Takes the deferred section updates that wait for the end of the batch.
      */
     List<DeferredSectionUpdate> drainDeferredSectionUpdates() {
@@ -305,6 +403,19 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * well, because a section coordinate is a chunk coordinate.
      */
     record DeferredSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {}
+
+    /**
+     * One deferred removal: the removed entity, the level callback the inline vanilla removal would have
+     * invoked and the removal reason the entity was marked with. The barrier runs that callback on the server
+     * thread, which is the whole server-owned part of the removal.
+     */
+    record DeferredEntityRemoval(Entity entity, EntityInLevelCallback callback, Entity.RemovalReason reason) {}
+
+    /**
+     * One drain of the deferred removals of a batch: the removals to apply and the removal requests that were
+     * already recorded or already applied and were therefore counted as no-ops.
+     */
+    record RemovalDrain(List<DeferredEntityRemoval> removals, long repeats) {}
 
     /**
      * One region's share of the batch: the region lease, the entities it ticks, and the snapshot members

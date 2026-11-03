@@ -26,6 +26,21 @@ package net.neoforged.neoforge.server.threading.region;
  * update never leaves a section publication behind, and a failing update never costs the updates queued
  * behind it.
  * <p>
+ * The three removal counters report the level callback of a worker entity removal that the batch barrier
+ * applied, dropped or turned into a no-op. An applied count is one normal removal path on the server thread:
+ * the identity departure, the section removal, the tracking and ticking stop, the destruction callback and
+ * the region retirement. A dropped count is one removal that did not complete (the engine shut down, the
+ * level identity closed, the entity left the level, it was revived, or its callback threw). A repeated count
+ * is one removal request that was a no-op because the entity was already recorded or its removal had already
+ * been applied; a repeat is never a second removal.
+ * <p>
+ * {@link #entityAddRejectedOnWorker()} counts the entity spawns a native region worker attempted and the
+ * storage guard refused: death loot, experience orbs, projectiles and every other entity a worker-side tick
+ * tries to create. It counts both the position write of the new entity - the vanilla constructor writes it
+ * before the entity is added to the level - and the admission into the level, so one spawn attempt is counted
+ * once. Entity addition is not part of the ownership lease, so this count is the rate of entity ticks that
+ * still fail on a worker.
+ * <p>
  * The two ownership counters report the entity tick lease of a region worker group. An allowance counts
  * one grant of a vanilla entity mutation the lease may own: it is the lease decision, not a completed
  * mutation, so one vanilla call can record several allowances when it enters several granted guard sites.
@@ -128,6 +143,10 @@ public record RegionThreadingDiagnostics(
         long retriedDeferredEntityMoveCount,
         long deferredEntitySectionUpdatesApplied,
         long droppedDeferredEntitySectionUpdates,
+        long deferredEntityRemovalsApplied,
+        long droppedDeferredEntityRemovals,
+        long repeatedDeferredEntityRemovals,
+        long entityAddRejectedOnWorker,
         long chunkGuardRefusals,
         long chunkFallbackEntityTicks,
         long chunkPreloadRefusedEntityTicks,
