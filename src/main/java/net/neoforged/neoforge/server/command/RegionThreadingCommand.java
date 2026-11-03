@@ -126,6 +126,13 @@ final class RegionThreadingCommand {
                 + ", pendingEntityTransfers=" + diagnostics.pendingEntityTransferCount()
                 + ", rememberedEntityTransferResults=" + diagnostics.rememberedEntityTransferResultCount()
                 + ", rejectedEntityTransferRecords=" + diagnostics.rejectedEntityTransferRecordCount()
+                + ", entityTickRegionsOnWorkers=" + diagnostics.entityTickRegionsOnWorkers()
+                + ", fallbackEntityTickRegions=" + diagnostics.fallbackEntityTickRegions()
+                + ", entityTickRegionsWithoutEligibleChunk=" + diagnostics.entityTickRegionsWithoutEligibleChunk()
+                + ", entityTicksOutsideRegion=" + diagnostics.entityTicksOutsideRegion()
+                + ", serverThreadOnlyEntityTicks=" + diagnostics.serverThreadOnlyEntityTicks()
+                + ", unindexedEntityTickStarts=" + diagnostics.unindexedEntityTickStarts()
+                + ", entityTickIndexFallbacks=" + diagnostics.entityTickIndexFallbacks()
                 + ", regionPolicy=" + diagnostics.regionPolicy()
                 + ", regionChunkSize=" + diagnostics.regionChunkSize()
                 + ", entityStorageMode=" + diagnostics.entityStorageMode()), false);

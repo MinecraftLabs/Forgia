@@ -53,6 +53,13 @@ final class ThreadedRegionizer {
     private final AtomicLong splitCheckRequestCount = new AtomicLong();
     private final AtomicLong mergeCheckRequestCount = new AtomicLong();
     /**
+     * Sequence of the entity tick index, assigned when an entity enters a region's index or re-enters the
+     * level's entity tick list. It is strictly increasing per regionizer, so the index order of one region is
+     * the order of the level's own entity tick list restricted to that region - also after a merge, a split or
+     * a move between regions, which keep the sequence of the entry they migrate.
+     */
+    private final AtomicLong entityTickSequence = new AtomicLong();
+    /**
      * Number of write-lock acquisitions, so one barrier that publishes many mappings in one scope is
      * distinguishable from one acquisition per mapping.
      */
@@ -213,9 +220,14 @@ final class ThreadedRegionizer {
         final RegionState sectionRegion = this.sectionRegions.get(sectionCoordinate(coordinate));
         if (sectionRegion != null) {
             this.regions.putIfAbsent(coordinate, sectionRegion);
+            // The coordinate is a member cell of the merged region, even when its chunk was loaded before
+            // this regionizer existed and no chunk load publishes it.
+            sectionRegion.addCell(sectionCoordinate(coordinate));
             return sectionRegion;
         }
-        return this.regions.computeIfAbsent(coordinate, RegionState::new);
+        final RegionState created = this.regions.computeIfAbsent(coordinate, RegionState::new);
+        created.addCell(sectionCoordinate(coordinate));
+        return created;
     }
 
     RegionState get(RegionCoordinate coordinate) {
@@ -286,21 +298,99 @@ final class ThreadedRegionizer {
     RegionState addEntity(Entity entity, RegionCoordinate coordinate) {
         final long stamp = this.acquireWriteLock();
         try {
-            if (this.isLevelClosedLocked(coordinate.level())) {
-                return null;
-            }
-            final RegionState region = this.getOrCreateLocked(coordinate);
-            final RegionState previous = this.entities.put(entity, region);
-            this.entityLevels.put(entity, coordinate.level());
-            if (previous != null && previous != region) {
-                this.removeIfEmpty(previous);
-                this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), region);
-                this.structuralChangeCount.incrementAndGet();
-            } else if (previous == null) {
-                this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), region);
-                this.structuralChangeCount.incrementAndGet();
-            }
+            return this.addEntityLocked(entity, coordinate);
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * Publishes the region mapping of one entity and keeps the region's entity tick index in step with it.
+     * <p>
+     * The index side is what makes a region's entity set enumerable for its worker: an entity that is mapped
+     * into a region is indexed there once, and a move between regions migrates the entry instead of dropping
+     * it, so the entity keeps its position in the region's tick order. A first mapping creates a non-ticking
+     * entry; only the level's entity tick list marks an entry as ticking.
+     * <p>
+     * Runs under the regionizer write lock, exactly like every other index mutation.
+     */
+    @Nullable
+    private RegionState addEntityLocked(Entity entity, RegionCoordinate coordinate) {
+        if (this.isLevelClosedLocked(coordinate.level())) {
+            return null;
+        }
+        final RegionState region = this.getOrCreateLocked(coordinate);
+        final RegionState previous = this.entities.put(entity, region);
+        this.entityLevels.put(entity, coordinate.level());
+        if (previous == region) {
             return region;
+        }
+        if (previous == null) {
+            region.indexEntityTickEntry(entity, this.entityTickSequence.incrementAndGet());
+            this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), region);
+            this.structuralChangeCount.incrementAndGet();
+        } else {
+            this.migrateEntityTickEntry(entity, previous, region);
+            this.removeIfEmptyLocked(previous);
+            this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), region);
+            this.structuralChangeCount.incrementAndGet();
+        }
+        return region;
+    }
+
+    /**
+     * Moves the index entry of {@code entity} from {@code source} to {@code destination}.
+     */
+    private void migrateEntityTickEntry(Entity entity, RegionState source, RegionState destination) {
+        final RegionEntityTickEntry entry = source.removeEntityTickEntry(entity);
+        if (entry != null) {
+            destination.indexExistingEntityTickEntry(entry);
+        }
+    }
+
+    /**
+     * Indexes {@code entity} for one start of its entity tick, exactly like the vanilla tick list adds it.
+     * <p>
+     * Called by the entity tick list hook, on the server thread, when the level starts ticking an entity: the
+     * region mapping is published if the entity is not tracked yet (this is the only place a first mapping is
+     * created without the entity having ticked), and the index entry is marked as ticking so the region's
+     * worker ticks it. A re-insertion after the entity stopped ticking appends the entry, exactly like the
+     * vanilla tick list appends it.
+     *
+     * @return {@code false} when the entity could not be indexed, so the caller has to keep it on the
+     *         server-thread path
+     */
+    boolean onEntityTickStarted(ServerLevel level, Entity entity) {
+        final long stamp = this.acquireWriteLock();
+        try {
+            if (this.closed || this.isLevelClosedLocked(level)) {
+                return false;
+            }
+            final RegionState region = this.addEntityLocked(entity, this.layout.regionAt(level, entity.blockPosition()));
+            if (region == null) {
+                return false;
+            }
+            region.markEntityTickEntryTicking(entity, this.entityTickSequence.incrementAndGet());
+            return true;
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * Records that the level's entity tick list no longer contains {@code entity}.
+     * <p>
+     * Called by the entity tick list hook on the server thread. The mapping and the index entry stay: the
+     * region still owns the entity (its scheduled tasks and its region queries keep working), and only the
+     * tick bit is cleared, so no worker ticks an entity the level stopped ticking.
+     */
+    void onEntityTickEnded(ServerLevel level, Entity entity) {
+        final long stamp = this.acquireWriteLock();
+        try {
+            final RegionState region = this.entities.get(entity);
+            if (region != null) {
+                region.markEntityTickEntryNotTicking(entity);
+            }
         } finally {
             this.releaseWriteLock(stamp);
         }
@@ -372,6 +462,11 @@ final class ThreadedRegionizer {
                 this.entityLevels.put(entity, level);
                 if (previous != destination) {
                     changed = true;
+                    if (previous != null) {
+                        this.migrateEntityTickEntry(entity, previous, destination);
+                    } else {
+                        destination.indexEntityTickEntry(entity, this.entityTickSequence.incrementAndGet());
+                    }
                 }
             }
             // The mapping is committed from here on. Everything below is recalculation for the regions the
@@ -457,8 +552,10 @@ final class ThreadedRegionizer {
             // check per destination region instead of one per entity it publishes into it.
             final Set<RegionCoordinate> mergeChecks = this.layout.isFixed() ? null : new LinkedHashSet<>();
             for (final OwnerMove move : additions) {
-                this.entities.put(move.entity(), this.getOrCreateLocked(move.destination()));
+                final RegionState destination = this.getOrCreateLocked(move.destination());
+                this.entities.put(move.entity(), destination);
                 this.entityLevels.put(move.entity(), move.destination().level());
+                destination.indexEntityTickEntry(move.entity(), this.entityTickSequence.incrementAndGet());
                 published.add(move.entity());
                 if (mergeChecks != null) {
                     mergeChecks.add(move.destination());
@@ -566,8 +663,9 @@ final class ThreadedRegionizer {
             final RegionState region = this.entities.remove(entity);
             this.entityLevels.remove(entity);
             if (region != null) {
+                region.removeEntityTickEntry(entity);
                 this.structuralChangeCount.incrementAndGet();
-                this.removeIfEmpty(region);
+                this.removeIfEmptyLocked(region);
             }
         } finally {
             this.releaseWriteLock(stamp);
@@ -611,6 +709,8 @@ final class ThreadedRegionizer {
             this.regions.values().forEach(region -> {
                 if (region.coordinate().level() == level) {
                     region.clearTasks();
+                    region.clearEntityTickEntries();
+                    region.clearCells();
                     region.markDead();
                 }
             });
@@ -640,6 +740,8 @@ final class ThreadedRegionizer {
             final boolean changed = !this.regions.isEmpty() || !this.sections.isEmpty() || !this.entities.isEmpty();
             this.regions.values().forEach(region -> {
                 region.clearTasks();
+                region.clearEntityTickEntries();
+                region.clearCells();
                 region.markDead();
             });
             this.entityLevels.clear();
@@ -676,8 +778,14 @@ final class ThreadedRegionizer {
         return new RegionSectionCoordinate(coordinate.level(), coordinate.regionX(), coordinate.regionZ());
     }
 
+    /**
+     * {@return true when the region still owns an entity mapping}
+     * <p>
+     * The entity tick index of the region holds exactly the mapped entities, so the check is constant time
+     * instead of a scan of the whole level's entity map.
+     */
     private boolean hasTrackedEntities(RegionState region) {
-        return this.entities.containsValue(region);
+        return region.entityTickEntryCount() > 0;
     }
 
     /**
@@ -783,6 +891,10 @@ final class ThreadedRegionizer {
         source.clearSections();
         this.regions.replaceAll((coordinate, region) -> region == source ? target : region);
         this.entities.replaceAll((entity, region) -> region == source ? target : region);
+        // The merged region keeps every entity and every cell of both regions; the tick order of the level's
+        // own list is preserved by the sequences of the migrated entries.
+        target.absorbEntityTickEntriesFrom(source);
+        target.absorbCellsFrom(source);
         this.structuralChangeCount.incrementAndGet();
     }
 
@@ -806,10 +918,12 @@ final class ThreadedRegionizer {
 
         this.regions.values().removeIf(value -> value == region);
         region.clearSections();
+        region.clearCells();
         for (final List<RegionSectionState> component : components) {
             final RegionState splitRegion = new RegionState(component.get(0).coordinate().regionCoordinate());
             for (final RegionSectionState section : component) {
                 splitRegion.addSection(section);
+                splitRegion.addCell(section.coordinate());
                 this.sectionRegions.put(section.coordinate(), splitRegion);
                 this.regions.put(section.coordinate().regionCoordinate(), splitRegion);
             }
@@ -819,7 +933,9 @@ final class ThreadedRegionizer {
             if (currentRegion != region || !(entity.level() instanceof ServerLevel level)) {
                 return currentRegion;
             }
-            return this.getOrCreateLocked(this.layout.regionAt(level, entity.blockPosition()));
+            final RegionState destination = this.getOrCreateLocked(this.layout.regionAt(level, entity.blockPosition()));
+            this.migrateEntityTickEntry(entity, region, destination);
+            return destination;
         });
         this.structuralChangeCount.incrementAndGet();
     }
@@ -890,6 +1006,31 @@ final class ThreadedRegionizer {
 
     private Set<RegionState> uniqueRegionsLocked() {
         return new HashSet<>(this.regions.values());
+    }
+
+    /**
+     * {@return the live regions of {@code level} whose entity tick index holds at least one ticking entity}
+     * <p>
+     * This is the activation set of the level's entity tick: the server thread leases exactly these regions
+     * and submits one worker task per region. A region without a ticking entity has no entity work this tick
+     * (its entities are mapped but not in the level's entity tick list), so it is not activated at all.
+     */
+    void collectActiveEntityTickRegions(ServerLevel level, List<RegionState> active) {
+        final long stamp = this.regionLock.readLock();
+        try {
+            for (final RegionState region : this.regions.values()) {
+                if (region.coordinate().level() != level || region.isDead() || region.tickingEntityCount() == 0) {
+                    continue;
+                }
+                // A merged region is registered under every member coordinate; the region that owns its own
+                // coordinate is the one that is activated.
+                if (this.regions.get(region.coordinate()) == region) {
+                    active.add(region);
+                }
+            }
+        } finally {
+            this.regionLock.unlockRead(stamp);
+        }
     }
 
     int sectionCount() {

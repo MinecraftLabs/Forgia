@@ -1148,7 +1148,10 @@ class RegionEntityTickPlanTest {
     }
 
     private RegionEntityTickPlan plan(ServerLevel level) {
-        final RegionEntityTickPlan plan = this.engine.beginEntityTickPlan(level, entity -> true, PARKING_BARRIER);
+        // The per-entity mode: these tests drive the acceptance and grouping mechanics directly, and a
+        // level whose tick list is present but whose entities are collected by hand is not the self-driven
+        // mode of the entity slice.
+        final RegionEntityTickPlan plan = this.engine.beginPerEntityTickPlan(level, entity -> true, PARKING_BARRIER);
         assertNotNull(plan, "entity tick worker execution must be enabled");
         return plan;
     }

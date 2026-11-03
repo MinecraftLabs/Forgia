@@ -187,5 +187,12 @@ public record RegionThreadingDiagnostics(
         long unchangedDeferredEntityMoves,
         long refusedDeferredEntityMoveBatches,
         long scheduledTaskMigrations,
+        long entityTickRegionsOnWorkers,
+        long fallbackEntityTickRegions,
+        long entityTickRegionsWithoutEligibleChunk,
+        long entityTicksOutsideRegion,
+        long serverThreadOnlyEntityTicks,
+        long unindexedEntityTickStarts,
+        long entityTickIndexFallbacks,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {}

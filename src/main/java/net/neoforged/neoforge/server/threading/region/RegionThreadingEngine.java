@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -38,6 +39,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.ticks.LevelTicks;
 import net.minecraft.world.ticks.ScheduledTick;
+import net.neoforged.neoforge.entity.PartEntity;
 import net.neoforged.neoforge.server.threading.EntityRegionScheduler;
 import net.neoforged.neoforge.server.threading.GlobalRegionScheduler;
 import net.neoforged.neoforge.server.threading.RegionScheduler;
@@ -90,6 +92,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * heuristic that keeps the common case off the chunk source, not a correctness bound.
      */
     private static final int ENTITY_TICK_CHUNK_MARGIN = 1;
+    /** Temporary switch of the activation diagnostics of the self-driven entity tick. */
     /** Sentinels of the per batch neighborhood cache: chunk not asked yet, computed not loaded, loaded. */
     private static final byte NEIGHBORHOOD_UNKNOWN = -1;
     private static final byte NEIGHBORHOOD_NOT_LOADED = 0;
@@ -140,6 +143,57 @@ public final class RegionThreadingEngine implements RegionThreading {
      * their region still runs on a worker.
      */
     private final AtomicLong chunkPreloadRefusedEntityTicks = new AtomicLong();
+    /** Regions the self-driven entity tick leased and submitted one worker task for. */
+    private final AtomicLong entityTickRegionsOnWorkers = new AtomicLong();
+    /**
+     * Regions whose entity tick could not be enumerated safely (no lease, no chunk rectangle, a retired
+     * region) and whose entities were therefore ticked on the server thread instead of being dropped.
+     */
+    private final AtomicLong fallbackEntityTickRegions = new AtomicLong();
+    /**
+     * Regions with a ticking entity whose own chunks are all outside the vanilla entity ticking range. Such a
+     * region is still submitted: its entity body runs the despawn check and skips the tick, exactly like the
+     * vanilla pass would.
+     */
+    private final AtomicLong entityTickRegionsWithoutEligibleChunk = new AtomicLong();
+    /** Entities of a region whose position left the region's chunk rectangle, ticked on the server thread. */
+    private final AtomicLong entityTicksOutsideRegion = new AtomicLong();
+    /** Always-ticking entities (players) a region handed to the server thread instead of ticking on a worker. */
+    private final AtomicLong serverThreadOnlyEntityTicks = new AtomicLong();
+    /** Entity tick list entries the region index could not take; they keep the server-thread path. */
+    private final AtomicLong unindexedEntityTickStarts = new AtomicLong();
+    /** Level ticks that fell back to the per-entity entity plan because the level's region index is unavailable. */
+    private final AtomicLong entityTickIndexFallbacks = new AtomicLong();
+    /**
+     * Levels whose entity tick index was seeded from the level's authoritative tick list.
+     */
+    private final Set<Object> seededEntityTickLevels = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    /**
+     * Chunk-load answers of the current loaded-chunk generation of each level.
+     * <p>
+     * The pre-load margin of the entity tick asks the same chunk neighborhood every tick, and a chunk changes
+     * its loaded state only while the level's loaded chunk set changes. The answers are therefore kept until
+     * the level reports a different loaded chunk count; both directions of a stale answer are safe - a stale
+     * "loaded" is refused by the worker chunk guard and ticked on the server thread, a stale "not loaded"
+     * keeps the entity on the server thread - so the cache only decides where an entity ticks, never whether
+     * it ticks.
+     */
+    private final Map<ServerLevel, ChunkLoadAnswers> chunkLoadAnswers = new ConcurrentHashMap<>();
+
+    /** One level's chunk-load answers and the loaded chunk count they were read at. */
+    private static final class ChunkLoadAnswers {
+        private final int loadedChunkCount;
+        private final Long2ByteMap answers = new Long2ByteOpenHashMap();
+        /** The derived one-chunk-margin answer per chunk, so a chunk's neighborhood is decided once. */
+        private final Long2ByteMap neighborhoodAnswers = new Long2ByteOpenHashMap();
+
+        private ChunkLoadAnswers(int loadedChunkCount) {
+            this.loadedChunkCount = loadedChunkCount;
+            this.answers.defaultReturnValue(NEIGHBORHOOD_UNKNOWN);
+            this.neighborhoodAnswers.defaultReturnValue(NEIGHBORHOOD_UNKNOWN);
+        }
+    }
+
     private final AtomicLong blockEntityTicksOnWorkers = new AtomicLong();
     private final AtomicLong skippedBlockEntityTicks = new AtomicLong();
     private final AtomicLong fallbackBlockEntityTicks = new AtomicLong();
@@ -830,7 +884,314 @@ public final class RegionThreadingEngine implements RegionThreading {
             // batch for region state that no longer exists. The publication re-checks this atomically.
             return null;
         }
-        return new RegionEntityTickPlan(this, level, inEntityTickingRange, barrier);
+        if (!this.seedEntityTickIndex(level)) {
+            // The level's authoritative tick list could not be seeded into the region index (a level without
+            // a tick list, or a retiring identity). The per-region index is then not a complete view of the
+            // level's entities, so this tick keeps the per-entity collection instead of dropping entities the
+            // index does not know.
+            this.entityTickIndexFallbacks.incrementAndGet();
+            return new RegionEntityTickPlan(this, level, inEntityTickingRange, barrier, false);
+        }
+        return RegionEntityTickPlan.selfDriven(this, level, inEntityTickingRange, barrier);
+    }
+
+    /**
+     * Starts the per-entity collection of the current {@code level} tick.
+     * <p>
+     * This is the fallback mode of the entity slice: the server thread walks the level's entity tick list and
+     * the plan collects the entities whose region can own them. The production entry point
+     * {@link #beginEntityTickPlan} selects it only for a level whose region entity tick index cannot be
+     * seeded; the region entity tick mechanics are tested through it directly.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    public RegionEntityTickPlan beginPerEntityTickPlan(ServerLevel level, Predicate<Entity> inEntityTickingRange, RegionTickBarrier barrier) {
+        return new RegionEntityTickPlan(this, level, inEntityTickingRange, barrier, false);
+    }
+
+    /**
+     * Seeds {@code level}'s region entity tick index from the level's authoritative entity tick list, once.
+     * <p>
+     * The index is fed by the entity tick list hooks, so a level that starts ticking entities after the engine
+     * was installed - including a level that existed before the bridge was installed - needs one pass over the
+     * list to publish its members. The seed runs on the server thread outside the entity pass, publishes the
+     * region mapping of every entity and marks its index entry as ticking, exactly like the hook would have.
+     *
+     * @return {@code false} when the level has no entity tick list to seed from
+     */
+    private boolean seedEntityTickIndex(ServerLevel level) {
+        if (this.seededEntityTickLevels.contains(level)) {
+            return true;
+        }
+        if (!level.forEachEntityInTickListForRegionIndex(entity -> {
+            if (!this.regionizer.onEntityTickStarted(level, entity)) {
+                this.unindexedEntityTickStarts.incrementAndGet();
+            }
+        })) {
+            return false;
+        }
+        this.seededEntityTickLevels.add(level);
+        return true;
+    }
+
+    /**
+     * Publishes that the level's entity tick list now contains {@code entity}, so the entity is indexed in the
+     * region its mapping names and the region's worker ticks it.
+     * <p>
+     * Called by the entity tick list hook on the server thread. A server that does not execute entity ticks on
+     * region workers keeps the vanilla tick list only.
+     */
+    @ApiStatus.Internal
+    public void entityTickStarted(ServerLevel level, Entity entity) {
+        if (!this.entityTickWorkerExecutionEnabled || this.shutdown) {
+            return;
+        }
+        if (!this.regionizer.onEntityTickStarted(level, entity)) {
+            this.unindexedEntityTickStarts.incrementAndGet();
+        }
+    }
+
+    /**
+     * Publishes that the level's entity tick list no longer contains {@code entity}.
+     * <p>
+     * Called by the entity tick list hook on the server thread. The entity keeps its region mapping and its
+     * index entry; only the tick membership is cleared.
+     */
+    @ApiStatus.Internal
+    public void entityTickEnded(ServerLevel level, Entity entity) {
+        if (!this.entityTickWorkerExecutionEnabled || this.shutdown) {
+            return;
+        }
+        this.regionizer.onEntityTickEnded(level, entity);
+    }
+
+    /**
+     * Ticks the entities of every active region on its owning region worker and waits for the batch.
+     * <p>
+     * This is the self-driven form of {@link #tickEntities(ServerLevel, List, RegionTickBarrier)}: the server
+     * thread does not collect entities. It activates the level's regions (one chunk eligibility snapshot per
+     * region), publishes the batch, leases every region, submits one worker task per region, waits at the
+     * barrier and runs the handoff. A worker enumerates the entity tick index of the region it leased, so the
+     * server thread never walks the level's entity tick list.
+     * <p>
+     * A region whose entity tick cannot be enumerated - no chunk rectangle, a retired region, a lease that
+     * cannot be acquired - is counted, and its entities are ticked on the server thread after the batch
+     * instead of being dropped. An entity of a leased region whose position left the region rectangle, whose
+     * chunk guard would need an unloaded chunk, or that only the server thread may tick (a player) is handed
+     * back to the server thread the same way.
+     */
+    void tickSelfDrivenEntities(ServerLevel level, RegionTickBarrier barrier) {
+        final List<RegionState> regions = new ArrayList<>();
+        this.regionizer.collectActiveEntityTickRegions(level, regions);
+        if (regions.isEmpty()) {
+            return;
+        }
+
+        final RegionEntityTickBatch batch = new RegionEntityTickBatch(level);
+        // The chunk-load answers are shared by every region of the pass and by every following pass of the
+        // same loaded chunk generation, so the level's loaded chunks are asked once instead of once per
+        // neighborhood.
+        final ChunkLoadAnswers chunkAnswers = this.chunkLoadAnswers(level);
+        final Long2ByteMap chunkLoaded = chunkAnswers.answers;
+        final Long2ByteMap neighborhoodLoaded = chunkAnswers.neighborhoodAnswers;
+        final List<RegionEntityTickActivation> activations = new ArrayList<>(regions.size());
+        for (final RegionState region : regions) {
+            final RegionEntityTickActivation activation = RegionEntityTickActivation.activate(level, region, this.layout, chunkLoaded, neighborhoodLoaded);
+            if (activation == null) {
+                // The region's chunk rectangle cannot be decided on the server thread: a region without a
+                // loaded chunk section, or a merged rectangle beyond the snapshot bound. Its entities are
+                // ticked on the server thread instead of being dropped.
+                this.fallbackEntityTickRegions.incrementAndGet();
+                this.addRegionFallback(batch, region);
+                continue;
+            }
+            if (activation.eligibleChunkCount() == 0) {
+                // Nothing in the region may be ticked this tick, but the vanilla body still runs the despawn
+                // check of its entities, so the region is dispatched like any other.
+                this.entityTickRegionsWithoutEligibleChunk.incrementAndGet();
+            }
+            activations.add(activation);
+        }
+        RegionEntityTickAttribution.endPlanSegment();
+        if (activations.isEmpty()) {
+            // Every region was handed to the server thread: no batch has to be published for this tick.
+            this.tickSelfDrivenFallbacks(batch);
+            return;
+        }
+
+        final TickBatchPublication publication = this.publishTickBatch(batch, level);
+        if (publication == TickBatchPublication.LEVEL_CLOSED) {
+            // The level clear completed after the activation. Its region state is retired and no batch may be
+            // published for it: the activated entities must not be ticked or handed to the server-thread
+            // fallback after their level unloaded.
+            for (final RegionEntityTickActivation activation : activations) {
+                this.skippedEntityTicks.addAndGet(activation.region().tickingEntityCount());
+            }
+            return;
+        }
+        if (publication == TickBatchPublication.SHUTDOWN) {
+            for (final RegionEntityTickActivation activation : activations) {
+                this.addRegionFallback(batch, activation.region());
+            }
+            this.tickSelfDrivenFallbacks(batch);
+            return;
+        }
+        batch.markExecutingOnCurrentThread();
+        final boolean attribution = RegionEntityTickAttribution.isEnabled();
+        Throwable failure = null;
+        try {
+            final long leaseStart = attribution ? System.nanoTime() : 0L;
+            try {
+                for (final RegionEntityTickActivation activation : activations) {
+                    final RegionState region = activation.region();
+                    if (!this.acquireRegionLease(region, barrier)) {
+                        this.fallbackEntityTickRegions.incrementAndGet();
+                        this.addRegionFallback(batch, region);
+                        continue;
+                    }
+                    this.entityTickRegionsOnWorkers.incrementAndGet();
+                    this.addLeasedGroup(region, () -> batch.addSelfDrivenGroup(activation, group -> this.selfDrivenEntityTickGroup(group, activation)));
+                }
+            } catch (Throwable throwable) {
+                failure = throwable;
+            } finally {
+                if (attribution) {
+                    RegionEntityTickAttribution.recordLease(System.nanoTime() - leaseStart);
+                }
+            }
+            final long awaitStart = attribution ? System.nanoTime() : 0L;
+            try {
+                batch.submitAndAwait(this.workerPool, barrier);
+            } catch (Throwable throwable) {
+                if (failure == null) {
+                    failure = throwable;
+                }
+            } finally {
+                if (attribution) {
+                    RegionEntityTickAttribution.recordAwait(System.nanoTime() - awaitStart);
+                }
+            }
+        } finally {
+            final long handoffStart = attribution ? System.nanoTime() : 0L;
+            try {
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityRemovals(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityAdditions(batch));
+                failure = runBatchCompletion(failure, () -> this.tickSelfDrivenFallbacks(batch));
+                failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
+                final long publicationStart = attribution ? System.nanoTime() : 0L;
+                try {
+                    failure = runBatchCompletion(failure, () -> this.applyDeferredEntityUpdates(batch));
+                } finally {
+                    if (attribution) {
+                        RegionEntityTickAttribution.recordDeferredPublication(System.nanoTime() - publicationStart);
+                    }
+                }
+                batch.finish();
+                this.activeTickBatches.remove(batch);
+                batch.clearExecutingOnCurrentThread();
+            } finally {
+                if (attribution) {
+                    RegionEntityTickAttribution.recordHandoff(System.nanoTime() - handoffStart);
+                }
+            }
+        }
+
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+        batch.throwIfFailed();
+    }
+
+    /**
+     * {@return the chunk-load answers of the level's current loaded-chunk generation}
+     * <p>
+     * A new generation starts when the level reports a different loaded chunk count; the map is then rebuilt
+     * from the server thread as the pre-load margin asks its chunks.
+     */
+    private ChunkLoadAnswers chunkLoadAnswers(ServerLevel level) {
+        final ServerChunkCache chunkSource = level.getChunkSource();
+        final int loadedChunkCount = chunkSource == null ? 0 : chunkSource.getLoadedChunksCount();
+        ChunkLoadAnswers answers = this.chunkLoadAnswers.get(level);
+        if (answers == null || answers.loadedChunkCount != loadedChunkCount) {
+            answers = new ChunkLoadAnswers(loadedChunkCount);
+            this.chunkLoadAnswers.put(level, answers);
+        }
+        return answers;
+    }
+
+    /**
+     * Hands every ticking entity of {@code region} to the server thread.
+     * <p>
+     * This is the counted per-region fallback: the region's entity tick could not be driven on a worker this
+     * tick, so its entities keep the vanilla server-thread body instead of being dropped.
+     */
+    private void addRegionFallback(RegionEntityTickBatch batch, RegionState region) {
+        for (final RegionEntityTickEntry entry : region.entityTickEntries()) {
+            if (entry.ticking()) {
+                batch.addSelfDrivenFallback(entry.entity());
+            }
+        }
+    }
+
+    /**
+     * Ticks the entities of this pass that a worker handed back, on the server thread.
+     */
+    private void tickSelfDrivenFallbacks(RegionEntityTickBatch batch) {
+        final ServerLevel level = batch.level();
+        for (final Entity entity : batch.chunkFallbackEntities()) {
+            // The chunk source refused a chunk the worker tick needed; the tick it abandoned is completed
+            // here, exactly like the fallback of the per-entity plan.
+            this.tickEntityInline(level, entity);
+        }
+        for (final Entity entity : batch.selfDrivenFallbackEntities()) {
+            this.tickEntityServerSide(level, entity);
+        }
+    }
+
+    /**
+     * Runs the whole vanilla entity body for {@code entity} on the server thread: the discard predicate, the
+     * frozen predicate, the despawn check, the entity ticking range, the riding stack and the non-passenger
+     * tick.
+     * <p>
+     * This is the server-thread path of an entity whose region could not be enumerated or that a worker handed
+     * back, so it reproduces the vanilla pass instead of only its tick.
+     */
+    private void tickEntityServerSide(ServerLevel level, Entity entity) {
+        if (entity.isRemoved() || entity.level() != level) {
+            this.skippedEntityTicks.incrementAndGet();
+            return;
+        }
+        if (this.regionizer.isLevelClosed(level)) {
+            this.skippedEntityTicks.incrementAndGet();
+            return;
+        }
+        final MinecraftServer server = level.getServer();
+        if (RegionEntityTickActivation.shouldDiscard(entity, server == null || server.isSpawningAnimals(), server == null || server.areNpcsEnabled())) {
+            entity.discard();
+            return;
+        }
+        if (RegionEntityTickActivation.isFrozen(entity, level.tickRateManager() == null || level.tickRateManager().runsNormally())) {
+            return;
+        }
+        entity.checkDespawn();
+        if (entity.isRemoved()) {
+            return;
+        }
+        if (!level.isInEntityTickingRange(entity.chunkPosition().toLong())) {
+            return;
+        }
+        final Entity vehicle = entity.getVehicle();
+        if (vehicle != null) {
+            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+                return;
+            }
+            entity.stopRiding();
+        }
+        if (entity.isRemoved() || entity instanceof PartEntity<?>) {
+            return;
+        }
+        level.guardEntityTick(level::tickNonPassenger, entity);
+        this.fallbackEntityTicks.incrementAndGet();
     }
 
     /**
@@ -1192,6 +1553,11 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * {@return the region currently owning {@code entity}, recording the ownership in the regionizer}
+     * <p>
+     * This publishes the mapping of an untracked entity and therefore takes the regionizer write lock. The
+     * per-tick grouping of the entity slice uses {@link #regionFor(Entity)} instead: the authoritative
+     * mapping is maintained by the entity's own tick (and by the recorded transfer), so grouping does not
+     * need to write it again.
      */
     @Nullable
     RegionState regionOf(Entity entity) {
@@ -1199,6 +1565,25 @@ public final class RegionThreadingEngine implements RegionThreading {
             return null;
         }
         return this.regionizer.moveEntity(entity, this.layout.regionAt(level, entity.blockPosition()));
+    }
+
+    /**
+     * {@return the region currently owning {@code entity}, or {@code null} when it is not tracked}
+     * <p>
+     * The read-only counterpart of {@link #regionOf(Entity)}: it never publishes a mapping and takes only the
+     * regionizer read lock. The entity tick plan groups with it, so grouping a tick does not need the
+     * regionizer write lock per entity.
+     */
+    @Nullable
+    RegionState regionFor(Entity entity) {
+        if (!(entity.level() instanceof ServerLevel level)) {
+            return null;
+        }
+        final RegionState region = this.regionizer.regionFor(entity);
+        if (region == null || region.coordinate().level() != level) {
+            return null;
+        }
+        return region;
     }
 
     /**
@@ -1495,7 +1880,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * up once. Nothing is force-loaded: a chunk that the chunk source does not already hold makes its
      * neighborhood unloaded.
      */
-    private boolean isEntityTickNeighborhoodLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded, Long2ByteMap neighborhoodLoaded) {
+    static boolean isEntityTickNeighborhoodLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded, Long2ByteMap neighborhoodLoaded) {
         final long key = ChunkPos.asLong(chunkX, chunkZ);
         final byte cached = neighborhoodLoaded.get(key);
         if (cached != NEIGHBORHOOD_UNKNOWN) {
@@ -1520,12 +1905,14 @@ public final class RegionThreadingEngine implements RegionThreading {
      * <p>
      * {@code chunkLoaded} memoizes the answer per chunk of the batch.
      */
-    private static boolean isChunkLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded) {
+    static boolean isChunkLoaded(ServerLevel level, int chunkX, int chunkZ, Long2ByteMap chunkLoaded) {
         final long key = ChunkPos.asLong(chunkX, chunkZ);
         final byte cached = chunkLoaded.get(key);
         if (cached != NEIGHBORHOOD_UNKNOWN) {
             return cached == NEIGHBORHOOD_LOADED;
         }
+        // Asked at most once per chunk and loaded-chunk generation, so the chunk source round trip of
+        // getChunkNow is not on the per-tick path of the neighborhood.
         final boolean loaded = level.getChunkSource().getChunkNow(chunkX, chunkZ) != null;
         chunkLoaded.put(key, loaded ? NEIGHBORHOOD_LOADED : NEIGHBORHOOD_NOT_LOADED);
         return loaded;
@@ -1642,6 +2029,173 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.regionizer.removeIfEmpty(region);
             }
         };
+    }
+
+    /**
+     * Builds the worker task of one self-driven region group.
+     * <p>
+     * The task enumerates the entity tick index of the region it leased - the server thread handed it nothing
+     * but the lease and the activation snapshot - revalidates the ownership of every entry, and runs the
+     * vanilla entity body of the region's ticking entities inside the region scope. This is what removes the
+     * per-entity server-thread collection from the entity pass: the server thread never iterated the level's
+     * entity tick list for this region.
+     */
+    private Runnable selfDrivenEntityTickGroup(RegionEntityTickBatch.Group group, RegionEntityTickActivation activation) {
+        final RegionState region = group.region();
+        final RegionCoordinate coordinate = region.coordinate();
+        final ServerLevel level = group.level();
+        final RandomSource random = group.random();
+        return () -> {
+            final long start = System.nanoTime();
+            final int[] ticked = { 0 };
+            try {
+                region.beginOwnership();
+                // The group random is installed once for the whole worker tick loop, exactly like the
+                // per-entity plan does for the group it was handed.
+                this.currentEntityTickRandom.set(random);
+                try {
+                    // The index is enumerated once per group: the tick list of the region cannot change
+                    // underneath this loop, because entity moves are deferred to the barrier and a leased
+                    // region cannot merge, split or transfer.
+                    final List<RegionEntityTickEntry> entries = region.entityTickEntries();
+                    final List<Entity> tickable = new ArrayList<>(entries.size());
+                    for (final RegionEntityTickEntry entry : entries) {
+                        if (!entry.ticking()) {
+                            // Mapped to the region but not in the level's entity tick list: the vanilla pass
+                            // does not tick it, and neither does the region.
+                            continue;
+                        }
+                        if (entry.serverThreadOnly()) {
+                            // An always-ticking entity (a player) is ticked by the server thread, never by a
+                            // region worker: its tick reaches the connection and the chunk source.
+                            group.batch().addSelfDrivenFallback(entry.entity());
+                            this.serverThreadOnlyEntityTicks.incrementAndGet();
+                            continue;
+                        }
+                        tickable.add(entry.entity());
+                    }
+                    if (!tickable.isEmpty()) {
+                        // The ownership lease covers exactly the entities of this region. Installing them
+                        // before the first tick keeps the ownership check of every mutation of the loop and
+                        // covers the passenger stacks the group ticks through their vehicle.
+                        group.addEntities(tickable);
+                    }
+                    final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    final BiConsumer<Entity, Throwable> failureObserver = this.entityTickFailureObserverForTesting;
+                    try {
+                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
+                            for (final Entity entity : tickable) {
+                                if (failureObserver == null) {
+                                    try {
+                                        if (tickSelfDrivenEntity(level, entity, activation, group)) {
+                                            ++ticked[0];
+                                        }
+                                    } catch (Throwable throwable) {
+                                        if (!handOffRefusedChunk(group, entity, throwable)) {
+                                            throw throwable;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                try {
+                                    if (tickSelfDrivenEntity(level, entity, activation, group)) {
+                                        ++ticked[0];
+                                    }
+                                } catch (Throwable throwable) {
+                                    if (handOffRefusedChunk(group, entity, throwable)) {
+                                        continue;
+                                    }
+                                    // Diagnostics only: the observer records the rejected operation and the
+                                    // group keeps ticking its remaining entities instead of aborting.
+                                    failureObserver.accept(entity, throwable);
+                                }
+                            }
+                        });
+                    } finally {
+                        ownership.close();
+                    }
+                } finally {
+                    this.currentEntityTickRandom.remove();
+                }
+            } finally {
+                region.endOwnership();
+                region.clearRunning();
+                final long duration = System.nanoTime() - start;
+                region.tickMetrics().recordTick(duration);
+                RegionTickWatchdog.warnIfLongTick("entity batch " + coordinate, duration);
+                this.entityTicksOnWorkers.addAndGet(ticked[0]);
+                this.regionizer.removeIfEmpty(region);
+            }
+        };
+    }
+
+    /**
+     * Runs the vanilla entity body of one entity of a leased region on the worker.
+     * <p>
+     * The body is the vanilla {@code ServerLevel} entity pass: the discard predicate, the frozen predicate, the
+     * despawn check, the entity ticking range of the entity's chunk, the riding stack and the non-passenger
+     * tick. The two server-owned reads of that body - the ticking range and the entity-load neighborhood of the
+     * chunk guard - are answered from the activation snapshot the server thread built before the lease.
+     * <p>
+     * An entity whose chunk cannot be decided from the snapshot, or whose chunk guard would need an unloaded
+     * chunk, is handed to the server thread instead of being dropped. The entity body has not run for it at
+     * that point, so the handoff runs all of it.
+     *
+     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
+     */
+    private boolean tickSelfDrivenEntity(ServerLevel level, Entity entity, RegionEntityTickActivation activation, RegionEntityTickBatch.Group group) {
+        if (entity.isRemoved()) {
+            return false;
+        }
+        // The cached chunk position of the entity: the chunk its tick starts from, read once for the
+        // activation snapshot and the ticking range check, exactly like the vanilla body reads it before it
+        // ticks.
+        final int chunk = activation.indexOf(entity.chunkPosition());
+        if (chunk < 0) {
+            // The entity left the region's chunk rectangle between its last mapping publication and this
+            // tick, so its chunk cannot be decided here. The server thread ticks it and republishes its
+            // mapping there.
+            group.batch().addSelfDrivenFallback(entity);
+            this.entityTicksOutsideRegion.incrementAndGet();
+            return false;
+        }
+        if (!activation.isNeighborhoodLoaded(chunk)) {
+            // The chunk guard would have to ask the chunk source for a chunk the tick may read; the entity is
+            // ticked on the server thread instead of blocking the worker on the chunk source.
+            group.batch().addSelfDrivenFallback(entity);
+            this.chunkPreloadRefusedEntityTicks.incrementAndGet();
+            return false;
+        }
+        if (activation.shouldDiscard(entity)) {
+            // The vanilla body discards the entity instead of ticking it. On a worker the removal itself is
+            // deferred to the barrier, exactly like every other removal of a leased region.
+            entity.discard();
+            return false;
+        }
+        if (activation.isFrozen(entity)) {
+            return false;
+        }
+        entity.checkDespawn();
+        if (entity.isRemoved()) {
+            return false;
+        }
+        if (!activation.isEntityTicking(chunk)) {
+            // Outside the vanilla entity ticking range: the despawn check above is all the vanilla body does,
+            // and the entity is not ticked.
+            return false;
+        }
+        final Entity vehicle = entity.getVehicle();
+        if (vehicle != null) {
+            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+                return false;
+            }
+            entity.stopRiding();
+        }
+        if (entity.isRemoved() || entity instanceof PartEntity<?>) {
+            return false;
+        }
+        level.guardEntityTick(level::tickNonPassenger, entity);
+        return true;
     }
 
     /**
@@ -2801,6 +3355,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // commit therefore cannot write a region mapping after the clear below.
                     this.entityTransferJournal.clearPendingFor(level);
                     this.pendingDeferredEntityMoves.removeIf(move -> move.destination().level() == level);
+                    this.chunkLoadAnswers.remove(level);
+                    this.seededEntityTickLevels.remove(level);
                     this.regionizer.clearLevel(level);
                     for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                         if (task.isOwnedBy(level)) {
@@ -3976,6 +4532,13 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.unchangedDeferredEntityMoveCount.get(),
                 this.refusedDeferredEntityMoveBatchCount.get(),
                 this.entityTaskMigrationCount.get(),
+                this.entityTickRegionsOnWorkers.get(),
+                this.fallbackEntityTickRegions.get(),
+                this.entityTickRegionsWithoutEligibleChunk.get(),
+                this.entityTicksOutsideRegion.get(),
+                this.serverThreadOnlyEntityTicks.get(),
+                this.unindexedEntityTickStarts.get(),
+                this.entityTickIndexFallbacks.get(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
     }
@@ -4029,6 +4592,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                     task.cancel();
                 }
                 this.entityTasksByEntity.clear();
+                this.chunkLoadAnswers.clear();
+                this.seededEntityTickLevels.clear();
                 this.regionizer.clear();
                 // The global region has no coordinate and is not part of the region metrics, so its window is
                 // released here: a shut-down engine holds no metric buffer at all.

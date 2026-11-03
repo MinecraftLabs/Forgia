@@ -1,8 +1,13 @@
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
-@@ -182,6 +_,7 @@
+@@ -180,8 +_,11 @@
+     private final MinecraftServer server;
+     private final ServerLevelData serverLevelData;
      private int lastSpawnChunkRadius;
-     final EntityTickList entityTickList = new EntityTickList();
+-    final EntityTickList entityTickList = new EntityTickList();
++    // Neo: the tick list publishes its membership to the region index of each entity, so a region worker can
++    // enumerate the entities of its own region.
++    final EntityTickList entityTickList = new EntityTickList(this);
      private final PersistentEntitySectionManager<Entity> entityManager;
 +    private final LevelEntityGetter<Entity> regionAwareEntityGetter;
      private final GameEventDispatcher gameEventDispatcher;
@@ -93,15 +98,18 @@
          if (flag1) {
              this.resetEmptyTime();
          }
-@@ -393,11 +_,19 @@
+@@ -393,11 +_,22 @@
                  profilerfiller.pop();
              }
  
-+            // Neo: experimental region entity tick bridge. Entities the plan accepts are ticked
-+            // (checkDespawn + tickNonPassenger) on their owning region worker after this pass; everything
-+            // else is ticked inline by the unchanged vanilla body below.
++            // Neo: region entity tick bridge. In self-driven mode the region workers enumerate and tick the
++            // entities of the region they leased, so the server thread only activates the regions, leases
++            // them, submits one task per region, waits at the barrier and runs the handoff; this list is not
++            // walked here at all. The plan falls back to collecting per entity when the level's region index
++            // is not available, and only that mode ticks nothing itself.
 +            final net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan entityTickPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
 +                .beginEntityTickPlan(this, p_308566_ -> this.chunkSource.chunkMap.getDistanceManager().inEntityTickingRange(p_308566_.chunkPosition().toLong()), this.chunkSource::managedBlockOnMainThread);
++            if (entityTickPlan == null || !entityTickPlan.ticksEntitiesOnRegionWorkers()) {
              this.entityTickList.forEach(p_308566_ -> {
                  if (!p_308566_.isRemoved()) {
                      if (this.shouldDiscardEntity(p_308566_)) {
@@ -113,7 +121,7 @@
                          profilerfiller.push("checkDespawn");
                          p_308566_.checkDespawn();
                          profilerfiller.pop();
-@@ -412,12 +_,15 @@
+@@ -412,12 +_,16 @@
                              }
  
                              profilerfiller.push("tick");
@@ -126,11 +134,45 @@
                      }
                  }
              });
++            }
 +            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runEntityTickPlan(entityTickPlan);
              profilerfiller.pop();
              this.tickBlockEntities();
          }
-@@ -438,7 +_,7 @@
+@@ -432,13 +_,40 @@
+         return this.chunkSource.chunkMap.getDistanceManager().inBlockTickingRange(p_184059_);
+     }
+ 
++    /**
++     * Neo: the vanilla entity ticking range of one chunk, evaluated on the server thread. The distance
++     * manager's ticking tracker is server-owned and is mutated while the server thread waits at a region tick
++     * barrier, so the region entity tick activation reads it per chunk, on the server thread, before the region
++     * is leased - a worker never reads it.
++     */
++    public boolean isInEntityTickingRange(long chunkKey) {
++        return this.chunkSource.chunkMap.getDistanceManager().inEntityTickingRange(chunkKey);
++    }
++
++    /**
++     * Neo: hands every entity of the entity tick list to {@code action}, in the order the vanilla entity pass
++     * would tick them, so the region entity tick index can be seeded from the authoritative list once per
++     * level. Runs on the server thread.
++     *
++     * @return {@code false} when this level has no entity tick list to seed from, which keeps the entity slice
++     *         on its per-entity collection instead of an index nothing maintains
++     */
++    public boolean forEachEntityInTickListForRegionIndex(java.util.function.Consumer<Entity> action) {
++        final EntityTickList list = this.entityTickList;
++        if (list == null) {
++            return false;
++        }
++        list.forEach(action);
++        return true;
++    }
++
+     protected void tickTime() {
+         if (this.tickTime) {
+             long i = this.levelData.getGameTime() + 1L;
              this.serverLevelData.setGameTime(i);
              this.serverLevelData.getScheduledEvents().tick(this.server, i);
              if (this.levelData.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) {

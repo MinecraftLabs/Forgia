@@ -705,6 +705,36 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Publishes that the level's entity tick list now contains {@code entity}.
+     * <p>
+     * This is the membership seam of the self-driven entity tick: the engine indexes the entity in the region
+     * that owns its mapping, so the region's worker enumerates exactly the entities the level would tick. The
+     * hook is a no-op without an installed engine, so a server that does not run the bridge keeps the vanilla
+     * tick list untouched.
+     */
+    public static void entityTickStarted(ServerLevel level, Entity entity) {
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.entityTickStarted(level, entity);
+            }
+        });
+    }
+
+    /**
+     * Publishes that the level's entity tick list no longer contains {@code entity}.
+     * <p>
+     * The entity stays indexed and mapped - its scheduled tasks and its region queries keep working - and only
+     * its tick membership is cleared, so no region worker ticks an entity the level stopped ticking.
+     */
+    public static void entityTickEnded(ServerLevel level, Entity entity) {
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.entityTickEnded(level, entity);
+            }
+        });
+    }
+
+    /**
      * Records a cross-region entity transfer decision in the installed engine without mutating any index.
      * <p>
      * This is the bridge for a caller that owns the vanilla entity, world and network side effects of a

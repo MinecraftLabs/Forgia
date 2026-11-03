@@ -57,6 +57,14 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<Entity> fallbackEntities = new ArrayList<>();
     /**
+     * Entities the self-driven slice hands back to the server thread: the entities of a region whose index
+     * could not be enumerated, the entities of a leased region whose chunk cannot be decided from the
+     * activation snapshot or whose chunk guard would need an unloaded chunk, and the always-ticking entities
+     * only the server thread may tick. The list is filled from the workers, so it is synchronized. Their
+     * vanilla entity body has not run yet, so the handoff runs all of it for them.
+     */
+    private final List<Entity> selfDrivenFallbackEntities = Collections.synchronizedList(new ArrayList<>());
+    /**
      * Entities a worker handed back after the chunk source refused a chunk it needed. They are ticked on the
      * server thread after the batch, like the entities whose region could not be leased. The list is filled
      * from the worker threads, so it is synchronized.
@@ -111,6 +119,31 @@ final class RegionEntityTickBatch extends RegionTickBatch {
 
     RegionEntityTickBatch(ServerLevel level) {
         super(level);
+    }
+
+    /**
+     * Adds one self-driven region group: the region lease, the server-thread activation snapshot of the region
+     * and the worker task that enumerates the region's entity tick index itself.
+     */
+    Group addSelfDrivenGroup(RegionEntityTickActivation activation, Function<Group, Runnable> workFactory) {
+        return this.addGroup(activation.region(), List.of(), workFactory);
+    }
+
+    /**
+     * Records an entity the self-driven slice hands to the server thread; its whole vanilla entity body runs
+     * in the handoff.
+     */
+    void addSelfDrivenFallback(Entity entity) {
+        this.selfDrivenFallbackEntities.add(entity);
+    }
+
+    /**
+     * Takes the entities the self-driven slice handed to the server thread.
+     */
+    List<Entity> selfDrivenFallbackEntities() {
+        synchronized (this.selfDrivenFallbackEntities) {
+            return List.copyOf(this.selfDrivenFallbackEntities);
+        }
     }
 
     /**
