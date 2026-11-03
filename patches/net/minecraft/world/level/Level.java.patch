@@ -525,6 +525,21 @@
                          this.neighborChanged(blockstate, blockpos, p_46719_, p_46718_, false);
                      }
                  }
+@@ -1056,6 +_,14 @@
+     public abstract RecipeManager getRecipeManager();
+ 
+     public BlockPos getBlockRandomPos(int p_46497_, int p_46498_, int p_46499_, int p_46500_) {
++        // Neo: a region chunk tick selects its positions from the random source of the chunk it ticks instead
++        // of the level-wide randValue sequence, which one worker cannot share with another. The bit layout of
++        // the selected offsets is the vanilla one.
++        final net.minecraft.util.RandomSource chunkTickPositionRandom = net.neoforged.neoforge.server.threading.RegionThreadingHooks.chunkTickPositionRandom();
++        if (chunkTickPositionRandom != null) {
++            int i = chunkTickPositionRandom.nextInt() >> 2;
++            return new BlockPos(p_46497_ + (i & 15), p_46498_ + (i >> 16 & p_46500_), p_46499_ + (i >> 8 & 15));
++        }
+         this.randValue = this.randValue * 3 + 1013904223;
+         int i = this.randValue >> 2;
+         return new BlockPos(p_46497_ + (i & 15), p_46498_ + (i >> 16 & p_46500_), p_46499_ + (i >> 8 & 15));
 @@ -1078,6 +_,18 @@
          return this.biomeManager;
      }

@@ -43,10 +43,13 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -56,6 +59,7 @@ import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionChunkTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
@@ -155,6 +159,36 @@ public class ServerLoadBenchmarkGameTests {
      * the property keeps the cache enabled, which is the production path.
      */
     static final String BLOCK_ENTITY_ADMISSION_CACHE_PROPERTY = "neoforge.serverBenchmarkBlockEntityAdmissionCache";
+    /**
+     * Chunks of the random tick workload when {@value #RANDOM_TICK_CHUNKS_PROPERTY} is unset.
+     */
+    private static final int RANDOM_TICK_CHUNKS = 256;
+    /**
+     * System property that overrides {@link #RANDOM_TICK_CHUNKS}, so the size of the random tick workload can be
+     * varied without editing the test. The grid is the smallest square that holds the requested count.
+     */
+    static final String RANDOM_TICK_CHUNKS_PROPERTY = "neoforge.serverBenchmarkRandomTickChunks";
+    /**
+     * Random tick speed of the random tick workload. The GameTest server runs with {@code randomTickSpeed=0}, so
+     * the workload sets the rule for its own window and restores it afterwards.
+     */
+    private static final int RANDOM_TICK_SPEED = 3;
+    /** Randomly ticking block layers per chunk of the random tick workload. */
+    private static final int RANDOM_TICK_LAYERS = 4;
+    /**
+     * Height of the first randomly ticking layer. Every layer sits in open sky far above the generated terrain of
+     * the test level, so the light checks of the random ticks see full sky light and the layer is a plain
+     * random-tick workload instead of a light-limited one.
+     */
+    private static final int RANDOM_TICK_BASE_HEIGHT = 200;
+    /** Vertical distance between two randomly ticking layers, so each layer is its own chunk section. */
+    private static final int RANDOM_TICK_LAYER_SPACING = 8;
+    /**
+     * One in this many blocks of the workload is read for the block state fingerprint. The fingerprint only has
+     * to prove that two runs of the same profile ended in the same block states, so a regular sample keeps the
+     * reporting cost small on the 1024-chunk grid.
+     */
+    private static final int RANDOM_TICK_FINGERPRINT_STRIDE = 7;
     /** Block distance between two hopper columns of one chunk, so their chests never merge into one chest. */
     private static final int HOPPER_COLUMN_SPACING = 2;
     /** Slots of one chunk layer: {@code 16 / spacing} per horizontal axis. */
@@ -257,6 +291,12 @@ public class ServerLoadBenchmarkGameTests {
     private static final int SOAK_ZOMBIE_DEATHS = 1;
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
+    /**
+     * Columns of the random tick workload row: the profile and its load, the server tick distribution, the chunk
+     * tick counters, the segments of the server-thread chunk tick slice and the block state fingerprint of the
+     * window's end state.
+     */
+    static final String RANDOM_TICK_CSV_HEADER = "profile,workers,regionSize,chunks,blocks,msptAvg,msptP50,msptP95,msptP99,chunkTicksOnWorkers,fallbackChunkTicks,boundaryChunkTicks,unloadedNeighborhoodChunkTicks,truncatedChunkTicks,unleasedChunkTicks,chunkTickLightningStrikes,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples,blockStateFingerprint";
     static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
     static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
@@ -401,6 +441,79 @@ public class ServerLoadBenchmarkGameTests {
                         reportHoppers(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, hoppers, grid.size(), itemCountStart.get(), drops.injectedItems(), admissionCache);
                         if (cleaned.compareAndSet(false, true)) {
                             removeHoppers(level, hoppers);
+                            releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    @GameTest(batch = "benchmarkRandomTick", timeoutTicks = 2000)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Measures the server tick and the chunk tick slice under a random tick load; only runs when neoforge.serverBenchmark is set")
+    static void measuresServerTickTimeUnderRandomTickLoad(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_BENCH_NOTE skipped random tick workload: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = randomTickGrid(origin, intProperty(RANDOM_TICK_CHUNKS_PROPERTY, RANDOM_TICK_CHUNKS));
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
+            // The chunk tick attribution is reported per measured tick, so it is reset when the warmup ends. The
+            // slices of the test level are measured; the other dimensions of the server carry no workload.
+            sampler.onMeasuredWindowStart(() -> {
+                RegionChunkTickAttribution.reset();
+                RegionChunkTickAttribution.setMeasuredLevel(level);
+            });
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<RegionChunkTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionChunkTickAttribution.snapshot());
+            final AtomicReference<Long> placedFingerprint = new AtomicReference<>(0L);
+            final AtomicReference<Integer> blocksPlaced = new AtomicReference<>(0);
+            final GameRules.IntegerValue randomTicking = level.getGameRules().getRule(GameRules.RULE_RANDOMTICKING);
+            final int previousRandomTicking = randomTicking.get();
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    RegionChunkTickAttribution.setEnabled(false);
+                    RegionChunkTickAttribution.setMeasuredLevel(null);
+                    randomTicking.set(previousRandomTicking, level.getServer());
+                    releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> forceChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS))
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the random tick chunk grid never finished its entity load"))
+                    .thenExecute(() -> {
+                        blocksPlaced.set(placeRandomTickBlocks(level, grid));
+                        placedFingerprint.set(randomTickFingerprint(level, grid));
+                        randomTicking.set(RANDOM_TICK_SPEED, level.getServer());
+                    })
+                    .thenExecute(() -> {
+                        before.set(RegionThreadingHooks.diagnostics());
+                        RegionChunkTickAttribution.setEnabled(true);
+                        attributionBefore.set(RegionChunkTickAttribution.snapshot());
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(sampler);
+                    })
+                    // One extra tick: the sequence runs inside the tick body, so the last sampled tick only
+                    // completes its Post event after this sequence step would otherwise have read it.
+                    .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 1)
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        final RegionChunkTickAttribution.Snapshot attributionAfter = RegionChunkTickAttribution.snapshot();
+                        RegionChunkTickAttribution.setEnabled(false);
+                        RegionChunkTickAttribution.setMeasuredLevel(null);
+                        reportRandomTicks(helper, sampler, before.get(), attributionBefore.get(), attributionAfter,
+                                grid.size(), blocksPlaced.get(), placedFingerprint.get(), randomTickFingerprint(level, grid), level.getGameTime());
+                        if (cleaned.compareAndSet(false, true)) {
+                            randomTicking.set(previousRandomTicking, level.getServer());
                             releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
                         }
                     })
@@ -682,6 +795,169 @@ public class ServerLoadBenchmarkGameTests {
                     })
                     .thenSucceed();
         });
+    }
+
+    /**
+     * {@return the smallest square chunk grid of at least {@code chunks} chunks around {@code origin}}
+     * <p>
+     * The random tick workload is sized by a chunk count, but a chunk grid is square, so a request of 64, 256 or
+     * 1024 chunks is exact and any other count is rounded up to the next square.
+     */
+    private static List<ChunkPos> randomTickGrid(BlockPos origin, int chunks) {
+        final int side = Math.max(1, (int) Math.ceil(Math.sqrt(chunks)));
+        final int baseChunkX = Math.floorDiv(origin.getX(), 16);
+        final int baseChunkZ = Math.floorDiv(origin.getZ(), 16);
+        final List<ChunkPos> grid = new ArrayList<>(side * side);
+        for (int dx = -side / 2; dx < side - side / 2; dx++) {
+            for (int dz = -side / 2; dz < side - side / 2; dz++) {
+                grid.add(new ChunkPos(baseChunkX + dx, baseChunkZ + dz));
+            }
+        }
+        return grid;
+    }
+
+    /**
+     * Places the random tick workload: {@value #RANDOM_TICK_LAYERS} randomly ticking layers per chunk.
+     * <p>
+     * Three layers are grass blocks on dirt, so the grass spread attempts - the constant part of a random tick
+     * workload - run on every tick and the dirt below gives the spread a target during the warmup. The last layer
+     * is farmland with wheat above it, so the crop growth path is part of the load as well; the wheat reaches its
+     * last age inside the warmup and keeps its area and light checks afterwards.
+     * <p>
+     * The blocks are written into the chunk sections directly: the workload is a block state pattern, and a full
+     * {@code setBlock} per placed block would queue a light update per block and leave the light thread working
+     * during the measured window. Every layer sits far above the generated terrain, so the sky light of the
+     * untouched sections is the full sky light the random ticks of the workload check.
+     *
+     * @return the number of placed blocks
+     */
+    private static int placeRandomTickBlocks(ServerLevel level, List<ChunkPos> grid) {
+        final BlockState grass = Blocks.GRASS_BLOCK.defaultBlockState();
+        final BlockState dirt = Blocks.DIRT.defaultBlockState();
+        final BlockState farmland = Blocks.FARMLAND.defaultBlockState();
+        final BlockState wheat = Blocks.WHEAT.defaultBlockState();
+        int placed = 0;
+        for (final ChunkPos chunk : grid) {
+            final LevelChunk levelChunk = level.getChunk(chunk.x, chunk.z);
+            for (int layer = 0; layer < RANDOM_TICK_LAYERS; layer++) {
+                final int y = RANDOM_TICK_BASE_HEIGHT + layer * RANDOM_TICK_LAYER_SPACING;
+                final boolean cropLayer = layer == RANDOM_TICK_LAYERS - 1;
+                for (int offsetX = 0; offsetX < 16; offsetX++) {
+                    for (int offsetZ = 0; offsetZ < 16; offsetZ++) {
+                        final int x = chunk.getMinBlockX() + offsetX;
+                        final int z = chunk.getMinBlockZ() + offsetZ;
+                        if (cropLayer) {
+                            placeBlock(levelChunk, x, y, z, farmland);
+                            placeBlock(levelChunk, x, y + 1, z, wheat);
+                            placed += 2;
+                        } else {
+                            placeBlock(levelChunk, x, y - 1, z, dirt);
+                            placeBlock(levelChunk, x, y, z, grass);
+                            placed += 2;
+                        }
+                    }
+                }
+            }
+        }
+        return placed;
+    }
+
+    private static void placeBlock(LevelChunk chunk, int x, int y, int z, BlockState state) {
+        chunk.getSection(chunk.getSectionIndex(y)).setBlockState(x & 15, y & 15, z & 15, state);
+    }
+
+    /**
+     * {@return a fingerprint of the block states of the random tick workload}
+     * <p>
+     * The fingerprint is the FNV-1a hash of the block state ids of every
+     * {@value #RANDOM_TICK_FINGERPRINT_STRIDE}th workload block. Two runs of the same profile have to end in the
+     * same block states, so a difference between two repeats of one profile is a determinism failure.
+     */
+    private static long randomTickFingerprint(ServerLevel level, List<ChunkPos> grid) {
+        long hash = 0xcbf29ce484222325L;
+        int visited = 0;
+        for (final ChunkPos chunk : grid) {
+            final LevelChunk levelChunk = level.getChunk(chunk.x, chunk.z);
+            for (int layer = 0; layer < RANDOM_TICK_LAYERS; layer++) {
+                final int y = RANDOM_TICK_BASE_HEIGHT + layer * RANDOM_TICK_LAYER_SPACING;
+                final boolean cropLayer = layer == RANDOM_TICK_LAYERS - 1;
+                for (int offsetX = 0; offsetX < 16; offsetX++) {
+                    for (int offsetZ = 0; offsetZ < 16; offsetZ++) {
+                        if (visited++ % RANDOM_TICK_FINGERPRINT_STRIDE != 0) {
+                            continue;
+                        }
+                        final int x = chunk.getMinBlockX() + offsetX;
+                        final int z = chunk.getMinBlockZ() + offsetZ;
+                        final BlockState state = levelChunk.getBlockState(new BlockPos(x, cropLayer ? y + 1 : y, z));
+                        hash ^= Block.getId(state);
+                        hash *= 0x100000001b3L;
+                    }
+                }
+            }
+        }
+        return hash;
+    }
+
+    /**
+     * Prints the measurement of the random tick workload as one CSV row.
+     * <p>
+     * The counters are the deltas of {@link RegionThreadingDiagnostics} over the measured window, so they belong
+     * to the measured ticks only. The five attribution columns are the per-tick wall time of the segments of the
+     * server-thread chunk tick slice, and {@code sliceP50Ms} is the median of the per-tick slice wall times: a
+     * full server tick carries a 12-20 ms tail even inline, so the mean of the tick cannot resolve a slice effect
+     * of a few milliseconds and the median of the slice itself is reported next to it.
+     * <p>
+     * {@code blockStateFingerprint} is printed for both repeats of one profile: the same seed and the same region
+     * layout have to end in the same block states.
+     */
+    private static void reportRandomTicks(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before,
+            RegionChunkTickAttribution.Snapshot attributionBefore, RegionChunkTickAttribution.Snapshot attributionAfter,
+            int chunks, int blocks, long placedFingerprint, long endFingerprint, long gameTime) {
+        final long[] sorted = sampler.sortedSamples();
+        helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
+        final long sliceP50Nanos = attributionAfter.latency().percentileNanos(0.50);
+        System.out.println(sampler.note(profile, after)
+                + " chunkTickWorkerExecution=" + after.map(RegionThreadingDiagnostics::chunkTickWorkerExecutionEnabled).orElse(false)
+                + " randomTickChunks=" + chunks
+                + " randomTickBlocks=" + blocks
+                + " randomTickSpeed=" + RANDOM_TICK_SPEED
+                + " randomTickWindowGameTime=" + gameTime
+                + " randomTickBlocksChanged=" + (placedFingerprint != endFingerprint)
+                + " blockStateFingerprint=" + endFingerprint
+                + " chunkTickAttributionSlices=" + slices);
+        System.out.println("SERVER_BENCH_RANDOMTICK_HEADER " + RANDOM_TICK_CSV_HEADER);
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_RANDOMTICK_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d%n",
+                profile,
+                after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
+                chunks,
+                blocks,
+                averageMillis(sorted),
+                percentileMillis(sorted, 0.50),
+                percentileMillis(sorted, 0.95),
+                percentileMillis(sorted, 0.99),
+                delta(before, after, RegionThreadingDiagnostics::chunkTicksOnWorkers),
+                delta(before, after, RegionThreadingDiagnostics::fallbackChunkTicks),
+                delta(before, after, RegionThreadingDiagnostics::boundaryChunkTicks),
+                delta(before, after, RegionThreadingDiagnostics::unloadedNeighborhoodChunkTicks),
+                delta(before, after, RegionThreadingDiagnostics::truncatedChunkTicks),
+                delta(before, after, RegionThreadingDiagnostics::unleasedChunkTicks),
+                delta(before, after, RegionThreadingDiagnostics::chunkTickLightningStrikes),
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
+                millisPerSlice(attributionAfter.planNanos() - attributionBefore.planNanos(), slices),
+                millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
+                millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
+                millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
+                sliceP50Nanos / 1_000_000.0,
+                slices,
+                endFingerprint);
+        printRegionMetrics(after);
+        helper.assertTrue(placedFingerprint != endFingerprint,
+                "the random tick workload changed no block state, so no random tick ran");
     }
 
     /**
@@ -1800,7 +2076,7 @@ public class ServerLoadBenchmarkGameTests {
                     entityTickWorkers,
                     this.flags.blockEntityTickWorkerExecutionEnabled(),
                     this.flags.scheduledTickWorkerExecutionEnabled(),
-                    this.flags.randomTickWorkerExecutionEnabled(),
+                    this.flags.chunkTickWorkerExecutionEnabled(),
                     this.layout,
                     storageMode);
         }

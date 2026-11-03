@@ -270,10 +270,10 @@ public class RegionThreadingGameTests {
         });
     }
 
-    @GameTest(batch = "regionRandomQuery", timeoutTicks = 600)
+    @GameTest(batch = "regionChunkTick", timeoutTicks = 600)
     @EmptyTemplate(value = "15x10x15", floor = true)
-    @TestHolder(description = "Requires a configured random tick worker slice to stay on the vanilla server-thread path and its entity query to run inline")
-    static void configuredRandomTickSliceStaysOnTheServerThread(final DynamicTest test, final RegistrationHelper reg) {
+    @TestHolder(description = "Requires a configured chunk tick slice to tick an interior chunk on its region worker, with a region-scoped entity query")
+    static void configuredChunkTickRunsOnTheRegionWorker(final DynamicTest test, final RegistrationHelper reg) {
         final AtomicReference<String> randomTickThread = new AtomicReference<>();
         final AtomicReference<String> queryThread = new AtomicReference<>();
         final AtomicInteger queryHits = new AtomicInteger();
@@ -281,8 +281,9 @@ public class RegionThreadingGameTests {
             @Override
             protected void randomTick(BlockState state, ServerLevel level, BlockPos pos, RandomSource random) {
                 randomTickThread.compareAndSet(null, Thread.currentThread().getName());
-                // A real range query issued from the random tick callback. The entity getter has to hand
-                // the whole query, including this predicate, to the server thread.
+                // A real range query issued from the random tick callback. Inside a chunk tick worker the lease
+                // of the region answers it from the physical bucket of the region, so the predicate runs on the
+                // worker and sees only the entities of that region.
                 level.getEntitiesOfClass(ItemEntity.class, new AABB(pos).inflate(4.0), item -> {
                     queryThread.compareAndSet(null, Thread.currentThread().getName());
                     queryHits.incrementAndGet();
@@ -292,15 +293,14 @@ public class RegionThreadingGameTests {
         });
         test.onGameTest(helper -> {
             final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
-            if (diagnostics.isEmpty() || !diagnostics.get().randomTickWorkerExecutionEnabled()) {
-                assertSliceDisabled(helper, true, "random tick worker slice");
+            if (diagnostics.isEmpty() || !diagnostics.get().chunkTickWorkerExecutionEnabled()) {
+                assertSliceDisabled(helper, true, "chunk tick worker slice");
                 helper.succeed();
                 return;
             }
             final ServerLevel level = helper.getLevel();
             final BlockPos blockPos = evidenceBlockPos(helper, diagnostics.get().regionPolicy(), diagnostics.get().regionChunkSize(), 1);
-            final String serverThreadName = Thread.currentThread().getName();
-            final long randomTicksBefore = diagnostics.get().randomTicksOnWorkers();
+            final long chunkTicksBefore = diagnostics.get().chunkTicksOnWorkers();
             final GameRules.IntegerValue randomTickSpeed = level.getGameRules().getRule(GameRules.RULE_RANDOMTICKING);
             final int previousRandomTickSpeed = randomTickSpeed.get();
             final AtomicReference<ItemEntity> queryEntity = new AtomicReference<>();
@@ -336,20 +336,23 @@ public class RegionThreadingGameTests {
                         final RegionThreadingDiagnostics after = diagnostics();
                         helper.assertTrue(randomTickThread.get() != null, "the custom random tick block never ran");
                         helper.assertTrue(
-                                serverThreadName.equals(randomTickThread.get()),
-                                "an unclassified random tick ran on '" + randomTickThread.get() + "' instead of the server thread '" + serverThreadName + "'");
+                                randomTickThread.get().startsWith("NeoForge Region Worker"),
+                                "an interior chunk tick ran on '" + randomTickThread.get() + "' instead of a region worker");
                         helper.assertTrue(queryHits.get() > 0, "the item entity predicate never ran, so no real entity query was exercised");
                         helper.assertTrue(
-                                serverThreadName.equals(queryThread.get()),
-                                "the random tick entity query ran on '" + queryThread.get() + "' instead of server thread '" + serverThreadName + "'");
-                        helper.assertTrue(after.randomTickWorkerExecutionEnabled(), "the requested random tick worker configuration must stay visible");
+                                queryThread.get() != null && queryThread.get().startsWith("NeoForge Region Worker"),
+                                "the chunk tick entity query ran on '" + queryThread.get() + "' instead of the leased region worker");
+                        helper.assertTrue(after.chunkTickWorkerExecutionEnabled(), "the requested chunk tick worker configuration must stay visible");
+                        helper.assertTrue(after.chunkTickWorkerDispatchEffective(), "a configured chunk tick slice must dispatch");
                         helper.assertTrue(
-                                !after.randomTickWorkerDispatchEffective(),
-                                "unclassified random callbacks must report the effective dispatch as gated");
-                        helper.assertTrue(
-                                after.randomTicksOnWorkers() == randomTicksBefore,
-                                "a gated random tick slice advanced the random tick worker counter");
-                        helper.assertTrue(after.entityTicksOnWorkers() == 0L, "entity ticks must stay on the server thread");
+                                after.chunkTicksOnWorkers() > chunkTicksBefore,
+                                "the chunk tick worker counter did not advance: before=" + chunkTicksBefore
+                                        + " after=" + after.chunkTicksOnWorkers()
+                                        + " fallback=" + after.fallbackChunkTicks()
+                                        + " boundary=" + after.boundaryChunkTicks()
+                                        + " unloadedNeighborhood=" + after.unloadedNeighborhoodChunkTicks());
+                        helper.assertTrue(after.truncatedChunkTicks() == 0L, "the evidence chunk tick was truncated");
+                        helper.assertTrue(after.ownershipViolationCount() == 0L, "the chunk tick raised an ownership violation");
                     })
                     .thenSucceed();
         });
@@ -428,7 +431,7 @@ public class RegionThreadingGameTests {
 
     @GameTest(batch = "regionRandomMelt", timeoutTicks = 400)
     @EmptyTemplate(value = "15x10x15", floor = true)
-    @TestHolder(description = "Melts ice with a random tick while the bounded random tick slice is enabled")
+    @TestHolder(description = "Melts ice with a random tick on the region worker of the interior evidence chunk")
     static void randomTickMeltsIce(final DynamicTest test) {
         test.onGameTest(helper -> {
             final GameRules.IntegerValue randomTickSpeed = helper.getLevel().getGameRules().getRule(GameRules.RULE_RANDOMTICKING);
@@ -442,7 +445,7 @@ public class RegionThreadingGameTests {
                 level.setBlock(icePos.above(), Blocks.AIR.defaultBlockState(), 3);
                 releaseForcedChunk(level, icePos);
             });
-            final long randomTicksBefore = diagnostics.map(RegionThreadingDiagnostics::randomTicksOnWorkers).orElse(0L);
+            final long chunkTicksBefore = diagnostics.map(RegionThreadingDiagnostics::chunkTicksOnWorkers).orElse(0L);
             randomTickSpeed.set(1000, level.getServer());
 
             helper.startSequence()
@@ -460,16 +463,20 @@ public class RegionThreadingGameTests {
                                 level.getBlockState(icePos).is(Blocks.WATER),
                                 "ice did not melt, so the selected random tick was not executed; state="
                                         + level.getBlockState(icePos));
-                        if (diagnostics.isPresent() && diagnostics.get().randomTickWorkerExecutionEnabled()) {
+                        if (diagnostics.isPresent() && diagnostics.get().chunkTickWorkerExecutionEnabled()) {
                             final RegionThreadingDiagnostics after = diagnostics();
                             helper.assertTrue(
-                                    !after.randomTickWorkerDispatchEffective(),
-                                    "unclassified random callbacks must report the effective dispatch as gated");
+                                    after.chunkTickWorkerDispatchEffective(),
+                                    "a configured chunk tick slice must report the effective dispatch");
                             helper.assertTrue(
-                                    after.randomTicksOnWorkers() == randomTicksBefore,
-                                    "a gated random tick slice advanced the random tick worker counter");
+                                    after.chunkTicksOnWorkers() > chunkTicksBefore,
+                                    "the interior evidence chunk did not tick on a region worker: before=" + chunkTicksBefore
+                                            + " after=" + after.chunkTicksOnWorkers()
+                                            + " fallback=" + after.fallbackChunkTicks()
+                                            + " boundary=" + after.boundaryChunkTicks()
+                                            + " unloadedNeighborhood=" + after.unloadedNeighborhoodChunkTicks());
                         } else {
-                            assertSliceDisabled(helper, true, "random tick worker slice");
+                            assertSliceDisabled(helper, true, "chunk tick worker slice");
                         }
                     })
                     .thenSucceed();

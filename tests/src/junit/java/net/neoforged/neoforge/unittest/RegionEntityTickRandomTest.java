@@ -127,12 +127,12 @@ class RegionEntityTickRandomTest {
         final ServerLevel level = mockLevel(7L, 40L, RandomSource.create(11L));
         final AtomicReference<RandomSource> blockTickRandom = new AtomicReference<>();
         final AtomicReference<RandomSource> scheduledRandom = new AtomicReference<>();
-        final AtomicReference<RandomSource> randomTickRandom = new AtomicReference<>();
+        final AtomicReference<RandomSource> chunkTickRandom = new AtomicReference<>();
         final Entity entity = entityTickingIn(level, new BlockPos(1, 64, 1), Collections.synchronizedList(new ArrayList<>()),
                 Collections.synchronizedList(new ArrayList<>()), null, random -> {
                     blockTickRandom.set(this.engine.currentRegionTickRandom());
                     scheduledRandom.set(RegionThreadingHooks.scheduledTickRandom());
-                    randomTickRandom.set(RegionThreadingHooks.randomTickRandom());
+                    chunkTickRandom.set(RegionThreadingHooks.chunkTickRandom());
                 });
 
         final RegionEntityTickPlan plan = plan(level);
@@ -143,7 +143,7 @@ class RegionEntityTickRandomTest {
         // because only a scheduled or random tick group may read the block entities of its region.
         assertNull(blockTickRandom.get(), "an entity group must not answer the block tick random");
         assertNull(scheduledRandom.get());
-        assertNull(randomTickRandom.get());
+        assertNull(chunkTickRandom.get());
     }
 
     @Test

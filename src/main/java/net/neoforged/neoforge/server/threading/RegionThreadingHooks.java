@@ -23,6 +23,8 @@ import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickScope;
+import net.neoforged.neoforge.server.threading.region.RegionChunkTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionChunkTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
@@ -31,7 +33,6 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
-import net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionScopedEntityQuery;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -540,41 +541,85 @@ public final class RegionThreadingHooks {
     }
 
     /**
-     * Starts collecting the block and fluid random ticks of the current level tick that should run on
-     * region workers.
+     * Starts the region-scoped chunk tick of the current level tick.
+     * <p>
+     * The call opens the slice of the opt-in chunk tick attribution, which is closed by
+     * {@link #runChunkTickPlan(RegionChunkTickPlan)} and stays disabled unless a diagnostics run enables it.
      *
-     * @param barrier waits for the submitted region work on the server thread
-     * @return the plan to fill, or {@code null} when random ticks have to stay on the server thread
+     * @param randomTickSpeed the level's random tick speed, read once by the level for the whole tick
+     * @param barrier         waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when the chunk tick has to stay on the server thread
      */
     @Nullable
-    public static RegionRandomTickPlan beginRandomTickPlan(ServerLevel level, RegionTickBarrier barrier) {
+    public static RegionChunkTickPlan beginChunkTickPlan(ServerLevel level, int randomTickSpeed, RegionTickBarrier barrier) {
+        RegionChunkTickAttribution.beginSlice(level);
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine) {
-            return engine.beginRandomTickPlan(level, barrier);
+            return engine.beginChunkTickPlan(level, randomTickSpeed, barrier);
         }
         return null;
     }
 
     /**
-     * Ticks the random ticks collected by {@code plan} on region workers and waits for the batch.
+     * Ticks the chunks collected by {@code plan} on region workers and waits for the batch.
      */
-    public static void runRandomTickPlan(@Nullable RegionRandomTickPlan plan) {
-        if (plan != null) {
-            plan.executeAndAwait();
+    public static void runChunkTickPlan(@Nullable RegionChunkTickPlan plan) {
+        try {
+            if (plan != null) {
+                plan.executeAndAwait();
+            }
+        } finally {
+            // The slice covers the whole chunk tick pass, including a failing batch: the attribution only
+            // measures, so it must not lose the slice of a tick that threw.
+            RegionChunkTickAttribution.endSlice();
         }
     }
 
     /**
-     * {@return the random source of the random tick group executing on the current thread, or
-     * {@code null} outside a random tick worker group}
+     * {@return the random source of the chunk tick executing on the current thread, or {@code null} outside a
+     * chunk tick worker group}
+     * <p>
+     * A chunk tick installs the random source of its own chunk, so the block code it runs and the position
+     * selection of the level draw from the chunk's source instead of the shared level sources.
      */
     @Nullable
-    public static RandomSource randomTickRandom() {
+    public static RandomSource chunkTickRandom() {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine) {
-            return engine.randomTickRandom();
+            return engine.chunkTickRandom();
         }
         return null;
+    }
+
+    /**
+     * {@return the position selection of the chunk tick executing on the current thread, or {@code null}
+     * outside a chunk tick worker group}
+     * <p>
+     * {@code Level.getBlockRandomPos} selects a random tick position from the level-wide {@code randValue}
+     * sequence, which one worker cannot share with another. Inside a chunk tick group the level selects the
+     * position from this source instead, so the selection of a chunk is per-chunk deterministic.
+     */
+    @Nullable
+    public static RandomSource chunkTickPositionRandom() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            return engine.chunkTickPositionRandom();
+        }
+        return null;
+    }
+
+    /**
+     * Defers the lightning strike of one chunk tick to the server thread.
+     * <p>
+     * A chunk tick worker may not resolve a strike: the target comes from the POI manager and from entity
+     * storage and can be in another region. Inside a chunk tick worker group the rolled position is recorded
+     * and the server thread resolves it at the batch barrier.
+     *
+     * @return {@code true} when the strike was deferred, {@code false} when the caller has to resolve it inline
+     */
+    public static boolean deferChunkTickLightning(net.minecraft.core.BlockPos rolledPos) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferChunkTickLightning(rolledPos);
     }
 
     /**
@@ -603,7 +648,7 @@ public final class RegionThreadingHooks {
         if (threading instanceof RegionThreadingEngine engine
                 && (engine.isEntityTickWorkerExecutionEnabled()
                         || engine.isScheduledTickWorkerExecutionEnabled()
-                        || engine.isRandomTickWorkerExecutionEnabled())) {
+                        || engine.isChunkTickWorkerExecutionEnabled())) {
             return new RegionAwareRandomSource(vanilla);
         }
         return vanilla;

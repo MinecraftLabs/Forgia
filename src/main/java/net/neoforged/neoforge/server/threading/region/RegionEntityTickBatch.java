@@ -85,9 +85,13 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * differ, and that order is not relied upon. Within one entity, newest wins is preserved.
      */
     private final IdentityHashMap<Entity, DeferredEntityUpdate> deferredUpdates = new IdentityHashMap<>();
-    private final List<DeferredSectionUpdate> deferredSectionUpdates = Collections.synchronizedList(new ArrayList<>());
-    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredSectionUpdates}. */
-    private volatile boolean sectionUpdateSeamClosed;
+    /**
+     * Moves that a worker recorded for the barrier.
+     * <p>
+     * The record is shared with the chunk tick batch, which defers the move of an entity its precipitation
+     * tick pushed out of a snow layer: both slices publish the entity section on the server thread.
+     */
+    private final RegionDeferredEntitySectionUpdates deferredSectionUpdates = new RegionDeferredEntitySectionUpdates(this);
     /**
      * Removals that a worker recorded for the barrier, keyed by entity identity.
      * <p>
@@ -99,22 +103,10 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     /**
      * Admissions that a worker recorded for the barrier, in record order.
      * <p>
-     * One entry is one riding graph, because an entity and its passengers are one admission: the barrier
-     * admits the members in vanilla self-then-passengers order, so a vehicle is in the level before its
-     * passengers. The list is guarded by its own monitor, is only filled from workers, and is drained and
-     * cleared once per tick by the barrier, so it stays bounded by the graphs admitted in the current tick.
+     * The record is shared with the chunk tick batch, which defers the admission of an entity a random tick
+     * spawned: both slices admit the riding graph on the server thread.
      */
-    private final List<DeferredEntityAddition> deferredAdditions = new ArrayList<>();
-    /**
-     * Every entity of an already recorded admission, by identity. It makes the per-entity calls of
-     * {@code addFreshEntityWithPassengers} no-ops of the graph that already carries them instead of a second
-     * record; guarded by the monitor of {@link #deferredAdditions}.
-     */
-    private final Set<Entity> recordedAdditionMembers = Collections.newSetFromMap(new IdentityHashMap<>());
-    /** Admissions this batch recorded; guarded by the monitor of {@link #deferredAdditions}. */
-    private long recordedAdditionCount;
-    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredAdditions}. */
-    private volatile boolean additionSeamClosed;
+    private final RegionDeferredEntityAdditions deferredAdditions = new RegionDeferredEntityAdditions(this);
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level) {
@@ -264,14 +256,14 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * storage refusal instead.
      */
     boolean acceptsDeferredSectionUpdates() {
-        return !this.isSectionUpdateSeamClosed() && !this.isComplete();
+        return this.deferredSectionUpdates.accepts();
     }
 
     /**
      * {@return true when this batch no longer accepts or applies deferred section updates}
      */
     boolean isSectionUpdateSeamClosed() {
-        return this.sectionUpdateSeamClosed;
+        return this.deferredSectionUpdates.isSeamClosed();
     }
 
     /**
@@ -284,12 +276,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * @return the number of released updates, which the caller counts as dropped
      */
     int closeDeferredSectionUpdates() {
-        synchronized (this.deferredSectionUpdates) {
-            this.sectionUpdateSeamClosed = true;
-            final int released = this.deferredSectionUpdates.size();
-            this.deferredSectionUpdates.clear();
-            return released;
-        }
+        return this.deferredSectionUpdates.close();
     }
 
     /**
@@ -306,13 +293,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      *         be published and the caller has to refuse it before it mutates the entity
      */
     boolean deferSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {
-        synchronized (this.deferredSectionUpdates) {
-            if (this.sectionUpdateSeamClosed || this.isComplete()) {
-                return false;
-            }
-            this.deferredSectionUpdates.add(new DeferredSectionUpdate(entity, callback, targetSection));
-            return true;
-        }
+        return this.deferredSectionUpdates.defer(entity, callback, targetSection);
     }
 
     /**
@@ -372,7 +353,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * refusing them would abort the constructor at an arbitrary point instead of at the admission.
      */
     boolean isAdditionSeamClosed() {
-        return this.additionSeamClosed;
+        return this.deferredAdditions.isSeamClosed();
     }
 
     /**
@@ -389,18 +370,7 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      *         never be applied and the caller has to keep the storage refusal
      */
     boolean deferAddition(Entity entity, List<Entity> graph) {
-        synchronized (this.deferredAdditions) {
-            if (this.additionSeamClosed || this.isComplete()) {
-                return false;
-            }
-            if (this.recordedAdditionMembers.contains(entity)) {
-                return true;
-            }
-            this.deferredAdditions.add(new DeferredEntityAddition(entity, List.copyOf(graph)));
-            this.recordedAdditionMembers.addAll(graph);
-            this.recordedAdditionCount++;
-            return true;
-        }
+        return this.deferredAdditions.defer(entity, graph);
     }
 
     /**
@@ -412,39 +382,22 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      *
      * @return the released admissions and the records this batch accepted
      */
-    AdditionDrain closeDeferredAdditions() {
-        synchronized (this.deferredAdditions) {
-            this.additionSeamClosed = true;
-            return this.drainAdditions();
-        }
+    RegionDeferredEntityAdditions.Drain closeDeferredAdditions() {
+        return this.deferredAdditions.close();
     }
 
     /**
      * Takes the deferred admissions that wait for the end of the batch.
      */
-    AdditionDrain drainDeferredAdditions() {
-        synchronized (this.deferredAdditions) {
-            return this.drainAdditions();
-        }
-    }
-
-    private AdditionDrain drainAdditions() {
-        final AdditionDrain drain = new AdditionDrain(List.copyOf(this.deferredAdditions), this.recordedAdditionCount);
-        this.deferredAdditions.clear();
-        this.recordedAdditionMembers.clear();
-        this.recordedAdditionCount = 0L;
-        return drain;
+    RegionDeferredEntityAdditions.Drain drainDeferredAdditions() {
+        return this.deferredAdditions.drain();
     }
 
     /**
      * Takes the deferred section updates that wait for the end of the batch.
      */
-    List<DeferredSectionUpdate> drainDeferredSectionUpdates() {
-        synchronized (this.deferredSectionUpdates) {
-            final List<DeferredSectionUpdate> updates = List.copyOf(this.deferredSectionUpdates);
-            this.deferredSectionUpdates.clear();
-            return updates;
-        }
+    List<RegionDeferredEntitySectionUpdates.DeferredSectionUpdate> drainDeferredSectionUpdates() {
+        return this.deferredSectionUpdates.drain();
     }
 
     /**
@@ -494,25 +447,6 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * observed. The destination is captured once and never re-derived at the batch barrier.
      */
     record DeferredEntityUpdate(Entity entity, @Nullable RegionCoordinate destination) {}
-
-    /**
-     * One deferred section update: the moved entity, the level callback the inline move would have invoked
-     * and the section of the position the move reached. The section carries the target chunk acquisition as
-     * well, because a section coordinate is a chunk coordinate.
-     */
-    record DeferredSectionUpdate(Entity entity, EntityInLevelCallback callback, long targetSection) {}
-
-    /**
-     * One deferred admission: the entity the worker added and the whole riding graph it belongs to, in the
-     * order the barrier admits it. The root is kept for diagnostics; the graph is what the barrier admits.
-     */
-    record DeferredEntityAddition(Entity root, List<Entity> graph) {}
-
-    /**
-     * One drain of the deferred admissions of a batch: the admissions to apply and the number of records the
-     * batch accepted, which the caller counts as recorded.
-     */
-    record AdditionDrain(List<DeferredEntityAddition> additions, long recorded) {}
 
     /**
      * One region's share of the batch: the region lease, the entities it ticks, the snapshot members it is

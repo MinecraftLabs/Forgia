@@ -146,6 +146,9 @@ runs {
             // Measurement runs pass -PserverBenchmarkZombieLoot=false to turn the mob loot rule off for the
             // entity worker window; unset keeps the vanilla rule.
             systemProperty("neoforge.serverBenchmarkZombieLoot", providers.gradleProperty("serverBenchmarkZombieLoot").getOrElse("true"))
+            // Measurement runs pass -PserverBenchmarkRandomTickChunks=N to size the random tick workload grid
+            // without editing the test; unset keeps the default workload of the test.
+            systemProperty("neoforge.serverBenchmarkRandomTickChunks", providers.gradleProperty("serverBenchmarkRandomTickChunks").getOrElse("256"))
             // Measurement runs pass -PserverBenchmarkTicks=N to lengthen the measured window of the entity
             // worker soak; unset keeps the default window of the soak.
             systemProperty("neoforge.serverBenchmarkTicks", providers.gradleProperty("serverBenchmarkTicks").getOrElse("3000"))

@@ -130,7 +130,7 @@ public class NeoForgeConfig {
                     .define("enableRegionThreadingScheduledTicks", false);
 
             enableRegionThreadingRandomTicks = builder
-                    .comment("EXPERIMENTAL: Requests the bounded random block and fluid tick slice. Requires enableRegionThreadingBridge. In production the effective dispatch stays gated because no random callback class is admitted as entity-storage safe, so the vanilla inline loop runs; diagnostics report the request separately from the effective dispatch.")
+                    .comment("EXPERIMENTAL: Ticks the chunks of a level on their owning region worker thread while the server thread waits for the batch. This is the chunk tick body - random block and fluid ticks, ice and snow, and thunder - not only the random ticks the key is named after. Requires enableRegionThreadingBridge. Only chunks whose eight neighboring chunks belong to the same region and are loaded run on a worker; a chunk that a random tick could write out of its region, or that would have to load a chunk, stays on the server thread. Natural spawning, the inhabited time update, the custom spawners and every other global decision stay on the server thread. Every refusal is counted and reported by the region threading diagnostics.")
                     .translation("neoforge.configgui.enableRegionThreadingRandomTicks")
                     .worldRestart()
                     .define("enableRegionThreadingRandomTicks", false);

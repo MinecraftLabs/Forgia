@@ -181,53 +181,75 @@
              }
          }
      }
-@@ -465,6 +_,13 @@
+@@ -472,28 +_,12 @@
+         ProfilerFiller profilerfiller = this.getProfiler();
+         profilerfiller.push("thunder");
+         if (flag && this.isThundering() && this.random.nextInt(100000) == 0) {
+-            BlockPos blockpos = this.findLightningTargetAround(this.getBlockRandomPos(i, 0, j, 15));
+-            if (this.isRainingAt(blockpos)) {
+-                DifficultyInstance difficultyinstance = this.getCurrentDifficultyAt(blockpos);
+-                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING)
+-                    && this.random.nextDouble() < (double)difficultyinstance.getEffectiveDifficulty() * 0.01
+-                    && !this.getBlockState(blockpos.below()).is(Blocks.LIGHTNING_ROD);
+-                if (flag1) {
+-                    SkeletonHorse skeletonhorse = EntityType.SKELETON_HORSE.create(this);
+-                    if (skeletonhorse != null) {
+-                        skeletonhorse.setTrap(true);
+-                        skeletonhorse.setAge(0);
+-                        skeletonhorse.setPos((double)blockpos.getX(), (double)blockpos.getY(), (double)blockpos.getZ());
+-                        this.addFreshEntity(skeletonhorse);
+-                    }
+-                }
+-
+-                LightningBolt lightningbolt = EntityType.LIGHTNING_BOLT.create(this);
+-                if (lightningbolt != null) {
+-                    lightningbolt.moveTo(Vec3.atBottomCenterOf(blockpos));
+-                    lightningbolt.setVisualOnly(flag1);
+-                    this.addFreshEntity(lightningbolt);
+-                }
++            BlockPos blockpos = this.getBlockRandomPos(i, 0, j, 15);
++            // Neo: a region chunk tick worker may not resolve the strike itself, because the target comes from
++            // the POI manager and from entity storage and can be in another region. The worker records the
++            // rolled position and the server thread resolves it at the batch barrier.
++            if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickLightning(blockpos)) {
++                this.tickLightning(blockpos);
+             }
+         }
+ 
+@@ -537,11 +_,40 @@
+         profilerfiller.pop();
      }
  
-     public void tickChunk(LevelChunk p_8715_, int p_8716_) {
-+        this.tickChunk(p_8715_, p_8716_, null);
++    // Neo: resolves and applies one lightning strike of the chunk tick. The vanilla body calls it inline; a
++    // region chunk tick worker defers the rolled position and the server thread calls it at the batch barrier.
++    public void tickLightning(BlockPos p_143290_) {
++        BlockPos blockpos = this.findLightningTargetAround(p_143290_);
++        if (this.isRainingAt(blockpos)) {
++            DifficultyInstance difficultyinstance = this.getCurrentDifficultyAt(blockpos);
++            boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING)
++                && this.random.nextDouble() < (double)difficultyinstance.getEffectiveDifficulty() * 0.01
++                    && !(this.getBlockState(blockpos.below()).getBlock() instanceof net.minecraft.world.level.block.LightningRodBlock); // Neo: support custom LightningRodBlocks
++            if (flag1) {
++                SkeletonHorse skeletonhorse = EntityType.SKELETON_HORSE.create(this);
++                if (skeletonhorse != null) {
++                    skeletonhorse.setTrap(true);
++                    skeletonhorse.setAge(0);
++                    skeletonhorse.setPos((double)blockpos.getX(), (double)blockpos.getY(), (double)blockpos.getZ());
++                    this.addFreshEntity(skeletonhorse);
++                }
++            }
++
++            LightningBolt lightningbolt = EntityType.LIGHTNING_BOLT.create(this);
++            if (lightningbolt != null) {
++                lightningbolt.moveTo(Vec3.atBottomCenterOf(blockpos));
++                lightningbolt.setVisualOnly(flag1);
++                this.addFreshEntity(lightningbolt);
++            }
++        }
 +    }
 +
-+    // Neo: overload that lets the level tick collect the selected random ticks for the region worker
-+    // slice. Chunk selection, thunder, precipitation, natural spawning and section traversal stay in this
-+    // server-thread body; only the selected block/fluid callbacks are handed to the plan.
-+    public void tickChunk(LevelChunk p_8715_, int p_8716_, @Nullable net.neoforged.neoforge.server.threading.region.RegionRandomTickPlan randomTickPlan) {
-         ChunkPos chunkpos = p_8715_.getPos();
-         boolean flag = this.isRaining();
-         int i = chunkpos.getMinBlockX();
-@@ -477,7 +_,7 @@
-                 DifficultyInstance difficultyinstance = this.getCurrentDifficultyAt(blockpos);
-                 boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING)
-                     && this.random.nextDouble() < (double)difficultyinstance.getEffectiveDifficulty() * 0.01
--                    && !this.getBlockState(blockpos.below()).is(Blocks.LIGHTNING_ROD);
-+                        && !(this.getBlockState(blockpos.below()).getBlock() instanceof net.minecraft.world.level.block.LightningRodBlock); // Neo: support custom LightningRodBlocks
-                 if (flag1) {
-                     SkeletonHorse skeletonhorse = EntityType.SKELETON_HORSE.create(this);
-                     if (skeletonhorse != null) {
-@@ -520,12 +_,20 @@
-                         profilerfiller.push("randomTick");
-                         BlockState blockstate = levelchunksection.getBlockState(blockpos1.getX() - i, blockpos1.getY() - k, blockpos1.getZ() - j);
-                         if (blockstate.isRandomlyTicking()) {
--                            blockstate.randomTick(this, blockpos1, this.random);
-+                            if (randomTickPlan != null) {
-+                                randomTickPlan.accept(chunkpos, blockpos1, blockstate::randomTick);
-+                            } else {
-+                                blockstate.randomTick(this, blockpos1, this.random);
-+                            }
-                         }
- 
-                         FluidState fluidstate = blockstate.getFluidState();
-                         if (fluidstate.isRandomlyTicking()) {
--                            fluidstate.randomTick(this, blockpos1, this.random);
-+                            if (randomTickPlan != null) {
-+                                randomTickPlan.accept(chunkpos, blockpos1, (randomTickLevel, randomTickPos, randomTickRandom) -> fluidstate.randomTick(randomTickLevel, randomTickPos, randomTickRandom));
-+                            } else {
-+                                fluidstate.randomTick(this, blockpos1, this.random);
-+                            }
-                         }
- 
-                         profilerfiller.pop();
-@@ -542,6 +_,7 @@
+     @VisibleForTesting
+     public void tickPrecipitation(BlockPos p_295060_) {
          BlockPos blockpos = this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, p_295060_);
          BlockPos blockpos1 = blockpos.below();
          Biome biome = this.getBiome(blockpos).value();

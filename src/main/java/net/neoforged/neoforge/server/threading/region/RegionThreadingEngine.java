@@ -126,7 +126,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final boolean entityTickWorkerExecutionEnabled;
     private final boolean blockEntityTickWorkerExecutionEnabled;
     private final boolean scheduledTickWorkerExecutionEnabled;
-    private final boolean randomTickWorkerExecutionEnabled;
+    private final boolean chunkTickWorkerExecutionEnabled;
     private final AtomicLong rejectedWorkerTaskCount = new AtomicLong();
     private final AtomicLong failedQueuedTaskCount = new AtomicLong();
     private final AtomicLong entityTicksOnWorkers = new AtomicLong();
@@ -209,16 +209,33 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong scheduledTicksOnWorkers = new AtomicLong();
     private final AtomicLong skippedScheduledTicks = new AtomicLong();
     private final AtomicLong fallbackScheduledTicks = new AtomicLong();
-    private final AtomicLong randomTicksOnWorkers = new AtomicLong();
-    private final AtomicLong skippedRandomTicks = new AtomicLong();
-    private final AtomicLong fallbackRandomTicks = new AtomicLong();
+    private final AtomicLong chunkTicksOnWorkers = new AtomicLong();
+    private final AtomicLong skippedChunkTicks = new AtomicLong();
+    private final AtomicLong fallbackChunkTicks = new AtomicLong();
+    /** Chunks the plan kept on the server thread because a random tick of them could leave their region. */
+    private final AtomicLong boundaryChunkTicks = new AtomicLong();
+    /** Chunks the plan kept on the server thread because a neighboring chunk is not loaded. */
+    private final AtomicLong unloadedNeighborhoodChunkTicks = new AtomicLong();
+    /** Chunk ticks a worker abandoned because the chunk source refused a chunk it needed. */
+    private final AtomicLong truncatedChunkTicks = new AtomicLong();
+    /** Chunks collected after their batch already ran, so the server thread ticked them inline. */
+    private final AtomicLong lateChunkTicks = new AtomicLong();
+    /** Regions whose lease could not be acquired, so their chunks ticked on the server thread. */
+    private final AtomicLong unleasedChunkTicks = new AtomicLong();
+    /** Lightning strikes a chunk tick worker rolled and the server thread resolved at the barrier. */
+    private final AtomicLong chunkTickLightningStrikes = new AtomicLong();
+    /**
+     * Level ticks whose chunk tick stayed on the server thread because the level keeps the legacy shared entity
+     * section storage instead of per-region buckets.
+     */
+    private final AtomicLong nonPartitionedChunkTicks = new AtomicLong();
     private final AtomicBoolean entityTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean blockEntityTickWorkersNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean scheduledTickWorkersNoticeLogged = new AtomicBoolean();
-    private final AtomicBoolean randomTickWorkersNoticeLogged = new AtomicBoolean();
+    private final AtomicBoolean chunkTickWorkersNoticeLogged = new AtomicBoolean();
+    private final AtomicBoolean chunkTickStorageNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean entityTickFallbackNoticeLogged = new AtomicBoolean();
     private final AtomicBoolean scheduledTickFallbackNoticeLogged = new AtomicBoolean();
-    private final AtomicBoolean randomTickFallbackNoticeLogged = new AtomicBoolean();
     /**
      * Declares who may touch the vanilla entity section/index storage while this engine's workers run.
      * <p>
@@ -286,11 +303,26 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final ThreadLocal<Queue<Runnable>> currentRegionTickMutations = new ThreadLocal<>();
     /**
-     * Random source of the random tick group that executes on the current thread. It is only set for the
-     * duration of a worker group, so {@link #randomTickRandom()} returns {@code null} everywhere else
-     * and the vanilla level random stays authoritative outside a batch.
+     * Random source of the chunk tick group that executes on the current thread. It is installed for the tick
+     * of one chunk, so {@link #chunkTickRandom()} answers with the random source of that chunk and
+     * {@code level.random} draws of the chunk body resolve it instead of the shared vanilla source.
      */
-    private final ThreadLocal<RandomSource> currentRandomTickRandom = new ThreadLocal<>();
+    private final ThreadLocal<RandomSource> currentChunkTickRandom = new ThreadLocal<>();
+    /**
+     * Position selection of the chunk tick of the current thread.
+     * <p>
+     * {@code Level.getBlockRandomPos} selects a position from the level-wide {@code randValue} sequence, which
+     * one worker cannot share with another. A chunk tick therefore installs the chunk's own random source here
+     * and the level selects the position from it, so the selection of a chunk is per-chunk deterministic.
+     */
+    private final ThreadLocal<RandomSource> currentChunkTickPositionRandom = new ThreadLocal<>();
+    /**
+     * The strikes a chunk tick worker rolled and may not resolve itself.
+     * <p>
+     * Only set inside a worker group, so the level defers a strike there and resolves it inline on the server
+     * thread.
+     */
+    private final ThreadLocal<Queue<BlockPos>> currentChunkTickLightning = new ThreadLocal<>();
     private final Set<RegionTickBatch> activeTickBatches = ConcurrentHashMap.newKeySet();
     /**
      * Pending and terminal decisions of the recorded cross-region entity transfer transaction. The
@@ -438,8 +470,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Production uses {@link RegionEntityStorageMode#MAIN_THREAD_ONLY}; only the entity tick worker
      * mechanics tests construct an engine with region-owned storage.
      */
-    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionPolicy regionPolicy) {
-        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, randomTickWorkerExecutionEnabled, regionPolicy, RegionEntityStorageMode.MAIN_THREAD_ONLY);
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionPolicy regionPolicy) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, regionPolicy, RegionEntityStorageMode.MAIN_THREAD_ONLY);
     }
 
     /**
@@ -450,8 +482,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * {@link RegionLayout} instead, so the engine, its regionizer and the physical section partitions of
      * the levels it ticks share one fixed region size.
      */
-    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionPolicy regionPolicy, RegionEntityStorageMode entityStorageMode) {
-        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, randomTickWorkerExecutionEnabled, RegionLayout.of(regionPolicy), entityStorageMode);
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionPolicy regionPolicy, RegionEntityStorageMode entityStorageMode) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, RegionLayout.of(regionPolicy), entityStorageMode);
     }
 
     /**
@@ -460,7 +492,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * This is the production constructor: the layout carries both the policy and the fixed region edge
      * length, so nothing downstream has to guess the size.
      */
-    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
         this.layout = layout;
         this.regionizer = new ThreadedRegionizer(this.layout);
         this.workerPool = new RegionWorkerPool(workerThreads > 0 ? workerThreads : Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
@@ -469,7 +501,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.entityTickWorkerExecutionEnabled = entityTickWorkerExecutionEnabled;
         this.blockEntityTickWorkerExecutionEnabled = blockEntityTickWorkerExecutionEnabled;
         this.scheduledTickWorkerExecutionEnabled = scheduledTickWorkerExecutionEnabled;
-        this.randomTickWorkerExecutionEnabled = randomTickWorkerExecutionEnabled;
+        this.chunkTickWorkerExecutionEnabled = chunkTickWorkerExecutionEnabled;
         this.entityStorageMode = entityStorageMode;
         RegionOwnershipViolationHandler.reset();
         RegionEntityOwnershipScope.resetCounters();
@@ -479,8 +511,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Creates an engine with an explicit region layout and every bounded tick slice, keeping entity storage
      * on the server thread.
      */
-    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean randomTickWorkerExecutionEnabled, RegionLayout layout) {
-        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, randomTickWorkerExecutionEnabled, layout, RegionEntityStorageMode.MAIN_THREAD_ONLY);
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionLayout layout) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, layout, RegionEntityStorageMode.MAIN_THREAD_ONLY);
     }
 
     public RegionPolicy regionPolicy() {
@@ -1258,24 +1290,30 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Starts collecting the block and fluid random ticks of the current {@code level} tick that should run
-     * on region workers.
+     * Starts the region-scoped chunk tick of the current {@code level} tick.
+     * <p>
+     * The level's own chunk loop decides which chunks are ticked (natural spawning gate, forced-tick gate,
+     * {@code shouldTickBlocksAt}) and hands every such chunk to {@link RegionChunkTickPlan#accept}. This call
+     * only decides whether the slice runs at all.
      *
-     * @param barrier waits for the submitted region work on the server thread
-     * @return the plan to fill, or {@code null} when random ticks have to stay on the server thread
+     * @param randomTickSpeed the level's random tick speed, read once by the level for the whole tick
+     * @param barrier         waits for the submitted region work on the server thread
+     * @return the plan to fill, or {@code null} when the chunk tick has to stay on the server thread
      */
     @Nullable
-    public RegionRandomTickPlan beginRandomTickPlan(ServerLevel level, RegionTickBarrier barrier) {
-        if (!this.randomTickWorkerExecutionEnabled || this.shutdown) {
+    public RegionChunkTickPlan beginChunkTickPlan(ServerLevel level, int randomTickSpeed, RegionTickBarrier barrier) {
+        if (!this.chunkTickWorkerExecutionEnabled || this.shutdown) {
             return null;
         }
-        if (!this.unclassifiedWorkerCallbacksForTesting) {
-            // A random tick callback is arbitrary block/fluid code and can touch entity storage or shared
-            // level state, so no callback class is admitted yet. The vanilla inline path runs instead and
-            // keeps the synchronous result of the callback.
-            if (this.randomTickFallbackNoticeLogged.compareAndSet(false, true)) {
-                LOGGER.info("Region random ticks are configured for workers but fall back to the server thread: no callback class is admitted as entity-storage safe");
+        if (level.entitySectionRegionChunkSize() <= 0) {
+            // A random tick reaches entity storage through the region-scoped query of its lease - a raised snow
+            // layer pushes the entities standing in it up, a hatched egg spawns one - and that query only exists
+            // for a level whose sections are partitioned per region. A level that keeps the legacy shared section
+            // storage would have to refuse those ticks, so its chunk tick stays on the server thread.
+            if (this.chunkTickStorageNoticeLogged.compareAndSet(false, true)) {
+                LOGGER.info("Region chunk ticks stay on the server thread for a level without region-owned entity section storage");
             }
+            this.nonPartitionedChunkTicks.incrementAndGet();
             return null;
         }
         if (level.getProfiler() != InactiveProfiler.INSTANCE) {
@@ -1283,11 +1321,11 @@ public final class RegionThreadingEngine implements RegionThreading {
             return null;
         }
         if (this.regionizer.isLevelClosed(level)) {
-            // The level identity is retired; tick the random ticks inline like vanilla instead of
-            // publishing a batch for region state that no longer exists.
+            // The level identity is retired; tick the chunks inline like vanilla instead of publishing a
+            // batch for region state that no longer exists.
             return null;
         }
-        return new RegionRandomTickPlan(this, level, barrier);
+        return new RegionChunkTickPlan(this, level, randomTickSpeed, barrier);
     }
 
     /**
@@ -1359,14 +1397,15 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * {@return true when the selected block and fluid random ticks execute on region workers}
+     * {@return true when the chunk tick of a level executes on region workers}
      * <p>
-     * This is the configured request, not the effective dispatch. Without an audited callback admission
-     * {@link #beginRandomTickPlan} returns {@code null} and the vanilla inline loop runs instead.
+     * This is the configured request, not the effective dispatch: the profiler, a closing level and the
+     * per-chunk interior and loaded-neighborhood rules still keep work on the server thread, and every
+     * refusal is counted.
      */
     @ApiStatus.Internal
-    public boolean isRandomTickWorkerExecutionEnabled() {
-        return this.randomTickWorkerExecutionEnabled;
+    public boolean isChunkTickWorkerExecutionEnabled() {
+        return this.chunkTickWorkerExecutionEnabled;
     }
 
     /**
@@ -1378,11 +1417,11 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * {@return true when the configured random tick worker slice actually dispatches callbacks}
+     * {@return true when the configured chunk tick worker slice actually dispatches chunks}
      */
     @ApiStatus.Internal
-    public boolean isRandomTickWorkerDispatchEffective() {
-        return this.randomTickWorkerExecutionEnabled && this.unclassifiedWorkerCallbacksForTesting;
+    public boolean isChunkTickWorkerDispatchEffective() {
+        return this.chunkTickWorkerExecutionEnabled;
     }
 
     /**
@@ -1459,8 +1498,32 @@ public final class RegionThreadingEngine implements RegionThreading {
      * {@code null} outside a random tick worker group}
      */
     @Nullable
-    public RandomSource randomTickRandom() {
-        return this.currentRandomTickRandom.get();
+    public RandomSource chunkTickRandom() {
+        return this.currentChunkTickRandom.get();
+    }
+
+    /**
+     * {@return the position selection of the chunk tick executing on the current thread, or {@code null}
+     * outside a chunk tick worker group}
+     */
+    @Nullable
+    public RandomSource chunkTickPositionRandom() {
+        return this.currentChunkTickPositionRandom.get();
+    }
+
+    /**
+     * Records the lightning strike of a chunk tick worker for the batch barrier.
+     *
+     * @return {@code true} when the strike was recorded, {@code false} on a thread that has to resolve it
+     *         inline
+     */
+    public boolean deferChunkTickLightning(BlockPos rolledPos) {
+        final Queue<BlockPos> strikes = this.currentChunkTickLightning.get();
+        if (strikes == null) {
+            return false;
+        }
+        strikes.add(rolledPos);
+        return true;
     }
 
     /**
@@ -1478,7 +1541,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (scheduled != null) {
             return scheduled;
         }
-        final RandomSource random = this.currentRandomTickRandom.get();
+        final RandomSource random = this.currentChunkTickRandom.get();
         if (random != null) {
             return random;
         }
@@ -1506,7 +1569,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (scheduled != null) {
             return scheduled;
         }
-        final RandomSource random = this.currentRandomTickRandom.get();
+        final RandomSource random = this.currentChunkTickRandom.get();
         return random != null ? random : this.currentBlockEntityTickRandom.get();
     }
 
@@ -2937,71 +3000,93 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Ticks {@code ticks} on their owning region workers and waits for the batch.
+     * Ticks the chunks of one level tick on the region workers and waits for the batch.
      * <p>
-     * Runs on the server thread: chunk selection, random position selection, section traversal, thunder,
-     * precipitation, natural spawning and inhabited time already ran in the unchanged server-thread body,
-     * so this method only distributes the selected random tick callbacks. The batch is published under the
-     * lifecycle read gate before any region lease is acquired, so a concurrent shutdown or level unload
-     * observes it and waits instead of retiring regions that the batch still holds or is about to lease.
-     * Region ownership is re-resolved after the snapshot, so a region that merged or split between
-     * collection and lease acquisition is replaced by its authoritative successor instead of dropping the
-     * tick. Ticks whose region cannot be leased safely run on the server thread after the batch rather than
+     * Runs on the server thread after the level's own chunk loop decided which chunks tick: natural spawning,
+     * the inhabited time update, the custom spawners and the per-chunk broadcast already ran there. The batch is
+     * published under the lifecycle read gate before any region lease is acquired, so a concurrent shutdown or
+     * level unload observes it and waits instead of retiring regions that the batch still holds or is about to
+     * lease. Region ownership is re-resolved after the collection, so a region that merged or split between the
+     * decision and the lease acquisition is replaced by its authoritative successor instead of dropping the
+     * chunk. Chunks whose region cannot be leased safely run on the server thread after the batch rather than
      * being dropped.
      * <p>
      * The server thread waits for the whole batch before the level broadcast and the rest of the level tick
-     * continue. The mutation queue is drained afterwards, so a random tick that schedules a block or fluid
-     * tick never mutates {@code LevelTicks} from a worker.
+     * continue. The deferred effects of the workers are applied in this order: the section publications of the
+     * moves, the removals, the admissions, the lightning strikes the workers rolled, the chunks that could not
+     * be leased, and finally the {@code LevelTicks} mutations, so a random tick never mutates a server-owned
+     * structure from a worker.
      */
-    void tickRandomTicks(ServerLevel level, List<RegionRandomTick> ticks, List<RegionRandomTick> chunkFallbackTicks, RegionTickBarrier barrier) {
-        if (ticks.isEmpty() && chunkFallbackTicks.isEmpty()) {
+    void tickChunks(ServerLevel level, List<RegionChunkTickEntry> chunks, int randomTickSpeed, RegionTickBarrier barrier) {
+        // The server thread is done deciding which chunks it hands over; the attribution of the slice closes its
+        // plan segment here, before the batch is published.
+        RegionChunkTickAttribution.endPlanSegment();
+        if (chunks.isEmpty()) {
             return;
         }
 
-        final RegionRandomTickBatch batch = new RegionRandomTickBatch(level, chunkFallbackTicks);
+        final RegionChunkTickBatch batch = new RegionChunkTickBatch(level, randomTickSpeed);
         final TickBatchPublication publication = this.publishTickBatch(batch, level);
         if (publication == TickBatchPublication.LEVEL_CLOSED) {
-            // The level clear completed after this snapshot was collected. Its region state is retired and
-            // no batch may be published for it: the collected random ticks must not tick for a level that
-            // already unloaded.
-            this.skippedRandomTicks.addAndGet(ticks.size() + chunkFallbackTicks.size());
+            // The level clear completed after this collection. Its region state is retired and no batch may be
+            // published for it: the collected chunks must not tick for a level that already unloaded.
+            this.skippedChunkTicks.addAndGet(chunks.size());
             return;
         }
         if (publication == TickBatchPublication.SHUTDOWN) {
-            // The engine was shut down between the snapshot and the batch; the collected random ticks still
-            // have to tick, but no batch may be published after shutdown started.
-            for (final RegionRandomTick tick : ticks) {
-                this.tickRandomTickInline(level, tick);
-            }
-            for (final RegionRandomTick tick : chunkFallbackTicks) {
-                this.tickRandomTickInline(level, tick);
+            // The engine was shut down between the collection and the batch; the collected chunks still have to
+            // tick, but no batch may be published after shutdown started.
+            for (final RegionChunkTickEntry chunk : chunks) {
+                this.tickChunkOnServerThread(level, chunk, randomTickSpeed);
             }
             return;
         }
-        // This thread owns the batch until it finished; a shutdown or unload requested from inside it
-        // (fallback work included) cannot wait for a batch that only this thread can complete.
+        // This thread owns the batch until it finished; a shutdown or unload requested from inside it (fallback
+        // work included) cannot wait for a batch that only this thread can complete.
         batch.markExecutingOnCurrentThread();
+        // The opt-in attribution is decided once per batch, never per chunk.
+        final boolean attribution = RegionChunkTickAttribution.isEnabled();
         Throwable failure = null;
         try {
+            final long leaseStart = attribution ? System.nanoTime() : 0L;
             try {
-                this.leaseRandomTickGroups(batch, ticks, barrier);
+                this.leaseChunkTickGroups(batch, chunks, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
-                try {
-                    batch.submitAndAwait(this.workerPool, barrier);
-                } catch (Throwable throwable) {
-                    if (failure == null) {
-                        failure = throwable;
-                    }
+                if (attribution) {
+                    RegionChunkTickAttribution.recordLease(System.nanoTime() - leaseStart);
+                }
+            }
+            final long awaitStart = attribution ? System.nanoTime() : 0L;
+            try {
+                batch.submitAndAwait(this.workerPool, barrier);
+            } catch (Throwable throwable) {
+                if (failure == null) {
+                    failure = throwable;
+                }
+            } finally {
+                if (attribution) {
+                    RegionChunkTickAttribution.recordAwait(System.nanoTime() - awaitStart);
                 }
             }
         } finally {
-            failure = runBatchCompletion(failure, () -> this.tickFallbackRandomTicks(batch));
-            failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
-            batch.finish();
-            this.activeTickBatches.remove(batch);
-            batch.clearExecutingOnCurrentThread();
+            final long handoffStart = attribution ? System.nanoTime() : 0L;
+            try {
+                failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickSectionUpdates(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickRemovals(batch));
+                failure = runBatchCompletion(failure, () -> this.applyDeferredChunkTickAdditions(batch));
+                failure = runBatchCompletion(failure, () -> this.applyChunkTickLightning(batch));
+                failure = runBatchCompletion(failure, () -> this.tickFallbackChunkTicks(batch));
+                failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
+                batch.finish();
+                this.activeTickBatches.remove(batch);
+                batch.clearExecutingOnCurrentThread();
+            } finally {
+                if (attribution) {
+                    RegionChunkTickAttribution.recordHandoff(System.nanoTime() - handoffStart);
+                }
+            }
         }
 
         if (failure != null) {
@@ -3011,24 +3096,24 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Groups {@code pending} random ticks by their authoritative region and takes the lease of every group.
+     * Groups {@code pending} chunks by their authoritative region and takes the lease of every group.
      * <p>
      * Runs after the batch was published, so cleanup already waits for it and no lifecycle read gate may be
-     * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt.
-     * Anything that cannot be resolved to a live, leasable region is recorded as a server-thread fallback.
+     * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt. Anything
+     * that cannot be resolved to a live, leasable region is recorded as a server-thread fallback.
      */
-    private void leaseRandomTickGroups(RegionRandomTickBatch batch, List<RegionRandomTick> pending, RegionTickBarrier barrier) {
-        List<RegionRandomTick> remaining = pending;
-        int batchedTicks = 0;
+    private void leaseChunkTickGroups(RegionChunkTickBatch batch, List<RegionChunkTickEntry> pending, RegionTickBarrier barrier) {
+        List<RegionChunkTickEntry> remaining = pending;
+        int batchedChunks = 0;
         for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
-            final RegionTickGrouping<RegionState, RegionRandomTick> grouping = new RegionTickGrouping<>();
-            final List<RegionRandomTick> retry = new ArrayList<>();
-            for (final RegionRandomTick tick : remaining) {
-                final RegionState region = this.regionizer.getOrCreate(this.layout.regionAt(batch.level(), tick.pos()));
+            final RegionTickGrouping<RegionState, RegionChunkTickEntry> grouping = new RegionTickGrouping<>();
+            final List<RegionChunkTickEntry> retry = new ArrayList<>();
+            for (final RegionChunkTickEntry chunk : remaining) {
+                final RegionState region = this.regionizer.getOrCreate(chunk.region(this.layout, batch.level()));
                 if (region == null || region.isDead()) {
-                    retry.add(tick);
+                    retry.add(chunk);
                 } else {
-                    grouping.add(region, tick);
+                    grouping.add(region, chunk);
                 }
             }
             if (grouping.isEmpty()) {
@@ -3036,22 +3121,23 @@ public final class RegionThreadingEngine implements RegionThreading {
                 break;
             }
 
-            final List<RegionRandomTick> next = new ArrayList<>(retry);
+            final List<RegionChunkTickEntry> next = new ArrayList<>(retry);
             boolean leasedAny = false;
             for (final RegionState region : grouping.regions()) {
+                final List<RegionChunkTickEntry> regionChunks = grouping.items(region);
                 if (batch.leases(region)) {
-                    // An earlier group of this same batch already owns the lease. It cannot be
-                    // acquired again and must never be awaited on this thread.
-                    batch.group(region).ifPresent(group -> group.addTicks(grouping.items(region)));
+                    // An earlier group of this same batch already owns the lease. It cannot be acquired again
+                    // and must never be awaited on this thread.
+                    batch.group(region).ifPresent(group -> group.addChunks(regionChunks));
                     continue;
                 }
                 if (!this.acquireRegionLease(region, barrier)) {
-                    next.addAll(grouping.items(region));
+                    next.addAll(regionChunks);
                     continue;
                 }
                 leasedAny = true;
-                batchedTicks += grouping.size(region);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region), batch.nextRandomSeed(), this::randomTickGroup));
+                batchedChunks += regionChunks.size();
+                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks, this::chunkTickGroup));
             }
             remaining = next;
             if (!leasedAny) {
@@ -3060,36 +3146,87 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
         }
 
-        if (!remaining.isEmpty()) {
-            batch.addFallback(remaining);
+        for (final RegionChunkTickEntry chunk : remaining) {
+            batch.addFallback(chunk);
+            this.unleasedChunkTicks.incrementAndGet();
         }
-        if (batchedTicks > 0 && this.randomTickWorkersNoticeLogged.compareAndSet(false, true)) {
-            LOGGER.info("Region random ticks are now executing on region workers: {} ticks", batchedTicks);
+        if (batchedChunks > 0 && this.chunkTickWorkersNoticeLogged.compareAndSet(false, true)) {
+            LOGGER.info("Region chunk ticks are now executing on region workers: {} chunks", batchedChunks);
         }
     }
 
-    private Runnable randomTickGroup(RegionRandomTickBatch.Group group) {
+    /**
+     * The worker task of one region: it ticks the chunks of that region in collection order.
+     * <p>
+     * The group holds the lease of the region and the entity ownership lease of the entities stored in it, so a
+     * random tick reaches entity storage only through the region-scoped query and every server-owned effect it
+     * causes is deferred to the barrier. The chunk's own random source is installed for the whole body, so
+     * {@code level.random} draws of the chunk body and the position selection of the level resolve it instead of
+     * the shared vanilla sources.
+     * <p>
+     * A chunk tick that needs a chunk the worker may not load cannot be re-run - the random ticks that already
+     * ran would run twice - so the chunk's tick stops where the refusal happened and the chunk is counted as
+     * truncated.
+     */
+    private Runnable chunkTickGroup(RegionChunkTickBatch.Group group) {
         final RegionState region = group.region();
         final RegionCoordinate coordinate = region.coordinate();
-        final ServerLevel level = group.level();
-        final List<RegionRandomTick> ticks = group.ticks();
-        final RandomSource random = group.random();
+        final ServerLevel level = group.batch().level();
+        final List<RegionChunkTickEntry> chunks = group.chunks();
+        final int randomTickSpeed = group.batch().randomTickSpeed();
         return () -> {
             final long start = System.nanoTime();
             final int[] ticked = { 0 };
             try {
                 region.beginOwnership();
-                this.currentRandomTickRandom.set(random);
+                // LevelTicks is server-owned storage: a scheduled tick a random tick starts is recorded here and
+                // applied by the publishing server thread after the batch, never from a worker.
                 this.currentRegionTickMutations.set(group.batch().regionTickMutations());
                 try {
-                    this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
-                        for (final RegionRandomTick tick : ticks) {
-                            tick.callback().randomTick(level, tick.pos(), random);
-                            ++ticked[0];
+                    // The ownership lease covers exactly this worker tick loop: it is opened after the region
+                    // lease and closed before it, so a worker task outside the loop never sees it.
+                    final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    try {
+                        // Neighbor cascades of the block writes of a chunk tick stay inside this context, so two
+                        // workers never mutate the same collecting updater.
+                        final RegionNeighborUpdateScope previousNeighbors = RegionNeighborUpdateScope.enter(new RegionNeighborUpdateScope());
+                        try {
+                            this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
+                                for (final RegionChunkTickEntry chunk : chunks) {
+                                    if (!region.isOwnedByCurrentThread() || this.regionizer.isLevelClosed(level)) {
+                                        // The lease is gone or the level unloaded underneath the group: the
+                                        // remaining chunks of the region keep the server-thread body.
+                                        group.batch().addFallback(chunk);
+                                        continue;
+                                    }
+                                    final RandomSource random = chunk.random(level);
+                                    this.currentChunkTickRandom.set(random);
+                                    this.currentChunkTickPositionRandom.set(random);
+                                    this.currentChunkTickLightning.set(group.batch().lightningStrikes());
+                                    try {
+                                        level.tickChunk(chunk.chunk(), randomTickSpeed);
+                                        ++ticked[0];
+                                    } catch (Throwable throwable) {
+                                        // A chunk request the chunk source refused is a truncation, not a
+                                        // failure: the random ticks that already ran must not run again.
+                                        if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
+                                            throw throwable;
+                                        }
+                                        this.truncatedChunkTicks.incrementAndGet();
+                                    } finally {
+                                        this.currentChunkTickLightning.remove();
+                                        this.currentChunkTickPositionRandom.remove();
+                                        this.currentChunkTickRandom.remove();
+                                    }
+                                }
+                            });
+                        } finally {
+                            RegionNeighborUpdateScope.exit(previousNeighbors);
                         }
-                    });
+                    } finally {
+                        ownership.close();
+                    }
                 } finally {
-                    this.currentRandomTickRandom.remove();
                     this.currentRegionTickMutations.remove();
                 }
             } finally {
@@ -3097,41 +3234,115 @@ public final class RegionThreadingEngine implements RegionThreading {
                 region.clearRunning();
                 final long duration = System.nanoTime() - start;
                 region.tickMetrics().recordTick(duration);
-                RegionTickWatchdog.warnIfLongTick("random tick batch " + coordinate, duration);
-                this.randomTicksOnWorkers.addAndGet(ticked[0]);
+                RegionTickWatchdog.warnIfLongTick("chunk tick batch " + coordinate, duration);
+                this.chunkTicksOnWorkers.addAndGet(ticked[0]);
                 this.regionizer.removeIfEmpty(region);
             }
         };
     }
 
     /**
-     * Executes the random ticks whose region could not be leased safely, and the ticks of chunks that are
-     * not surrounded by chunks of the same region, on the server thread after the batch.
+     * Ticks the chunks whose region could not be leased safely on the server thread after the batch.
      * <p>
-     * The callbacks were selected from the level sections, so they must not go through the generic region
-     * handoff again: that could defer them to a later region tick or drop them on a closed level. A tick
-     * whose level identity closed while the batch ran is handled by the existing closed-level policy and
-     * counted as skipped, exactly like the collected snapshot of a closed level.
+     * The chunks were decided and collected on the server thread, so they must not go through the generic region
+     * handoff again: that could defer them to a later region tick or drop them on a closed level. A chunk whose
+     * level identity closed while the batch ran is counted as skipped, exactly like the collected chunks of a
+     * closed level.
      */
-    private void tickFallbackRandomTicks(RegionRandomTickBatch batch) {
+    private void tickFallbackChunkTicks(RegionChunkTickBatch batch) {
         final ServerLevel level = batch.level();
-        for (final RegionRandomTick tick : batch.fallbackTicks()) {
-            if (this.regionizer.isLevelClosed(level)) {
-                this.skippedRandomTicks.incrementAndGet();
-                continue;
-            }
-            this.fallbackRandomTicks.incrementAndGet();
-            tick.callback().randomTick(level, tick.pos(), level.random);
+        for (final RegionChunkTickEntry chunk : batch.fallbackChunks()) {
+            this.tickChunkOnServerThread(level, chunk, batch.randomTickSpeed());
         }
     }
 
-    private void tickRandomTickInline(ServerLevel level, RegionRandomTick tick) {
+    /**
+     * Ticks one collected chunk on the server thread.
+     * <p>
+     * The chunk draws from the same per-chunk random source it would have drawn from on a worker, so a chunk
+     * that falls back produces the same selection as a chunk that is dispatched, and a retried chunk never
+     * depends on which thread ticked it.
+     */
+    private void tickChunkOnServerThread(ServerLevel level, RegionChunkTickEntry chunk, int randomTickSpeed) {
         if (this.regionizer.isLevelClosed(level)) {
-            this.skippedRandomTicks.incrementAndGet();
+            this.skippedChunkTicks.incrementAndGet();
             return;
         }
-        this.fallbackRandomTicks.incrementAndGet();
-        tick.callback().randomTick(level, tick.pos(), level.random);
+        this.fallbackChunkTicks.incrementAndGet();
+        final RandomSource random = chunk.random(level);
+        this.currentChunkTickRandom.set(random);
+        this.currentChunkTickPositionRandom.set(random);
+        try {
+            level.tickChunk(chunk.chunk(), randomTickSpeed);
+        } finally {
+            this.currentChunkTickPositionRandom.remove();
+            this.currentChunkTickRandom.remove();
+        }
+    }
+
+    /**
+     * Resolves the lightning strikes the chunk tick workers rolled and applies them on the server thread.
+     * <p>
+     * A worker may not resolve a strike itself: the target comes from the POI manager (a lightning rod within
+     * 128 blocks) and from entity storage, and it can be in another region, so the strike is applied here after
+     * the barrier with the level random, exactly like the vanilla thunder body. A strike whose level closed
+     * while the batch ran is dropped instead of applying after the unload.
+     */
+    private void applyChunkTickLightning(RegionChunkTickBatch batch) {
+        final Queue<BlockPos> strikes = batch.lightningStrikes();
+        if (strikes.isEmpty()) {
+            return;
+        }
+        final ServerLevel level = batch.level();
+        if (this.shutdown || this.regionizer.isLevelClosed(level)) {
+            strikes.clear();
+            return;
+        }
+        BlockPos rolled;
+        while ((rolled = strikes.poll()) != null) {
+            level.tickLightning(rolled);
+            this.chunkTickLightningStrikes.incrementAndGet();
+        }
+    }
+
+    /**
+     * {@return true when every chunk around {@code chunkPos} is loaded}
+     * <p>
+     * A random tick of the chunk can read or write the eight neighboring chunks, and a worker may not load a
+     * chunk: the chunk source refuses the request instead of waiting for the server thread that waits for the
+     * worker. A chunk with an unloaded neighbor therefore keeps the server-thread body.
+     */
+    boolean isChunkTickNeighborhoodLoaded(ServerLevel level, ChunkPos chunkPos) {
+        final ServerChunkCache chunkSource = level.getChunkSource();
+        for (int offsetX = -1; offsetX <= 1; offsetX++) {
+            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                if (offsetX == 0 && offsetZ == 0) {
+                    continue;
+                }
+                if (!chunkSource.hasChunk(chunkPos.x + offsetX, chunkPos.z + offsetZ)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Counts one chunk the plan kept on the server thread because a random tick of it could leave the region. */
+    void countBoundaryChunkTick() {
+        this.boundaryChunkTicks.incrementAndGet();
+        this.fallbackChunkTicks.incrementAndGet();
+    }
+
+    /** Counts one chunk the plan kept on the server thread because a neighboring chunk is not loaded. */
+    void countUnloadedNeighborhoodChunkTick() {
+        this.unloadedNeighborhoodChunkTicks.incrementAndGet();
+        this.fallbackChunkTicks.incrementAndGet();
+    }
+
+    /** Counts one chunk collected after its batch already ran, so the server thread ticked it inline. */
+    void countLateChunkTick() {
+        this.lateChunkTicks.incrementAndGet();
+        this.fallbackChunkTicks.incrementAndGet();
     }
 
     private static void throwUnchecked(Throwable throwable) {
@@ -3699,17 +3910,35 @@ public final class RegionThreadingEngine implements RegionThreading {
      * the entity to another region.
      */
     private void applyDeferredEntitySectionUpdates(RegionEntityTickBatch batch) {
-        final List<RegionEntityTickBatch.DeferredSectionUpdate> updates = batch.drainDeferredSectionUpdates();
+        this.applyDeferredSectionUpdates(batch.level(), batch.drainDeferredSectionUpdates(), batch.isSectionUpdateSeamClosed());
+    }
+
+    /**
+     * Applies the section updates of the moves that a chunk tick worker deferred to the barrier.
+     * <p>
+     * A precipitation tick pushes the entities standing in the snow layer it raises out of the block, which is
+     * an owned move of the chunk tick group, so it is deferred and applied exactly like the move of an entity
+     * during its own tick.
+     */
+    private void applyDeferredChunkTickSectionUpdates(RegionChunkTickBatch batch) {
+        this.applyDeferredSectionUpdates(batch.level(), batch.drainDeferredSectionUpdates(), batch.isSectionUpdateSeamClosed());
+    }
+
+    /**
+     * Applies one drain of deferred section updates on the server thread.
+     *
+     * @see #applyDeferredEntitySectionUpdates(RegionEntityTickBatch)
+     */
+    private void applyDeferredSectionUpdates(ServerLevel level, List<RegionDeferredEntitySectionUpdates.DeferredSectionUpdate> updates, boolean seamClosed) {
         if (updates.isEmpty()) {
             return;
         }
-        final ServerLevel level = batch.level();
-        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isSectionUpdateSeamClosed()) {
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || seamClosed) {
             this.droppedDeferredSectionUpdateCount.addAndGet(updates.size());
             return;
         }
         Throwable failure = null;
-        for (final RegionEntityTickBatch.DeferredSectionUpdate update : updates) {
+        for (final RegionDeferredEntitySectionUpdates.DeferredSectionUpdate update : updates) {
             final Entity entity = update.entity();
             if (entity.isRemoved() || entity.level() != level || !entity.isAddedToLevel()) {
                 this.droppedDeferredSectionUpdateCount.incrementAndGet();
@@ -3769,6 +3998,17 @@ public final class RegionThreadingEngine implements RegionThreading {
      * entity's own removal state, and this step runs the level callback on the server thread after the batch.
      */
     private void applyDeferredBlockEntityRemovals(RegionBlockEntityTickBatch batch) {
+        this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
+    }
+
+    /**
+     * Applies the removals of an owned entity that a chunk tick worker deferred to the barrier.
+     * <p>
+     * A random tick that removes an entity of its region removes it through the same vanilla funnel, so the
+     * removal is deferred and applied exactly like the removal of a dying entity: the worker writes the entity's
+     * own removal state, and this step runs the level callback on the server thread after the batch.
+     */
+    private void applyDeferredChunkTickRemovals(RegionChunkTickBatch batch) {
         this.applyDeferredRemovals(batch.level(), batch.drainDeferredRemovals(), batch.isRemovalSeamClosed());
     }
 
@@ -3850,18 +4090,35 @@ public final class RegionThreadingEngine implements RegionThreading {
      * before the fallback ticks and the ownership publication, so both observe the admitted entity.
      */
     private void applyDeferredEntityAdditions(RegionEntityTickBatch batch) {
-        final RegionEntityTickBatch.AdditionDrain drain = batch.drainDeferredAdditions();
+        this.applyDeferredAdditions(batch.level(), batch.drainDeferredAdditions(), batch.isAdditionSeamClosed());
+    }
+
+    /**
+     * Applies the admissions that a chunk tick worker deferred to the barrier.
+     * <p>
+     * A random tick that hatches an egg or otherwise spawns an entity is a worker spawn of the chunk tick
+     * group, so it is deferred and admitted exactly like the spawn of an entity tick.
+     */
+    private void applyDeferredChunkTickAdditions(RegionChunkTickBatch batch) {
+        this.applyDeferredAdditions(batch.level(), batch.drainDeferredAdditions(), batch.isAdditionSeamClosed());
+    }
+
+    /**
+     * Applies one drain of deferred admissions on the server thread.
+     *
+     * @see #applyDeferredEntityAdditions(RegionEntityTickBatch)
+     */
+    private void applyDeferredAdditions(ServerLevel level, RegionDeferredEntityAdditions.Drain drain, boolean seamClosed) {
         this.recordedDeferredAdditionCount.addAndGet(drain.recorded());
         if (drain.additions().isEmpty()) {
             return;
         }
-        final ServerLevel level = batch.level();
-        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isAdditionSeamClosed()) {
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || seamClosed) {
             this.droppedDeferredAdditionCount.addAndGet(drain.additions().size());
             return;
         }
         Throwable failure = null;
-        for (final RegionEntityTickBatch.DeferredEntityAddition addition : drain.additions()) {
+        for (final RegionDeferredEntityAdditions.DeferredEntityAddition addition : drain.additions()) {
             if (!canAdmitDeferredEntityAddition(level, addition)) {
                 this.droppedDeferredAdditionCount.incrementAndGet();
                 continue;
@@ -3902,7 +4159,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * entity was removed or discarded by the worker after it recorded the admission, its level changed, a
      * member is already in the level - never leave half a graph behind.
      */
-    private static boolean canAdmitDeferredEntityAddition(ServerLevel level, RegionEntityTickBatch.DeferredEntityAddition addition) {
+    private static boolean canAdmitDeferredEntityAddition(ServerLevel level, RegionDeferredEntityAdditions.DeferredEntityAddition addition) {
         for (final Entity member : addition.graph()) {
             if (member.isRemoved() || member.isAddedToLevel() || member.level() != level) {
                 return false;
@@ -3925,11 +4182,17 @@ public final class RegionThreadingEngine implements RegionThreading {
             if (active instanceof RegionEntityTickBatch entityBatch) {
                 this.droppedDeferredSectionUpdateCount.addAndGet(entityBatch.closeDeferredSectionUpdates());
                 this.releaseDeferredRemovals(entityBatch.closeDeferredRemovals());
-                final RegionEntityTickBatch.AdditionDrain releasedAdditions = entityBatch.closeDeferredAdditions();
+                final RegionDeferredEntityAdditions.Drain releasedAdditions = entityBatch.closeDeferredAdditions();
                 this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
                 this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
             } else if (active instanceof RegionBlockEntityTickBatch blockEntityBatch) {
                 this.releaseDeferredRemovals(blockEntityBatch.closeDeferredRemovals());
+            } else if (active instanceof RegionChunkTickBatch chunkTickBatch) {
+                this.droppedDeferredSectionUpdateCount.addAndGet(chunkTickBatch.closeDeferredSectionUpdates());
+                this.releaseDeferredRemovals(chunkTickBatch.closeDeferredRemovals());
+                final RegionDeferredEntityAdditions.Drain releasedAdditions = chunkTickBatch.closeDeferredAdditions();
+                this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
+                this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
             }
         }
     }
@@ -4550,7 +4813,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.entityTickWorkerExecutionEnabled,
                 this.blockEntityTickWorkerExecutionEnabled,
                 this.scheduledTickWorkerExecutionEnabled,
-                this.randomTickWorkerExecutionEnabled,
+                this.chunkTickWorkerExecutionEnabled,
                 this.entityTicksOnWorkers.get(),
                 this.skippedEntityTicks.get(),
                 this.fallbackEntityTicks.get(),
@@ -4570,9 +4833,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.scheduledTicksOnWorkers.get(),
                 this.skippedScheduledTicks.get(),
                 this.fallbackScheduledTicks.get(),
-                this.randomTicksOnWorkers.get(),
-                this.skippedRandomTicks.get(),
-                this.fallbackRandomTicks.get(),
+                this.chunkTicksOnWorkers.get(),
+                this.skippedChunkTicks.get(),
+                this.fallbackChunkTicks.get(),
+                this.boundaryChunkTicks.get(),
+                this.unloadedNeighborhoodChunkTicks.get(),
+                this.truncatedChunkTicks.get(),
+                this.lateChunkTicks.get(),
+                this.unleasedChunkTicks.get(),
+                this.chunkTickLightningStrikes.get(),
+                this.nonPartitionedChunkTicks.get(),
                 this.globalRegion.isRunning(),
                 this.globalRegion.isWorkerSubmitted(),
                 this.rejectedWorkerTaskCount.get(),
@@ -4587,7 +4857,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.layout.regionChunkSize(),
                 this.entityStorageMode,
                 this.isScheduledTickWorkerDispatchEffective(),
-                this.isRandomTickWorkerDispatchEffective(),
+                this.isChunkTickWorkerDispatchEffective(),
                 this.entityTransferJournal.pendingCount(),
                 this.entityTransferJournal.rememberedCount(),
                 this.entityTransferJournal.rejectedRecordCount(),
