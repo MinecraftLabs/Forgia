@@ -269,7 +269,7 @@
          Entity entity = this.getEntities().get(p_8854_.getUUID());
          if (entity != null) {
              LOGGER.warn("Force-added player with duplicate UUID {}", p_8854_.getUUID());
-@@ -903,19 +_,29 @@
+@@ -903,19 +_,36 @@
              this.removePlayerImmediately((ServerPlayer)entity, Entity.RemovalReason.DISCARDED);
          }
  
@@ -279,6 +279,13 @@
      }
  
      private boolean addEntity(Entity p_8873_) {
++        // Neo: a native region worker whose entity tick lease covers this entity's position records the
++        // admission for its batch barrier, which runs this same method on the server thread. The entity is not
++        // in the level for the rest of the worker tick, so addFreshEntity answers "accepted for this tick"
++        // there, and an admission the barrier drops loses the entity; both are counted. Every other caller,
++        // and a worker whose entity is outside the lease or cannot be deferred, keeps the storage refusal
++        // below.
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferEntityAddition(this, p_8873_)) return true;
 +        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityAdditionAccess("ServerLevel.addEntity");
          if (p_8873_.isRemoved()) {
              LOGGER.warn("Tried to add entity {} but it was marked as removed already", EntityType.getKey(p_8873_.getType()));

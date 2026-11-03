@@ -163,8 +163,11 @@ public final class RegionThreadingHooks {
      * {@link #assertServerEntityStorageAccess(String)}, which never consults a lease. The position change of
      * an entity that is added to a level is granted only when the lease can defer its section publication
      * and its target chunk acquisition to the batch barrier, which is the job of
-     * {@link #deferEntitySectionUpdate(Entity, EntityInLevelCallback, double, double, double)}. Every
-     * non-worker caller is unaffected and keeps the vanilla behavior.
+     * {@link #deferEntitySectionUpdate(Entity, EntityInLevelCallback, double, double, double)}. The position
+     * writes of an entity that is <em>not</em> added to a level are granted as field writes, so a worker can
+     * construct and configure an entity it is about to admit; the admission itself is not granted, it is
+     * deferred to the same barrier by {@link #deferEntityAddition(ServerLevel, Entity)}. Every non-worker
+     * caller is unaffected and keeps the vanilla behavior.
      */
     public static void assertServerEntityStorageAccess(Entity entity, String operation) {
         if (!(entity.level() instanceof ServerLevel level)) {
@@ -183,13 +186,14 @@ public final class RegionThreadingHooks {
      * Rejects the admission of a new entity into a level issued from a native region worker.
      * <p>
      * Adding an entity writes the level's UUID admission set, the visible lookup, the entity section and the
-     * ticking list, so it is server-owned storage and stays rejected for a worker even while its entity tick
-     * lease owns the entities it ticks. The rejection is counted in
+     * ticking list, so it is server-owned storage and stays rejected for a worker unless the entity tick
+     * lease records the admission for the barrier of its batch; see
+     * {@link #deferEntityAddition(ServerLevel, Entity)}. The rejection is counted in
      * {@link RegionThreadingDiagnostics#entityAddRejectedOnWorker()} before it throws, so the rate of entity
-     * additions a worker attempted - death loot, experience orbs, projectiles, a spawn - is observable next
-     * to the removal counters. A spawn whose new entity is constructed on the worker is rejected one step
-     * earlier, at the position write of the constructor, and is counted there. Entity addition is not part of
-     * the ownership lease.
+     * additions a worker attempted and could not defer - a spawn outside its leased region, an entity that is
+     * already added or removed, a closed seam - is observable next to the removal counters. A spawn whose new
+     * entity is constructed on the worker outside the lease is rejected one step earlier, at the position
+     * write of the constructor, and is counted there.
      *
      * @throws IllegalStateException when the caller is a native region worker
      */
@@ -199,6 +203,41 @@ public final class RegionThreadingHooks {
         }
         RegionOwnershipViolationHandler.recordEntityAdditionRejection();
         RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
+     * Defers the admission of a new entity to the entity batch barrier of the current native region worker.
+     * <p>
+     * Adding an entity writes the level's UUID admission set, the visible lookup, the entity section, the
+     * ticking list, the tracking and the region index, so a native region worker must not run it. This hook
+     * records the whole riding graph of {@code entity} for the barrier of the worker's entity batch instead;
+     * the barrier runs the unmodified {@code ServerLevel.addEntity} on the server thread, so every storage
+     * effect is written exactly like a server-thread spawn.
+     * <p>
+     * <b>Contract change:</b> on a native region worker whose lease covers the entity's position,
+     * {@code ServerLevel.addFreshEntity} answers "accepted for this tick", not "already in the world". The
+     * entity is not in the level for the rest of the worker tick - {@code isAddedToLevel()} stays
+     * {@code false}, the level's lookups do not find it and it does not tick - and the barrier admits it
+     * afterwards. An admission the barrier cannot apply is <b>dropped</b>: the entity is then lost,
+     * because it was never in the level and nothing retries it. Every recorded admission is therefore counted
+     * as applied or dropped ({@link RegionThreadingDiagnostics#deferredEntityAdditionsApplied()},
+     * {@link RegionThreadingDiagnostics#deferredEntityAdditionsDropped()}), never silently skipped. The
+     * construction events of the entity ({@code EntityEvent.EntityConstructing}, {@code EntityEvent.Size})
+     * fire on the worker thread as a consequence; that exposure is documented and not moved.
+     * <p>
+     * Only a native region worker whose active lease covers the entity's position, whose entity and every
+     * entity of its riding graph are not added to a level and not removed, and whose entity is in the lease
+     * level records anything. The server thread, the client, every ordinary thread, a worker without a lease,
+     * an entity outside the leased region, a member of the graph that is already in the level and a lease that
+     * outlived its batch answer {@code false}, and the caller keeps the storage refusal.
+     *
+     * @param level  the level the entity is being added to
+     * @param entity the entity that is being added
+     * @return {@code true} when the caller must skip the vanilla admission, because the barrier admits the
+     *         entity instead
+     */
+    public static boolean deferEntityAddition(ServerLevel level, Entity entity) {
+        return RegionEntityOwnershipScope.deferEntityAddition(level, entity);
     }
 
     /**

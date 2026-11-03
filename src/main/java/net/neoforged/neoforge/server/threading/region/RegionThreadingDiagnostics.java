@@ -36,10 +36,18 @@ package net.neoforged.neoforge.server.threading.region;
  * <p>
  * {@link #entityAddRejectedOnWorker()} counts the entity spawns a native region worker attempted and the
  * storage guard refused: death loot, experience orbs, projectiles and every other entity a worker-side tick
- * tries to create. It counts both the position write of the new entity - the vanilla constructor writes it
- * before the entity is added to the level - and the admission into the level, so one spawn attempt is counted
- * once. Entity addition is not part of the ownership lease, so this count is the rate of entity ticks that
- * still fail on a worker.
+ * tries to create. It counts both the position write of the new entity outside the leased region and the
+ * admission into the level that could not be deferred, so one refused spawn attempt is counted once. A spawn
+ * the lease records is not counted here: it is deferred and shows up in the admission counters instead.
+ * <p>
+ * The three admission counters report the entity additions a worker recorded and the batch barrier applied
+ * or dropped. A recorded admission is one riding graph the worker constructed and configured inside its
+ * leased region; an applied admission is that graph admitted into the level by the unmodified vanilla path
+ * on the server thread. A dropped admission is one that never reached the level - the engine shut down, the
+ * level identity closed, the entity was removed before the barrier, a member of the graph was already in the
+ * level, or the vanilla path refused a member - and it <b>loses the entity</b>, because the entity was never
+ * in the level and nothing retries it. That is why a dropped admission is always counted and never silently
+ * skipped.
  * <p>
  * The two ownership counters report the entity tick lease of a region worker group. An allowance counts
  * one grant of a vanilla entity mutation the lease may own: it is the lease decision, not a completed
@@ -146,6 +154,9 @@ public record RegionThreadingDiagnostics(
         long deferredEntityRemovalsApplied,
         long droppedDeferredEntityRemovals,
         long repeatedDeferredEntityRemovals,
+        long deferredEntityAdditionsRecorded,
+        long deferredEntityAdditionsApplied,
+        long droppedDeferredEntityAdditions,
         long entityAddRejectedOnWorker,
         long chunkGuardRefusals,
         long chunkFallbackEntityTicks,

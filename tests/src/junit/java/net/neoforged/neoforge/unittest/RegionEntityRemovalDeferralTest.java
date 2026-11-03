@@ -310,21 +310,28 @@ class RegionEntityRemovalDeferralTest {
     }
 
     @Test
-    void aWorkerSideLootSpawnIsRejectedAndCountedWhileTheRemovalStillCompletes() {
+    void aWorkerSideLootSpawnIsDeferredAndAppliedWhileTheRemovalCompletes() {
         this.installEngine(1, true);
         final ServerLevel level = this.mockLevel();
         final TrackingRecorder recorder = new TrackingRecorder();
         final PersistentEntitySectionManager<Entity> manager = newGuardedManager(recorder);
-        // An entity that was constructed on the server thread and is added by the worker, like a projectile
-        // a block entity hands to the tick that fires it.
-        final TestEntity prebuilt = new TestEntity(level);
-        final List<String> attempts = new CopyOnWriteArrayList<>();
+        // The admission of the loot runs on the server thread through the level's section manager, exactly
+        // like the removal of the dying entity runs through its callback.
+        setField(ServerLevel.class, level, "entityManager", manager);
+        final List<Boolean> acceptedOnWorker = new CopyOnWriteArrayList<>();
+        final List<Entity> spawned = new CopyOnWriteArrayList<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
         final TestEntity entity = new TestEntity(level, self -> {
-            // The vanilla death spawns its loot on the tick that kills it. The new item entity is
-            // constructed on the worker, so the worker already fails at the position write of the new entity.
-            recordAttempt(attempts, () -> new TestEntity(self.level()));
-            // The admission guard of a level stays strict as well, and is counted separately.
-            recordAttempt(attempts, () -> self.level().addFreshEntity(prebuilt));
+            try {
+                // The vanilla death spawns its loot on the tick that kills it. The new item entity is
+                // constructed on the worker inside the leased region and admitted at the barrier.
+                final TestEntity loot = new TestEntity(self.level());
+                loot.setPos(SOURCE_POSITION.getX() + 0.5, SOURCE_POSITION.getY(), SOURCE_POSITION.getZ() + 0.5);
+                spawned.add(loot);
+                acceptedOnWorker.add(self.level().addFreshEntity(loot));
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
             self.discard();
         });
         admit(manager, entity, SOURCE_POSITION);
@@ -333,16 +340,17 @@ class RegionEntityRemovalDeferralTest {
         assertTrue(plan.accept(entity));
         plan.executeAndAwait();
 
-        assertEquals(2, attempts.size());
-        assertTrue(attempts.get(0).contains("Entity.setPosRaw"),
-                () -> "the loot spawn must be rejected at the position write of the new entity, got: " + attempts.get(0));
-        assertTrue(attempts.get(1).contains("ServerLevel.addEntity"),
-                () -> "the admission of a prebuilt entity must be rejected, got: " + attempts.get(1));
-        assertEquals(2L, this.engine.diagnostics().entityAddRejectedOnWorker(),
-                "both the construction of the new entity and the admission into the level count as a rejected spawn");
-        assertEquals(2L, this.engine.diagnostics().ownershipViolationCount());
+        assertEquals(List.of(), failures, () -> "the worker-side loot spawn was rejected: " + failures);
+        assertEquals(List.of(true), acceptedOnWorker, "the loot spawn must be accepted for this tick");
+        assertTrue(manager.isLoaded(spawned.get(0).getUUID()),
+                "the barrier must admit the loot of the dying entity");
+        assertEquals(1L, this.engine.diagnostics().deferredEntityAdditionsRecorded());
+        assertEquals(1L, this.engine.diagnostics().deferredEntityAdditionsApplied());
+        assertEquals(0L, this.engine.diagnostics().droppedDeferredEntityAdditions());
+        assertEquals(0L, this.engine.diagnostics().entityAddRejectedOnWorker(),
+                "a deferred loot spawn is no longer a rejected entity add");
         assertEquals(1L, this.engine.diagnostics().deferredEntityRemovalsApplied(),
-                "the removal must still complete after the rejected spawns");
+                "the removal must still complete next to the deferred admission");
         assertFalse(manager.isLoaded(entity.getUUID()));
         assertEquals(EntityIdentity.State.GONE, manager.identityLedger().current(entity.getUUID()).state());
     }
@@ -469,6 +477,10 @@ class RegionEntityRemovalDeferralTest {
         doReturn(server).when(level).getServer();
         // The target chunk acquisition of a deferred section update is server-owned storage.
         doAnswer(invocation -> null).when(level).getChunk(anyInt(), anyInt());
+        // The lease containment of a deferred entity addition asks the level for its physical region size.
+        // The removal path itself does not depend on the partitions, so the level reports the fixed edge
+        // length the lease containment uses.
+        doReturn(3).when(level).entitySectionRegionChunkSize();
         // The pre-load margin of an entity group asks the chunk source whether the neighborhood is
         // loaded; the mock level reports every chunk as loaded, so groups are submitted like before.
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);

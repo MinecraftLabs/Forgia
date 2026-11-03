@@ -184,6 +184,9 @@ class RegionEntityOwnershipTest {
         final ServerLevel level = mockLevel();
         final TestEntity foreign = new TestEntity(level);
         foreign.setPos(4096.0, 64.0, 0.0);
+        // The lease grants the position writes of every pending entity as field writes, so the ownership
+        // decision of a not-added entity is probed with Entity.move, which only an owning lease grants.
+        foreign.noPhysics = true;
         final List<Throwable> ownFailures = new CopyOnWriteArrayList<>();
         final List<Throwable> foreignAttempts = new CopyOnWriteArrayList<>();
         final TestEntity owned = new TestEntity(level, self -> {
@@ -193,7 +196,7 @@ class RegionEntityOwnershipTest {
                 ownFailures.add(throwable);
             }
             try {
-                foreign.setPosRaw(4098.0, 64.0, 0.0);
+                foreign.move(MoverType.SELF, new Vec3(1.0, 0.0, 0.0));
                 foreignAttempts.add(new AssertionError("a worker mutated an entity of another group"));
             } catch (IllegalStateException rejected) {
                 foreignAttempts.add(rejected);
@@ -209,7 +212,7 @@ class RegionEntityOwnershipTest {
         assertEquals(1, foreignAttempts.size());
         assertTrue(foreignAttempts.get(0) instanceof IllegalStateException,
                 () -> "a foreign entity mutation must be rejected, got: " + foreignAttempts.get(0));
-        assertTrue(foreignAttempts.get(0).getMessage().contains("Entity.setPosRaw"),
+        assertTrue(foreignAttempts.get(0).getMessage().contains("Entity.move"),
                 () -> "the rejection must name the operation, got: " + foreignAttempts.get(0).getMessage());
         assertEquals(4096.0, foreign.position().x, "a rejected foreign mutation must not move the entity");
         assertEquals(2L, this.engine.diagnostics().entityTicksOnWorkers());
@@ -356,6 +359,9 @@ class RegionEntityOwnershipTest {
         passenger.setPos(1.0, 64.0, 1.0);
         final TestEntity foreignPassenger = new TestEntity(level);
         foreignPassenger.setPos(1.0, 64.0, 1.0);
+        // The lease grants the position writes of every pending entity as field writes, so the ownership
+        // decision of a not-added entity is probed with Entity.move, which only an owning lease grants.
+        foreignPassenger.noPhysics = true;
         final Entity foreignVehicle = mock(Entity.class);
         when(foreignVehicle.hasPassenger(foreignPassenger)).thenReturn(true);
         setField(Entity.class, foreignPassenger, "vehicle", foreignVehicle);
@@ -369,7 +375,7 @@ class RegionEntityOwnershipTest {
                 memberFailures.add(throwable);
             }
             try {
-                foreignPassenger.setPosRaw(2.0, 64.0, 2.0);
+                foreignPassenger.move(MoverType.SELF, new Vec3(1.0, 0.0, 0.0));
                 foreignAttempts.add(new AssertionError("a worker mutated a passenger of a foreign vehicle"));
             } catch (IllegalStateException rejected) {
                 foreignAttempts.add(rejected);
@@ -387,7 +393,7 @@ class RegionEntityOwnershipTest {
         assertEquals(1, foreignAttempts.size());
         assertTrue(foreignAttempts.get(0) instanceof IllegalStateException,
                 () -> "a foreign passenger must be rejected, got: " + foreignAttempts.get(0));
-        assertTrue(foreignAttempts.get(0).getMessage().contains("Entity.setPosRaw"));
+        assertTrue(foreignAttempts.get(0).getMessage().contains("Entity.move"));
         assertEquals(2.0, passenger.position().x, "the owned passenger must move");
         assertEquals(1.0, foreignPassenger.position().x, "the foreign passenger must not move");
         assertEquals(1L, this.engine.diagnostics().entityTicksOnWorkers());
@@ -404,6 +410,9 @@ class RegionEntityOwnershipTest {
             tickThreads.add(Thread.currentThread().getName());
             self.setPosRaw(1.0, 64.0, 1.0);
         });
+        // The lease grants the position writes of every pending entity as field writes, so the inherited
+        // lease is probed with Entity.move, which only an owning lease grants.
+        first.noPhysics = true;
         final List<Throwable> ownFailures = new CopyOnWriteArrayList<>();
         final List<Throwable> inheritedAttempts = new CopyOnWriteArrayList<>();
         final TestEntity second = new TestEntity(level, self -> {
@@ -414,7 +423,7 @@ class RegionEntityOwnershipTest {
                 ownFailures.add(throwable);
             }
             try {
-                first.setPosRaw(3.0, 64.0, 3.0);
+                first.move(MoverType.SELF, new Vec3(1.0, 0.0, 0.0));
                 inheritedAttempts.add(new AssertionError("the second batch inherited the lease of the first"));
             } catch (IllegalStateException rejected) {
                 inheritedAttempts.add(rejected);
@@ -435,7 +444,7 @@ class RegionEntityOwnershipTest {
         assertEquals(1, inheritedAttempts.size());
         assertTrue(inheritedAttempts.get(0) instanceof IllegalStateException,
                 () -> "the entity of the previous batch must be rejected, got: " + inheritedAttempts.get(0));
-        assertTrue(inheritedAttempts.get(0).getMessage().contains("Entity.setPosRaw"));
+        assertTrue(inheritedAttempts.get(0).getMessage().contains("Entity.move"));
         assertEquals(1.0, first.position().x, "the previous batch's entity must not move");
         assertEquals(2.0, second.position().x);
         assertEquals(2L, this.engine.diagnostics().entityMutationsAllowedByOwnership());

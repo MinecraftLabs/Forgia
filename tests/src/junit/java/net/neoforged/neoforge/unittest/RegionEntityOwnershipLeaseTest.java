@@ -35,6 +35,14 @@ import org.junit.jupiter.api.Test;
 class RegionEntityOwnershipLeaseTest {
     private static final String REGION_PACKAGE = "net.neoforged.neoforge.server.threading.region.";
     private static final String SET_POS_RAW = "Entity.setPosRaw";
+    /**
+     * Operation the lease-membership tests probe with.
+     * <p>
+     * {@code Entity.setPosRaw} of an entity that is not added to a level is granted as a pending-admission
+     * field write regardless of the lease membership, so it cannot tell two leases apart. {@code Entity.move}
+     * is not part of that grant, so only the lease whose group owns the entity grants it.
+     */
+    private static final String MOVE = "Entity.move";
 
     private final ServerLevel level = leaseLevel();
     private final ServerLevel otherLevel = mock(ServerLevel.class);
@@ -137,16 +145,16 @@ class RegionEntityOwnershipLeaseTest {
         final Entity first = mock(Entity.class);
         final Entity second = mock(Entity.class);
         try (RegionEntityOwnershipScope outer = openLease(first)) {
-            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW));
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE));
             try (RegionEntityOwnershipScope inner = openLease(second)) {
-                assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW),
+                assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE),
                         "the nested lease must not inherit the membership of the enclosing lease");
-                assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, SET_POS_RAW));
+                assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, MOVE));
             }
-            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW),
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE),
                     "closing the nested lease must restore the enclosing lease");
         }
-        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW),
+        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE),
                 "a closed lease must never grant again");
     }
 
@@ -158,21 +166,21 @@ class RegionEntityOwnershipLeaseTest {
         final RegionEntityOwnershipScope inner = openLease(second);
 
         outer.close();
-        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW),
+        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE),
                 "the closed outer lease must not grant through the nested lease");
-        assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, SET_POS_RAW),
+        assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, MOVE),
                 "an out-of-order close must not unseat the lease that superseded it");
 
         inner.close();
-        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, SET_POS_RAW),
+        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, second, MOVE),
                 "the restored outer lease was closed and must not grant again");
-        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW),
+        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE),
                 "an out-of-order close must not revive the closed lease");
 
         // Closing the restored value once more restores its own predecessor, so the thread local never
         // keeps a dead lease behind.
         outer.close();
-        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, SET_POS_RAW));
+        assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, first, MOVE));
     }
 
     /**

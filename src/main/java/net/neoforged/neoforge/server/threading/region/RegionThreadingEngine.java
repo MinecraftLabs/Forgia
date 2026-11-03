@@ -52,6 +52,20 @@ import org.jetbrains.annotations.Nullable;
  * Native NeoForge region threading engine shell.
  * <p>
  * This class is intentionally small until the Folia regionizer and tick loop are ported.
+ * <p>
+ * The engine owns the server-thread side of every deferred effect of a region worker. For the entity tick
+ * slice that is the section publication and target chunk acquisition of a move, the level callback of a
+ * removal and the admission of a new entity, applied in that order at the barrier of one entity batch
+ * (section updates, removals, admissions, fallback ticks, server tasks, ownership publication). The
+ * admission is the one step that changes a caller-visible contract: on a native worker whose lease covers
+ * the entity's position, {@code ServerLevel.addFreshEntity} answers <b>"accepted for this tick"</b> instead
+ * of "already in the world". The entity is not visible to the level for the rest of the worker tick and the
+ * barrier admits it afterwards through the unmodified vanilla path; an admission the barrier cannot apply is
+ * <b>dropped</b>, which loses the entity, and is counted in
+ * {@link RegionThreadingDiagnostics#deferredEntityAdditionsDropped()} next to the applied and recorded
+ * admissions. Entity construction events ({@code EntityEvent.EntityConstructing}, {@code EntityEvent.Size})
+ * therefore fire on the worker thread; that is a documented compatibility exposure, not a defect of the
+ * admission.
  */
 public final class RegionThreadingEngine implements RegionThreading {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -258,6 +272,24 @@ public final class RegionThreadingEngine implements RegionThreading {
      * repeat is never a second removal.
      */
     private final AtomicLong repeatedDeferredRemovalCount = new AtomicLong();
+    /**
+     * Deferred admissions a worker recorded for a barrier. One record is one riding graph, so a vehicle and
+     * its passengers count once.
+     */
+    private final AtomicLong recordedDeferredAdditionCount = new AtomicLong();
+    /**
+     * Deferred admissions a barrier admitted on the server thread through the unmodified
+     * {@code ServerLevel.addEntity}. One applied admission is one whole riding graph in the level.
+     */
+    private final AtomicLong appliedDeferredAdditionCount = new AtomicLong();
+    /**
+     * Deferred admissions that did not complete: the engine shut down (including the admissions a shut-down
+     * batch releases without applying), the level identity closed, the entity was removed or left the level
+     * between the record and the barrier, a member of the graph was already in the level, or the vanilla path
+     * refused a member. A dropped admission loses the entity - it was never in the level and nothing retries
+     * it - so it is always counted.
+     */
+    private final AtomicLong droppedDeferredAdditionCount = new AtomicLong();
     /**
      * Serializes region drain activation with lifecycle cleanup. A drain holds the read lock only while
      * it checks the lifecycle state and marks the lease or worker submission; shutdown and level clear
@@ -1253,6 +1285,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // published in, and before the ownership publication, so the handoff observes the removed
                 // entity and publishes its departure instead of a region mapping.
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityRemovals(batch));
+                // The admission of a new entity is the third deferred vanilla storage effect. It runs after
+                // the removals, so a record whose entity was removed before the barrier is dropped by the
+                // removal it observes, and after the section updates, so an entity admitted here lands in the
+                // section bucket its final position names and not in one a pending update is about to move.
+                // It runs before the fallback ticks, so a graph admitted in this tick is visible to the
+                // server-thread ticks of the same batch, and before the ownership publication, so the
+                // handoff tracks the new entity.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredEntityAdditions(batch));
                 failure = runBatchCompletion(failure, () -> this.tickFallbackEntities(batch));
                 failure = runBatchCompletion(failure, batch::runDeferredServerTasks);
                 // The ownership publication is timed on its own inside the handoff, so the cost of the
@@ -2972,6 +3012,91 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Applies the admissions of new entities that a worker deferred to the barrier.
+     * <p>
+     * A worker that spawns an entity inside its leased region cannot admit it: the admission writes the
+     * level's UUID set, its visible lookup, the entity section, the ticking list, the tracking and the region
+     * index. The worker therefore constructs and configures the entity - the position writes of a pending
+     * entity are field writes and are granted - and records the whole riding graph. This barrier runs the
+     * unmodified {@code ServerLevel.addEntity} for every member of the graph on the server thread, so the
+     * admission is written exactly like a server-thread spawn: the join event, the identity ledger, the
+     * section of the entity's final position, the tracking callbacks, the ticking list and the region index.
+     * <p>
+     * The members are admitted in the recorded self-then-passengers order, so a vehicle is in the level before
+     * its passengers. A graph is admitted whole or counted as dropped; a member the vanilla path refuses after
+     * the graph was admitted partially stays admitted, because an admission cannot be rolled back, but the
+     * record is counted as dropped so the loss is never silent.
+     * <p>
+     * An admission that cannot be applied is dropped without touching storage and counted in
+     * {@link RegionThreadingDiagnostics#deferredEntityAdditionsDropped()}: the engine shut down, the level
+     * identity closed, the entity was removed or left the level between the record and the barrier, a member
+     * of the graph is already in the level, or a member's admission threw. The step runs after the deferred
+     * removals, so a record whose entity was removed meanwhile is dropped by the state the removal left, and
+     * before the fallback ticks and the ownership publication, so both observe the admitted entity.
+     */
+    private void applyDeferredEntityAdditions(RegionEntityTickBatch batch) {
+        final RegionEntityTickBatch.AdditionDrain drain = batch.drainDeferredAdditions();
+        this.recordedDeferredAdditionCount.addAndGet(drain.recorded());
+        if (drain.additions().isEmpty()) {
+            return;
+        }
+        final ServerLevel level = batch.level();
+        if (this.shutdown || this.regionizer.isLevelClosed(level) || batch.isAdditionSeamClosed()) {
+            this.droppedDeferredAdditionCount.addAndGet(drain.additions().size());
+            return;
+        }
+        Throwable failure = null;
+        for (final RegionEntityTickBatch.DeferredEntityAddition addition : drain.additions()) {
+            if (!canAdmitDeferredEntityAddition(level, addition)) {
+                this.droppedDeferredAdditionCount.incrementAndGet();
+                continue;
+            }
+            try {
+                boolean admitted = true;
+                for (final Entity member : addition.graph()) {
+                    if (!level.addFreshEntity(member)) {
+                        // The vanilla path refused a member - a duplicate UUID, a cancelled join event or a
+                        // sealed identity. The members it already accepted stay in the level, because an
+                        // admission cannot be rolled back, and the record is counted as dropped.
+                        admitted = false;
+                    }
+                }
+                if (admitted) {
+                    this.appliedDeferredAdditionCount.incrementAndGet();
+                } else {
+                    this.droppedDeferredAdditionCount.incrementAndGet();
+                }
+            } catch (Throwable throwable) {
+                this.droppedDeferredAdditionCount.incrementAndGet();
+                if (failure == null) {
+                    failure = throwable;
+                } else {
+                    failure.addSuppressed(throwable);
+                }
+            }
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /**
+     * {@return true when the barrier can still admit the recorded riding graph of {@code addition}}
+     * <p>
+     * The whole graph is validated before the first member is admitted, so the common drop reasons - the
+     * entity was removed or discarded by the worker after it recorded the admission, its level changed, a
+     * member is already in the level - never leave half a graph behind.
+     */
+    private static boolean canAdmitDeferredEntityAddition(ServerLevel level, RegionEntityTickBatch.DeferredEntityAddition addition) {
+        for (final Entity member : addition.graph()) {
+            if (member.isRemoved() || member.isAddedToLevel() || member.level() != level) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Closes the deferred seams of every active entity batch when shutdown starts.
      * <p>
      * A shut-down engine never runs a barrier again, so a batch that still ticks must not accept another
@@ -2987,6 +3112,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 final RegionEntityTickBatch.RemovalDrain releasedRemovals = entityBatch.closeDeferredRemovals();
                 this.droppedDeferredRemovalCount.addAndGet(releasedRemovals.removals().size());
                 this.repeatedDeferredRemovalCount.addAndGet(releasedRemovals.repeats());
+                final RegionEntityTickBatch.AdditionDrain releasedAdditions = entityBatch.closeDeferredAdditions();
+                this.recordedDeferredAdditionCount.addAndGet(releasedAdditions.recorded());
+                this.droppedDeferredAdditionCount.addAndGet(releasedAdditions.additions().size());
             }
         }
     }
@@ -3638,6 +3766,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.appliedDeferredRemovalCount.get(),
                 this.droppedDeferredRemovalCount.get(),
                 this.repeatedDeferredRemovalCount.get(),
+                this.recordedDeferredAdditionCount.get(),
+                this.appliedDeferredAdditionCount.get(),
+                this.droppedDeferredAdditionCount.get(),
                 RegionOwnershipViolationHandler.entityAdditionRejectionCount(),
                 RegionWorkerChunkUnavailableException.refusalCount(),
                 this.chunkFallbackEntityTicks.get(),

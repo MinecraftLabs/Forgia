@@ -176,7 +176,7 @@ public class ServerLoadBenchmarkGameTests {
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
@@ -792,11 +792,13 @@ public class ServerLoadBenchmarkGameTests {
      * A scheduled zombie is hurt from inside its own tick, so the death, the loot spawn of the death and the
      * removal of the dying entity all run on the thread that ticks the entity: the region worker in a worker
      * profile and the server thread in the reference profile. The loot spawn is the entity addition the
-     * ownership lease still rejects, so one driven death reports one rejected entity tick and one
-     * {@code entityAddRejectedOnWorker} count; the removal twenty ticks later is the deferred removal. The
-     * population is kept at its size by replacing a dead or dying zombie on the server thread with a fresh one
-     * at the same position, so every profile ticks the same number of entities and the row stays comparable
-     * with the runs that drive no deaths at all.
+     * ownership lease defers: the worker constructs the item entity inside its leased region, records the
+     * admission and the batch barrier admits it on the server thread, so a driven death reports one deferred
+     * admission next to the deferred removal twenty ticks later, and no rejected entity tick. A death whose
+     * loot lands outside the leased region keeps the storage refusal and counts one
+     * {@code entityAddRejectedOnWorker}. The population is kept at its size by replacing a dead or dying
+     * zombie on the server thread with a fresh one at the same position, so every profile ticks the same
+     * number of entities and the row stays comparable with the runs that drive no deaths at all.
      */
     private static final class ZombieDeathDriver implements Runnable {
         private final ServerLevel level;
@@ -1038,7 +1040,7 @@ public class ServerLoadBenchmarkGameTests {
                 + " distinctBlockers=" + blockers.blockerCount()
                 + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -1087,6 +1089,9 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::deferredEntityRemovalsApplied),
                 delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityRemovals),
                 delta(before, after, RegionThreadingDiagnostics::repeatedDeferredEntityRemovals),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityAdditionsRecorded),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityAdditionsApplied),
+                delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityAdditions),
                 delta(before, after, RegionThreadingDiagnostics::entityAddRejectedOnWorker),
                 deathDriver.deathsInWindow(),
                 deathDriver.replacementsInWindow());

@@ -46,6 +46,12 @@ import org.jetbrains.annotations.Nullable;
  * server thread, so the section membership, the tracking and ticking callbacks, the identity ledger and the
  * region index are written exactly like a server-thread removal. A removal of an entity that is already
  * recorded is a counted no-op, so an entity is never removed twice.
+ * <p>
+ * A worker that admits an entity into its level records one deferred admission per riding graph instead of
+ * running the vanilla admission, and the barrier runs the unmodified {@code ServerLevel.addEntity} for every
+ * member of the graph on the server thread. The record therefore carries the whole self-and-passenger graph,
+ * which is admitted whole or counted as dropped; the members the caller adds one by one (as
+ * {@code addFreshEntityWithPassengers} does) are no-ops of the graph that already carries them.
  */
 @ApiStatus.Internal
 final class RegionEntityTickBatch extends RegionTickBatch {
@@ -90,6 +96,25 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     private long repeatedRemovalCount;
     /** Set when the engine shuts down; guarded by the monitor of {@link #deferredRemovals}. */
     private volatile boolean removalSeamClosed;
+    /**
+     * Admissions that a worker recorded for the barrier, in record order.
+     * <p>
+     * One entry is one riding graph, because an entity and its passengers are one admission: the barrier
+     * admits the members in vanilla self-then-passengers order, so a vehicle is in the level before its
+     * passengers. The list is guarded by its own monitor, is only filled from workers, and is drained and
+     * cleared once per tick by the barrier, so it stays bounded by the graphs admitted in the current tick.
+     */
+    private final List<DeferredEntityAddition> deferredAdditions = new ArrayList<>();
+    /**
+     * Every entity of an already recorded admission, by identity. It makes the per-entity calls of
+     * {@code addFreshEntityWithPassengers} no-ops of the graph that already carries them instead of a second
+     * record; guarded by the monitor of {@link #deferredAdditions}.
+     */
+    private final Set<Entity> recordedAdditionMembers = Collections.newSetFromMap(new IdentityHashMap<>());
+    /** Admissions this batch recorded; guarded by the monitor of {@link #deferredAdditions}. */
+    private long recordedAdditionCount;
+    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredAdditions}. */
+    private volatile boolean additionSeamClosed;
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level) {
@@ -362,6 +387,79 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         }
     }
 
+    /**
+     * {@return true when this batch no longer accepts or applies deferred admissions}
+     * <p>
+     * A batch that already completed its barrier, or whose seam was closed because the engine shut down,
+     * cannot admit an entity, so {@link #deferAddition(Entity, List)} refuses and the worker keeps the
+     * storage refusal. The position writes of the pending entity stay granted: they are field writes only, and
+     * refusing them would abort the constructor at an arbitrary point instead of at the admission.
+     */
+    boolean isAdditionSeamClosed() {
+        return this.additionSeamClosed;
+    }
+
+    /**
+     * Records the admission of one riding graph that a worker deferred to the barrier.
+     * <p>
+     * The graph is admitted whole or counted as dropped, so it is recorded with every member and in vanilla
+     * self-then-passengers order. A member that an earlier record of the same batch already carries is a
+     * no-op: {@code addFreshEntityWithPassengers} adds the members one by one, and the first record already
+     * carries the whole graph.
+     *
+     * @param entity the entity the caller is adding, the root of the recorded graph
+     * @param graph  the root and its indirect passengers, in the order they have to be admitted
+     * @return {@code false} when the seam was closed or the barrier already completed, so the admission can
+     *         never be applied and the caller has to keep the storage refusal
+     */
+    boolean deferAddition(Entity entity, List<Entity> graph) {
+        synchronized (this.deferredAdditions) {
+            if (this.additionSeamClosed || this.isComplete()) {
+                return false;
+            }
+            if (this.recordedAdditionMembers.contains(entity)) {
+                return true;
+            }
+            this.deferredAdditions.add(new DeferredEntityAddition(entity, List.copyOf(graph)));
+            this.recordedAdditionMembers.addAll(graph);
+            this.recordedAdditionCount++;
+            return true;
+        }
+    }
+
+    /**
+     * Stops accepting deferred admissions and releases the ones that already wait.
+     * <p>
+     * Called when the engine shuts down: the barrier of this batch will never admit an entity again, so a
+     * worker that still ticks must be refused instead of granted, and the released records must not keep an
+     * entity reference alive.
+     *
+     * @return the released admissions and the records this batch accepted
+     */
+    AdditionDrain closeDeferredAdditions() {
+        synchronized (this.deferredAdditions) {
+            this.additionSeamClosed = true;
+            return this.drainAdditions();
+        }
+    }
+
+    /**
+     * Takes the deferred admissions that wait for the end of the batch.
+     */
+    AdditionDrain drainDeferredAdditions() {
+        synchronized (this.deferredAdditions) {
+            return this.drainAdditions();
+        }
+    }
+
+    private AdditionDrain drainAdditions() {
+        final AdditionDrain drain = new AdditionDrain(List.copyOf(this.deferredAdditions), this.recordedAdditionCount);
+        this.deferredAdditions.clear();
+        this.recordedAdditionMembers.clear();
+        this.recordedAdditionCount = 0L;
+        return drain;
+    }
+
     private RemovalDrain drainRemovals() {
         final RemovalDrain drain = new RemovalDrain(List.copyOf(this.deferredRemovals.values()), this.repeatedRemovalCount);
         this.deferredRemovals.clear();
@@ -447,6 +545,18 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * already recorded or already applied and were therefore counted as no-ops.
      */
     record RemovalDrain(List<DeferredEntityRemoval> removals, long repeats) {}
+
+    /**
+     * One deferred admission: the entity the worker added and the whole riding graph it belongs to, in the
+     * order the barrier admits it. The root is kept for diagnostics; the graph is what the barrier admits.
+     */
+    record DeferredEntityAddition(Entity root, List<Entity> graph) {}
+
+    /**
+     * One drain of the deferred admissions of a batch: the admissions to apply and the number of records the
+     * batch accepted, which the caller counts as recorded.
+     */
+    record AdditionDrain(List<DeferredEntityAddition> additions, long recorded) {}
 
     /**
      * One region's share of the batch: the region lease, the entities it ticks, the snapshot members it is

@@ -5,8 +5,10 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
@@ -55,6 +57,17 @@ import org.jetbrains.annotations.Nullable;
  * on the server thread. The entity is removed for the rest of the worker tick, because the worker itself set
  * the removal state. A removal of an entity that is not added to a level has no server-owned effect and
  * needs no deferral.
+ * <p>
+ * An admission of a new entity is the third mutation with a server-owned effect, and the only one that is
+ * split: <b>field writes are unrestricted for pending entities, admission is lease-contained</b>. The
+ * position writes of an entity that is not added to a level are granted without a position condition
+ * ({@link #GRANTABLE_PENDING_ADMISSION_OPERATIONS}), because such an entity has the {@code NULL} level
+ * callback and no server-owned effect - the vanilla constructor of every entity starts at
+ * {@code (0, 0, 0)} before the subclass writes the real position, so a containment test on the write would
+ * refuse every spawn outside the region {@code (0, 0)}. The containment is enforced where it decides
+ * storage: {@link #deferEntityAddition(ServerLevel, Entity)} refuses to record an admission whose position
+ * is outside the leased region, and the level keeps the storage refusal for it. A recorded admission is
+ * applied by the batch barrier through the unmodified {@code ServerLevel.addEntity}.
  */
 @ApiStatus.Internal
 public final class RegionEntityOwnershipScope implements AutoCloseable {
@@ -93,6 +106,28 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
             "Entity.remove",
             "Entity.setRemoved",
             "LivingEntity.remove");
+
+    /**
+     * The vanilla entity position writes a lease may grant for an entity that is <em>not added to a level
+     * yet</em>, i.e. for the construction and configuration of an entity the worker is about to admit.
+     * <p>
+     * These writes touch only the entity's own {@code position}, {@code blockPosition} and
+     * {@code chunkPosition} fields: a not-added entity has the {@code NULL} level callback, so no section is
+     * published, and the target chunk acquisition of {@code setPosRaw} is gated on
+     * {@code isAddedToLevel()}. They are granted without a position condition on purpose: the vanilla
+     * {@code Entity} constructor writes {@code (0, 0, 0)} before the subclass writes the real position, so a
+     * containment test on the write would refuse every spawn outside the region {@code (0, 0)}. The lease
+     * containment of an admission is decided by {@link #deferEntityAddition(ServerLevel, Entity)}, which is
+     * the step that gives the position a section bucket.
+     * <p>
+     * {@code Entity.move} is deliberately absent: physics and collision reads belong to the chunk guard, and
+     * no spawn path needs them. {@code Entity.teleportTo} stays absent as well, because it changes level,
+     * identity and storage.
+     */
+    private static final Set<String> GRANTABLE_PENDING_ADMISSION_OPERATIONS = Set.of(
+            "Entity.absMoveTo",
+            "Entity.moveTo",
+            "Entity.setPosRaw");
 
     private static final ThreadLocal<RegionEntityOwnershipScope> CURRENT = new ThreadLocal<>();
     private static final ThreadLocal<Long> CURRENT_LEASE_ID = new ThreadLocal<>();
@@ -151,6 +186,11 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      * counted the violation. A refusal of a mutation of an entity that is neither added to the level nor
      * owned by the lease is also counted as a rejected entity spawn, because the vanilla entity constructor
      * writes the position of a new entity before the entity is added to the level.
+     * <p>
+     * The position writes of a not-yet-added entity are granted by
+     * {@link #grantsPendingAdmissionMutation(RegionEntityOwnershipScope, ServerLevel, Entity, String)} and
+     * are not counted as a rejected spawn: the entity is being constructed for an admission the lease may
+     * record.
      */
     public static boolean grantsEntityMutation(ServerLevel level, Entity entity, String operation) {
         final RegionEntityOwnershipScope scope = CURRENT.get();
@@ -160,6 +200,10 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         if (scope.coordinate.level() == level
                 && scope.group.owns(entity)
                 && grantsOperation(scope, entity, operation)) {
+            ALLOWED_MUTATION_COUNT.incrementAndGet();
+            return true;
+        }
+        if (grantsPendingAdmissionMutation(scope, level, entity, operation)) {
             ALLOWED_MUTATION_COUNT.incrementAndGet();
             return true;
         }
@@ -191,6 +235,83 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         return GRANTABLE_OPERATIONS.contains(operation)
                 && !entity.isRemoved()
                 && (!entity.isAddedToLevel() || defersSectionUpdate(entity));
+    }
+
+    /**
+     * {@return true when {@code operation} positions an entity that is not added to {@code level} yet}
+     * <p>
+     * The grant is the construction half of an admission: the lease level must be the entity's level (the
+     * storage guard derives {@code level} from the entity), the entity must not be added to a level and must
+     * not be removed, and the operation must be one of the
+     * {@linkplain #GRANTABLE_PENDING_ADMISSION_OPERATIONS grantable pending-admission writes}. No position is
+     * checked here; see the class documentation for why the containment belongs to
+     * {@link #deferEntityAddition(ServerLevel, Entity)}.
+     */
+    private static boolean grantsPendingAdmissionMutation(RegionEntityOwnershipScope scope, ServerLevel level, Entity entity, String operation) {
+        return scope.coordinate.level() == level
+                && GRANTABLE_PENDING_ADMISSION_OPERATIONS.contains(operation)
+                && !entity.isAddedToLevel()
+                && !entity.isRemoved();
+    }
+
+    /**
+     * Records the admission of the entity graph rooted at {@code entity} for the batch barrier.
+     * <p>
+     * This is the admission half of the lease, and the only place where an entity addition is
+     * lease-contained: the entity must be a not-yet-added, not-removed entity of {@code level} whose position
+     * is inside the leased region, and every entity of its self-and-passenger graph must be a not-yet-added,
+     * not-removed entity of the same level. A riding graph is recorded whole or refused whole, because half a
+     * graph in the level is never a valid state.
+     * <p>
+     * The barrier then runs the unmodified {@code ServerLevel.addEntity} for every member of the graph on the
+     * server thread, so the section membership, the identity ledger, the tracking and ticking callbacks and
+     * the region index are written exactly like a server-thread spawn. Nothing is admitted on the worker: the
+     * entity stays {@code !isAddedToLevel()} for the rest of the worker tick, and an admission the barrier
+     * drops (the engine shut down, the level closed, the entity was removed meanwhile) loses the entity and
+     * is counted.
+     *
+     * @param level  the level the caller is adding to
+     * @param entity the entity the caller is adding
+     * @return {@code true} when the caller must skip the vanilla admission because the barrier runs it,
+     *         {@code false} when the caller keeps the storage refusal
+     */
+    public static boolean deferEntityAddition(ServerLevel level, Entity entity) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null
+                || !scope.isActive()
+                || !RegionWorkerScope.isNativeWorkerThread()
+                || scope.coordinate.level() != level
+                || entity.level() != level
+                || entity.isAddedToLevel()
+                || entity.isRemoved()
+                || !containsPosition(scope, level, entity.blockPosition())) {
+            return false;
+        }
+        final List<Entity> graph = entity.getSelfAndPassengers().toList();
+        for (final Entity member : graph) {
+            if (member.level() != level || member.isAddedToLevel() || member.isRemoved()) {
+                // Half a graph is never a valid state: refuse the whole admission instead of recording the
+                // members that would be admissible.
+                return false;
+            }
+        }
+        return scope.group.batch().deferAddition(entity, graph);
+    }
+
+    /**
+     * {@return true when {@code pos} of {@code level} lies inside the region of the active lease {@code scope}}
+     * <p>
+     * The bounds are the ones of the physical section bucket of the leased region, the same block bounds the
+     * region-scoped entity query clamps a query box to. A level without physical region buckets answers
+     * {@code false}, so a lease never records an admission for storage that is not partitioned.
+     */
+    private static boolean containsPosition(RegionEntityOwnershipScope scope, ServerLevel level, BlockPos pos) {
+        final int regionChunkSize = level.entitySectionRegionChunkSize();
+        if (regionChunkSize <= 0) {
+            return false;
+        }
+        return Math.floorDiv(SectionPos.blockToSectionCoord(pos.getX()), regionChunkSize) == scope.coordinate.regionX()
+                && Math.floorDiv(SectionPos.blockToSectionCoord(pos.getZ()), regionChunkSize) == scope.coordinate.regionZ();
     }
 
     /**

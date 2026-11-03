@@ -418,6 +418,13 @@ class RegionEntityStorageBoundaryTest {
         assertFalse(mapDecorations(mapData).containsKey("frame-" + frameId));
     }
 
+    /**
+     * A native worker without an entity tick lease keeps every admission refusal, and the two entry points
+     * that never defer - the player admission and the duplicate precheck of
+     * {@code tryAddFreshEntityWithPassengers} - keep it under a lease as well. A worker that holds a lease
+     * covering the entity's position records the admission for its batch barrier instead of reaching this
+     * guard; see {@link RegionEntityAdmissionDeferralTest}.
+     */
     @Test
     void nativeWorkerServerLevelAdmissionRejectsBeforeRegistration() {
         this.installEngine();
