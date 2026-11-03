@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.server.command;
 
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.builder.ArgumentBuilder;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -12,10 +13,16 @@ import net.minecraft.network.chat.Component;
 import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 
 final class RegionThreadingCommand {
+    /** Regions the per-region listing shows when no count is given. */
+    static final int DEFAULT_LISTED_REGIONS = 10;
+    /** Upper bound of the listing, so one command cannot dump thousands of regions into the chat. */
+    static final int MAX_LISTED_REGIONS = 100;
+
     private RegionThreadingCommand() {}
 
     static ArgumentBuilder<CommandSourceStack, ?> register() {
@@ -27,7 +34,22 @@ final class RegionThreadingCommand {
                             diagnostics -> sendDiagnostics(source, diagnostics),
                             () -> sendNotInstalled(source));
                     return 1;
-                }));
+                }))
+                .then(Commands.literal("regions")
+                        .executes(context -> sendRegionListing(context.getSource(), DEFAULT_LISTED_REGIONS))
+                        .then(Commands.argument("count", IntegerArgumentType.integer(1, MAX_LISTED_REGIONS))
+                                .executes(context -> sendRegionListing(context.getSource(), IntegerArgumentType.getInteger(context, "count")))));
+    }
+
+    /**
+     * Sends the per-region listing of the {@code count} slowest regions by p99.
+     */
+    private static int sendRegionListing(CommandSourceStack source, int count) {
+        RegionThreadingHooks.diagnostics().ifPresentOrElse(
+                diagnostics -> RegionMetricsReport.listingLines(diagnostics.regionTicks(), count)
+                        .forEach(line -> source.sendSuccess(() -> Component.literal(line), false)),
+                () -> source.sendSuccess(() -> Component.literal(RegionMetricsReport.notInstalledLine()), false));
+        return 1;
     }
 
     private static void sendDiagnostics(CommandSourceStack source, RegionThreadingDiagnostics diagnostics) {
@@ -103,6 +125,9 @@ final class RegionThreadingCommand {
                 + ", regionPolicy=" + diagnostics.regionPolicy()
                 + ", regionChunkSize=" + diagnostics.regionChunkSize()
                 + ", entityStorageMode=" + diagnostics.entityStorageMode()), false);
+        // Added, never merged into the line above: the region metrics are a second, independent line so the
+        // existing diagnostics line stays stable for scripts that match it.
+        source.sendSuccess(() -> Component.literal(RegionMetricsReport.summaryLine(diagnostics.regionMetrics())), false);
     }
 
     private static void sendNotInstalled(CommandSourceStack source) {
@@ -121,5 +146,6 @@ final class RegionThreadingCommand {
                 + ", configuredWorkerThreads=" + NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get()
                 + ", configuredRegionPolicy=" + NeoForgeConfig.SERVER.regionThreadingMode.get()
                 + ", configuredRegionChunkSize=" + NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get()), false);
+        source.sendSuccess(() -> Component.literal(RegionMetricsReport.notInstalledLine()), false);
     }
 }

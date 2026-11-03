@@ -176,6 +176,7 @@ final class RegionState {
 
     void markDead() {
         this.lifecycleState.set(RegionLifecycleState.DEAD);
+        this.tickMetrics.release();
     }
 
     boolean isEmpty() {
@@ -204,6 +205,9 @@ final class RegionState {
             return false;
         }
         this.clearTasks();
+        // A retired region is dropped from the regionizer, so its metric window is released here instead of
+        // waiting for the last reference to the dead region state to disappear.
+        this.tickMetrics.release();
         return true;
     }
 }

@@ -5,6 +5,8 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.List;
+
 /**
  * Snapshot of the internal region threading runtime state.
  * <p>
@@ -91,6 +93,13 @@ package net.neoforged.neoforge.server.threading.region;
  * {@link #refusedDeferredEntityMoveBatches()} counts the batches the regionizer refused as a whole, whose
  * updates the barrier then published per entity. {@link #scheduledTaskMigrations()} counts the scheduled
  * entity tasks a move notification had to migrate to the region that now contains the task's entity.
+ * <p>
+ * {@link #regionTicks()} holds the per-region tick metrics of every live region and {@link #regionMetrics()}
+ * their aggregate; both are immutable snapshots taken at the same moment as this record.
+ * {@link RegionTickSnapshot} documents what region MSPT and region TPS mean, the window they are measured
+ * over and how a tick is classified as keeping up or behind. A diagnostics call without any live region -
+ * including a call on a server that never installed the engine - reports an empty region list and a summary
+ * of zero regions, and such a server records no per-region metric at all.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -165,4 +174,6 @@ public record RegionThreadingDiagnostics(
         long batchedDeferredEntityMoves,
         long unchangedDeferredEntityMoves,
         long refusedDeferredEntityMoveBatches,
-        long scheduledTaskMigrations) {}
+        long scheduledTaskMigrations,
+        RegionMetricsSummary regionMetrics,
+        List<RegionTickSnapshot> regionTicks) {}

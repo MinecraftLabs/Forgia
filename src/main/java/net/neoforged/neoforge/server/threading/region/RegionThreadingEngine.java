@@ -2589,6 +2589,9 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     private void drainLevelRegionTasks(ServerLevel level, @Nullable RegionTickBarrier barrier) {
         final long now = System.nanoTime();
+        // Every live region of this level opens the metric slot of this server tick before any of its work is
+        // recorded, so a region that is never leased closes the slot as 0 ns instead of a missed tick.
+        final long tickIndex = level.getGameTime();
         final boolean workerThread = this.workerPool.isWorkerThread(Thread.currentThread());
         // A lifecycle cleanup may already wait for the entity batch or region tick running on this thread.
         // Blocking on the lifecycle gate would wait for itself, so such a drain only tries the read lock
@@ -2602,6 +2605,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             if (region.coordinate().level() != level) {
                 return;
             }
+            region.tickMetrics().beginTick(tickIndex, now);
             if (region.isOwnedByCurrentThread()) {
                 // The current thread is already ticking this region (a nested level drain from a region
                 // task). Skip it entirely: activating it would consume the region tick timer without a
@@ -3778,9 +3782,14 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * {@return a snapshot of internal runtime diagnostics}
+     * <p>
+     * The snapshot includes the per-region tick metrics of every live region and their aggregate. Both are
+     * immutable, so a caller reads them without holding a lock of the engine, and a diagnostics call that
+     * finds no region reports an empty region list and a summary of zero regions.
      */
     @ApiStatus.Internal
     public RegionThreadingDiagnostics diagnostics() {
+        final List<RegionTickSnapshot> regionTicks = this.regionizer.regionTickSnapshots();
         return new RegionThreadingDiagnostics(
                 this.regionizer.size(),
                 this.regionizer.runningRegionCount(),
@@ -3854,7 +3863,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.batchedDeferredEntityMoveCount.get(),
                 this.unchangedDeferredEntityMoveCount.get(),
                 this.refusedDeferredEntityMoveBatchCount.get(),
-                this.entityTaskMigrationCount.get());
+                this.entityTaskMigrationCount.get(),
+                RegionMetricsSummary.summarize(regionTicks),
+                regionTicks);
     }
 
     /**
@@ -3907,6 +3918,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 this.entityTasksByEntity.clear();
                 this.regionizer.clear();
+                // The global region has no coordinate and is not part of the region metrics, so its window is
+                // released here: a shut-down engine holds no metric buffer at all.
+                this.globalRegion.tickMetrics().release();
                 this.workerPool.close();
             } finally {
                 lifecycleWriteLock.unlock();

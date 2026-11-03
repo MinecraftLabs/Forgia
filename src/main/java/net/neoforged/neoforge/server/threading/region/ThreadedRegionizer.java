@@ -20,8 +20,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.Nullable;
@@ -676,6 +678,34 @@ final class ThreadedRegionizer {
 
     private boolean hasTrackedEntities(RegionState region) {
         return this.entities.containsValue(region);
+    }
+
+    /**
+     * {@return the tick metrics of every live region, in regionizer order}
+     * <p>
+     * The per-region snapshots are immutable, so the diagnostics of one call are consistent with each other
+     * even when a worker records the next tick while the list is built. Retired regions are already released
+     * and are not part of the live region set, so their windows never appear here.
+     */
+    List<RegionTickSnapshot> regionTickSnapshots() {
+        final Set<RegionState> live = this.uniqueRegions();
+        final List<RegionTickSnapshot> snapshots = new ArrayList<>(live.size());
+        for (final RegionState region : live) {
+            final RegionCoordinate coordinate = region.coordinate();
+            snapshots.add(region.tickMetrics().snapshot(dimensionName(coordinate.level()), coordinate.regionX(), coordinate.regionZ()));
+        }
+        return List.copyOf(snapshots);
+    }
+
+    /**
+     * {@return the dimension id the per-region metrics are labelled with}
+     * <p>
+     * A level without a dimension key has no id to report; the metrics of such a level are labelled
+     * {@code unknown} instead of failing the whole diagnostics snapshot.
+     */
+    private static String dimensionName(ServerLevel level) {
+        final ResourceKey<Level> dimension = level.dimension();
+        return dimension == null ? "unknown" : dimension.location().toString();
     }
 
     int size() {
