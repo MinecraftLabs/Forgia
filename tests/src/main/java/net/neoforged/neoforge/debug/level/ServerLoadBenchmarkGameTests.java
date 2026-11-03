@@ -34,6 +34,7 @@ import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.util.RandomSource;
+import net.minecraft.world.Container;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -44,6 +45,8 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -57,6 +60,7 @@ import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
+import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.testframework.DynamicTest;
@@ -115,6 +119,8 @@ public class ServerLoadBenchmarkGameTests {
     private static final int WARMUP_TICKS = 200;
     /** Ticks sampled and reported. */
     private static final int MEASURED_TICKS = 600;
+    /** Regions the measured window reports per-region MSPT and TPS for, worst p99 first. */
+    private static final int REGION_METRIC_SAMPLE_LIMIT = 5;
     /**
      * Furnaces of the block entity workload when {@value #FURNACE_COUNT_PROPERTY} is unset.
      */
@@ -131,6 +137,43 @@ public class ServerLoadBenchmarkGameTests {
      * for every measured fixed region size.
      */
     private static final int INTERIOR_CHUNK_RESIDUE = 1;
+    /**
+     * Hoppers of the hopper workload when {@value #HOPPER_COUNT_PROPERTY} is unset. Every hopper of the
+     * workload has a source chest above it and a destination chest below it, so one column is one
+     * container-to-container transfer that the vanilla hopper rate spreads over eight ticks.
+     */
+    private static final int HOPPER_COUNT = 2048;
+    /**
+     * System property that overrides {@link #HOPPER_COUNT}, so the size of the hopper workload can be varied
+     * without editing the test. {@code 0} places no hopper at all.
+     */
+    static final String HOPPER_COUNT_PROPERTY = "neoforge.serverBenchmarkHoppers";
+    /**
+     * System property that turns the per-chunk block-entity admission cache of the installed engine off for a
+     * hopper measurement run, so the same workload can be measured with and without the cache. A run without
+     * the property keeps the cache enabled, which is the production path.
+     */
+    static final String BLOCK_ENTITY_ADMISSION_CACHE_PROPERTY = "neoforge.serverBenchmarkBlockEntityAdmissionCache";
+    /** Block distance between two hopper columns of one chunk, so their chests never merge into one chest. */
+    private static final int HOPPER_COLUMN_SPACING = 2;
+    /** Slots of one chunk layer: {@code 16 / spacing} per horizontal axis. */
+    private static final int HOPPER_SLOTS_PER_LAYER = (16 / HOPPER_COLUMN_SPACING) * (16 / HOPPER_COLUMN_SPACING);
+    /** Blocks between two vertical layers: the hopper and the two chests of its column. */
+    private static final int HOPPER_COLUMN_HEIGHT = 3;
+    /** Slots of the source chest of one column that start filled, so the transfer never runs dry. */
+    private static final int HOPPER_SOURCE_SLOTS = 4;
+    /**
+     * One in this many columns has no source chest and is fed with dropped item entities instead, so the
+     * workload exercises the item query and the removal of an absorbed item entity, not only the container
+     * to container transfer.
+     */
+    private static final int HOPPER_ITEM_COLUMN_EVERY = 3;
+    /** Ticks between two drops above an item column; the vanilla hopper cooldown is the same eight ticks. */
+    private static final int HOPPER_DROP_INTERVAL_TICKS = 8;
+    /** Items of one drop above an item column. Every drop is the only inflow the conservation check adds. */
+    private static final int HOPPER_DROP_STACK_SIZE = 1;
+    /** Height above the hopper block an item entity is dropped at, inside the suck box and above the block. */
+    private static final double HOPPER_DROP_HEIGHT = 1.05;
     /** Zombies of the entity workload. */
     private static final int ZOMBIE_COUNT = 250;
     /** Item entities of the entity workload. */
@@ -213,6 +256,7 @@ public class ServerLoadBenchmarkGameTests {
     private static final int SOAK_ZOMBIE_DEATHS = 1;
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
+    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
     static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
@@ -281,6 +325,81 @@ public class ServerLoadBenchmarkGameTests {
                         reportFurnaces(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, furnaces.size(), grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             removeFurnaces(level, furnaces);
+                            releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    @GameTest(batch = "benchmarkHopper", timeoutTicks = 2000)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Measures server tick time under a hopper transfer load; only runs when neoforge.serverBenchmark is set")
+    static void measuresServerTickTimeUnderHopperLoad(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_BENCH_NOTE skipped hopper workload: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final boolean admissionCache = applyBlockEntityAdmissionCacheSetting();
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = gridChunks(origin);
+            final List<BlockPos> hoppers = hopperPositions(origin);
+            final List<BlockPos> itemColumns = new ArrayList<>();
+            for (int index = 0; index < hoppers.size(); index++) {
+                if (isHopperItemColumn(index)) {
+                    itemColumns.add(hoppers.get(index));
+                }
+            }
+            final HopperItemDrops drops = new HopperItemDrops(level, itemColumns);
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, drops);
+            // The attribution is reported per measured tick, so it is reset when the warmup ends and the
+            // warmup itself stays unmeasured.
+            sampler.onMeasuredWindowStart(RegionBlockEntityTickAttribution::reset);
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<RegionBlockEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionBlockEntityTickAttribution.snapshot());
+            final AtomicReference<Long> itemCountStart = new AtomicReference<>(0L);
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    RegionBlockEntityTickAttribution.setEnabled(false);
+                    removeHoppers(level, hoppers);
+                    releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> forceChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS))
+                    // The worker slice only admits a ticker whose chunk finished its entity load, so the
+                    // grid is materialised and waited for before any hopper is placed.
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the benchmark chunk grid never finished its entity load"))
+                    .thenExecute(() -> placeHoppers(level, hoppers, helper))
+                    .thenExecute(() -> {
+                        itemCountStart.set(countItems(level, hoppers));
+                        before.set(RegionThreadingHooks.diagnostics());
+                        RegionBlockEntityTickAttribution.setEnabled(true);
+                        attributionBefore.set(RegionBlockEntityTickAttribution.snapshot());
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(sampler);
+                    })
+                    // One extra tick: the sequence runs inside the tick body, so the last sampled tick only
+                    // completes its Post event after this sequence step would otherwise have read it.
+                    .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 1)
+                    // Cleanup runs before the test succeeds: the GameTestRunner forces the chunks of the
+                    // next batch's structures while the test-passed listeners run, so releasing the grid
+                    // afterwards would unforce those chunks again and stall the next batch forever.
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        final RegionBlockEntityTickAttribution.Snapshot attributionAfter = RegionBlockEntityTickAttribution.snapshot();
+                        RegionBlockEntityTickAttribution.setEnabled(false);
+                        reportHoppers(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, hoppers, grid.size(), itemCountStart.get(), drops.injectedItems(), admissionCache);
+                        if (cleaned.compareAndSet(false, true)) {
+                            removeHoppers(level, hoppers);
                             releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
                         }
                     })
@@ -580,6 +699,25 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
+     * {@return the interior chunk columns of the grid}
+     * <p>
+     * A column is the center chunk of a 3x3 region and an interior chunk of a 9x9 region, so the interior-only
+     * block-entity types may tick there for every measured fixed region size.
+     */
+    private static List<ChunkPos> interiorColumns(BlockPos origin) {
+        final List<ChunkPos> columns = new ArrayList<>();
+        for (ChunkPos chunk : gridChunks(origin)) {
+            if (Math.floorMod(chunk.x, 3) == INTERIOR_CHUNK_RESIDUE && Math.floorMod(chunk.z, 3) == INTERIOR_CHUNK_RESIDUE) {
+                columns.add(chunk);
+            }
+        }
+        if (columns.isEmpty()) {
+            throw new IllegalStateException("the benchmark grid has no interior chunk for the workload columns");
+        }
+        return columns;
+    }
+
+    /**
      * {@return the absolute furnace positions of the workload}
      * <p>
      * The furnaces are distributed over the interior columns of the grid, round-robin, with distinct
@@ -588,15 +726,7 @@ public class ServerLoadBenchmarkGameTests {
      * layout, so all measured profiles tick the same furnaces at the same places.
      */
     private static List<BlockPos> furnacePositions(BlockPos origin) {
-        final List<ChunkPos> columns = new ArrayList<>();
-        for (ChunkPos chunk : gridChunks(origin)) {
-            if (Math.floorMod(chunk.x, 3) == INTERIOR_CHUNK_RESIDUE && Math.floorMod(chunk.z, 3) == INTERIOR_CHUNK_RESIDUE) {
-                columns.add(chunk);
-            }
-        }
-        if (columns.isEmpty()) {
-            throw new IllegalStateException("the benchmark grid has no interior chunk for the furnace columns");
-        }
+        final List<ChunkPos> columns = interiorColumns(origin);
         final int count = furnaceCount();
         final List<BlockPos> positions = new ArrayList<>(count);
         for (int index = 0; index < count; index++) {
@@ -616,6 +746,39 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static int furnaceCount() {
         return intProperty(FURNACE_COUNT_PROPERTY, FURNACE_COUNT);
+    }
+
+    /**
+     * {@return the absolute hopper positions of the workload}
+     * <p>
+     * Every hopper is the middle of a three-block column: a source chest above it and a destination chest
+     * below it, so one hopper moves one stack from one container into the other and the vanilla cooldown
+     * spreads its transfers over eight ticks. The columns are distributed over the interior chunks of the
+     * grid like the furnaces, with two blocks between two columns of one chunk so that no two chests of the
+     * workload merge into a double chest. The positions only depend on {@code origin} and
+     * {@link #hopperCount()}, never on the installed region layout.
+     */
+    private static List<BlockPos> hopperPositions(BlockPos origin) {
+        final List<ChunkPos> columns = interiorColumns(origin);
+        final int count = hopperCount();
+        final List<BlockPos> positions = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            final ChunkPos column = columns.get(index % columns.size());
+            final int slot = index / columns.size();
+            final int offsetX = (slot % (16 / HOPPER_COLUMN_SPACING)) * HOPPER_COLUMN_SPACING;
+            final int offsetZ = (slot / (16 / HOPPER_COLUMN_SPACING) % (16 / HOPPER_COLUMN_SPACING)) * HOPPER_COLUMN_SPACING;
+            final int layer = slot / HOPPER_SLOTS_PER_LAYER;
+            positions.add(new BlockPos(column.getMinBlockX() + offsetX, origin.getY() + 2 + HOPPER_COLUMN_HEIGHT * layer, column.getMinBlockZ() + offsetZ));
+        }
+        return positions;
+    }
+
+    /**
+     * {@return the number of hoppers of this run, {@value #HOPPER_COUNT} unless
+     * {@value #HOPPER_COUNT_PROPERTY} overrides it}
+     */
+    private static int hopperCount() {
+        return intProperty(HOPPER_COUNT_PROPERTY, HOPPER_COUNT);
     }
 
     /**
@@ -665,6 +828,25 @@ public class ServerLoadBenchmarkGameTests {
     private static boolean zombieLootEnabled() {
         final String configured = System.getProperty(ZOMBIE_LOOT_PROPERTY);
         return configured == null || configured.isBlank() || Boolean.parseBoolean(configured.trim());
+    }
+
+    /**
+     * Applies {@value #BLOCK_ENTITY_ADMISSION_CACHE_PROPERTY} to the installed engine and returns the
+     * effective setting, so one hopper run measures the cached admission and another the uncached evaluation
+     * of the same workload.
+     * <p>
+     * A run without an installed engine has no block-entity worker slice and nothing to configure; the
+     * property then only labels the row.
+     */
+    private static boolean applyBlockEntityAdmissionCacheSetting() {
+        final String configured = System.getProperty(BLOCK_ENTITY_ADMISSION_CACHE_PROPERTY);
+        final boolean enabled = configured == null || configured.isBlank() || Boolean.parseBoolean(configured.trim());
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.setBlockEntityAdmissionCacheEnabledForTesting(enabled);
+            }
+        });
+        return enabled;
     }
 
     /**
@@ -735,6 +917,173 @@ public class ServerLoadBenchmarkGameTests {
             if (level.getBlockState(pos).is(Blocks.FURNACE)) {
                 level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
             }
+        }
+    }
+
+    /**
+     * Places the hopper columns: a chest of source items above every hopper and an empty chest below it.
+     * <p>
+     * The source chests start with {@value #HOPPER_SOURCE_SLOTS} full stacks, which is more than the window can
+     * transfer at the vanilla hopper rate, so the flow never runs dry and the measured ticks all carry the
+     * same work.
+     */
+    private static void placeHoppers(ServerLevel level, List<BlockPos> positions, ExtendedGameTestHelper helper) {
+        for (int index = 0; index < positions.size(); index++) {
+            final BlockPos pos = positions.get(index);
+            if (isHopperItemColumn(index)) {
+                // No source chest: the block above stays air, so the hopper reads the item entities the drop
+                // driver spawns there instead of a container.
+                level.setBlock(pos, Blocks.HOPPER.defaultBlockState(), 3);
+            } else {
+                level.setBlock(pos.above(), Blocks.CHEST.defaultBlockState(), 3);
+                level.setBlock(pos, Blocks.HOPPER.defaultBlockState(), 3);
+            }
+            level.setBlock(pos.below(), Blocks.CHEST.defaultBlockState(), 3);
+        }
+        int placed = 0;
+        for (int index = 0; index < positions.size(); index++) {
+            final BlockPos pos = positions.get(index);
+            if (!(level.getBlockEntity(pos) instanceof HopperBlockEntity)) {
+                continue;
+            }
+            if (isHopperItemColumn(index)) {
+                placed++;
+            } else if (level.getBlockEntity(pos.above()) instanceof ChestBlockEntity source) {
+                for (int slot = 0; slot < HOPPER_SOURCE_SLOTS; slot++) {
+                    source.setItem(slot, new ItemStack(Items.COBBLESTONE, 64));
+                }
+                placed++;
+            }
+        }
+        helper.assertTrue(placed == positions.size(),
+                "only " + placed + " of " + positions.size() + " benchmark hopper columns were created");
+    }
+
+    /**
+     * {@return true when the column at {@code index} is fed with dropped item entities instead of a chest}
+     */
+    private static boolean isHopperItemColumn(int index) {
+        return index % HOPPER_ITEM_COLUMN_EVERY == 0;
+    }
+
+    private static void removeHoppers(ServerLevel level, List<BlockPos> positions) {
+        for (BlockPos pos : positions) {
+            if (level.getBlockState(pos).is(Blocks.HOPPER)) {
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3);
+                level.setBlock(pos.below(), Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+    }
+
+    /**
+     * {@return the item count of the whole workload: every container slot of every column and every item
+     * entity of the level}
+     * <p>
+     * The count has no cell that decides whether an item is visible. The containers are the fixed part of
+     * the workload - the source chest, the hopper and the destination chest of every column - and every slot
+     * of them is counted. Every {@link ItemEntity} of the level is counted wherever it is and however it
+     * moves, so an item that is still on its way, that waits in a suck box or that drifted out of the box
+     * above its hopper is part of the system and can never be read as a lost item.
+     * <p>
+     * Counting only the exact 1x1x1 box above each hopper did read such an item as lost: an item entity keeps
+     * the vanilla spawn impulse, and with gravity off that impulse never decays, so a dropped item rises out
+     * of the box within a few ticks whenever the hopper does not absorb it immediately. The workload then
+     * reported a loss of up to several hundred items while every item was still in the level.
+     */
+    private static long countItems(ServerLevel level, List<BlockPos> positions) {
+        long total = 0L;
+        for (BlockPos pos : positions) {
+            total += containerItems(level, pos.above());
+            total += containerItems(level, pos);
+            total += containerItems(level, pos.below());
+        }
+        for (Entity entity : level.getEntities().getAll()) {
+            if (entity instanceof ItemEntity item) {
+                total += item.getItem().getCount();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * {@return the item count of the containers the hoppers of the workload delivered into}
+     */
+    private static long countDeliveredItems(ServerLevel level, List<BlockPos> positions) {
+        long total = 0L;
+        for (BlockPos pos : positions) {
+            total += containerItems(level, pos.below());
+        }
+        return total;
+    }
+
+    private static long containerItems(ServerLevel level, BlockPos pos) {
+        if (!(level.getBlockEntity(pos) instanceof Container container)) {
+            return 0L;
+        }
+        long total = 0L;
+        for (int slot = 0; slot < container.getContainerSize(); slot++) {
+            total += container.getItem(slot).getCount();
+        }
+        return total;
+    }
+
+    /**
+     * Feeds the item columns of the hopper workload.
+     * <p>
+     * Every {@value #HOPPER_DROP_INTERVAL_TICKS} ticks one cobblestone item entity is spawned above each item
+     * column, inside the suck box of the hopper and above its block, so the hopper absorbs it from its own
+     * block-entity tick - the region-scoped item query and the deferred removal of the absorbed entity - and
+     * not from the {@code entityInside} callback of the entity tick. The items carry no gravity, so they stay
+     * in the suck box until a hopper absorbs them; a hopper on cooldown leaves its item waiting, and the
+     * report counts it in the item conservation of the workload.
+     */
+    private static final class HopperItemDrops implements Runnable {
+        private final ServerLevel level;
+        private final List<BlockPos> columns;
+        private long spawned;
+        private int countdown = HOPPER_DROP_INTERVAL_TICKS;
+
+        HopperItemDrops(ServerLevel level, List<BlockPos> columns) {
+            this.level = level;
+            this.columns = columns;
+        }
+
+        /**
+         * Drops one item above every item column, in the same interval as the hopper cooldown so the flow of
+         * a column stays one item per eight ticks.
+         */
+        @Override
+        public void run() {
+            if (this.columns.isEmpty() || --this.countdown > 0) {
+                return;
+            }
+            this.countdown = HOPPER_DROP_INTERVAL_TICKS;
+            for (BlockPos pos : this.columns) {
+                final ItemEntity item = new ItemEntity(this.level, pos.getX() + 0.5, pos.getY() + HOPPER_DROP_HEIGHT, pos.getZ() + 0.5,
+                        new ItemStack(Items.COBBLESTONE, HOPPER_DROP_STACK_SIZE));
+                // No gravity: the item has to stay in the suck box of its hopper instead of falling into the
+                // hopper block, where the entity tick of the server thread would absorb it.
+                item.setNoGravity(true);
+                this.level.addFreshEntity(item);
+                this.spawned++;
+            }
+        }
+
+        /**
+         * {@return the number of items dropped since the workload was set up}
+         * <p>
+         * The item count of the workload is taken before the first drop, so this is the exact number of items
+         * the system gained and the conservation check has to see them all in the containers or in the item
+         * entities that still wait above a hopper.
+         */
+        long spawned() {
+            return this.spawned;
+        }
+
+        /** {@return the number of items every drop injected into the system} */
+        long injectedItems() {
+            return this.spawned * HOPPER_DROP_STACK_SIZE;
         }
     }
 
@@ -906,6 +1255,78 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
+     * Prints the measurement of the hopper workload as one CSV row and asserts its item conservation.
+     * <p>
+     * {@code itemsConserved} is the invariant that proves the hopper tick neither duplicated nor lost an
+     * item: the workload owns every item of its columns, so the count of the start and the end of the
+     * measured window has to be equal. {@code itemsDelivered} is the count of the destination chests, which
+     * proves the columns really transferred: a workload that never moved an item would leave it at zero.
+     * <p>
+     * The five attribution columns are the per-tick wall time of the segments of the server-thread
+     * block-entity slice, exactly like {@link #reportFurnaces}: the plan collection, the region lease
+     * acquisition, the wait for the batch, the deferred work after the barrier and the whole slice.
+     */
+    private static void reportHoppers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before,
+            RegionBlockEntityTickAttribution.Snapshot attributionBefore, RegionBlockEntityTickAttribution.Snapshot attributionAfter,
+            List<BlockPos> hoppers, int chunks, long itemCountStart, long itemsDropped, boolean admissionCache) {
+        final long[] sorted = sampler.sortedSamples();
+        helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final long itemCountEnd = countItems(helper.getLevel(), hoppers);
+        final long delivered = countDeliveredItems(helper.getLevel(), hoppers);
+        // The workload owns every item it started with plus every item the drop driver spawned, and the drop
+        // driver is the only inflow, so the end count of the whole level has to be exactly their sum.
+        final long expectedEnd = itemCountStart + itemsDropped;
+        final boolean conserved = expectedEnd == itemCountEnd;
+        final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
+        System.out.println(sampler.note(profile, after)
+                + " hopperItemCountStart=" + itemCountStart
+                + " hopperItemCountEnd=" + itemCountEnd
+                + " hopperItemsDropped=" + itemsDropped
+                + " hopperItemsDelivered=" + delivered
+                + " hopperItemsConserved=" + conserved
+                + " blockEntityAttributionSlices=" + slices);
+        System.out.println("SERVER_BENCH_HOPPER_HEADER " + HOPPER_CSV_HEADER);
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%b,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%b%n",
+                profile,
+                after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
+                hoppers.size(),
+                chunks,
+                averageMillis(sorted),
+                percentileMillis(sorted, 0.50),
+                percentileMillis(sorted, 0.95),
+                percentileMillis(sorted, 0.99),
+                delta(before, after, RegionThreadingDiagnostics::blockEntityTicksOnWorkers),
+                delta(before, after, RegionThreadingDiagnostics::fallbackBlockEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::totalRegionTickCount),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesAllowedByLease),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesTruncatedByLease),
+                delta(before, after, RegionThreadingDiagnostics::entityQueriesRejected),
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
+                delta(before, after, RegionThreadingDiagnostics::deferredEntityRemovalsApplied),
+                delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityRemovals),
+                delta(before, after, RegionThreadingDiagnostics::repeatedDeferredEntityRemovals),
+                itemCountStart,
+                itemCountEnd,
+                itemsDropped,
+                delivered,
+                conserved,
+                millisPerSlice(attributionAfter.planNanos() - attributionBefore.planNanos(), slices),
+                millisPerSlice(attributionAfter.leaseNanos() - attributionBefore.leaseNanos(), slices),
+                millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
+                millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
+                millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
+                slices,
+                admissionCache);
+        printRegionMetrics(after);
+        helper.assertTrue(conserved,
+                "the hopper workload lost or duplicated items: start " + itemCountStart + ", dropped " + itemsDropped + ", end " + itemCountEnd);
+        helper.assertTrue(delivered > 0L, "the hopper workload never moved an item");
+    }
+
+    /**
      * {@return the per-tick average of {@code nanos} over {@code slices} in milliseconds, or {@code -1} when
      * the window recorded no slice}
      */
@@ -946,6 +1367,18 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount),
                 churn.replacementCount(),
                 mismatches);
+        printRegionMetrics(after);
+    }
+
+    /**
+     * Prints the per-region MSPT and TPS of the measured window in the form the region threading command
+     * reports them, so a benchmark run also shows which region was slow and whether it kept up.
+     */
+    private static void printRegionMetrics(Optional<RegionThreadingDiagnostics> diagnostics) {
+        diagnostics.ifPresent(current -> {
+            System.out.println(RegionMetricsReport.summaryLine(current.regionMetrics()));
+            RegionMetricsReport.listingLines(current.regionTicks(), REGION_METRIC_SAMPLE_LIMIT).forEach(System.out::println);
+        });
     }
 
     /**

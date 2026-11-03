@@ -88,4 +88,18 @@ public final class RegionTickCompatibility {
     public static boolean requiresInteriorRegion(@Nullable String type) {
         return type != null && REGION_SAFE_INTERIOR_BLOCK_ENTITY_TYPES.contains(type);
     }
+
+    /**
+     * {@return the admission decision of a ticker of {@code type} whose chunk is {@code interiorChunk}}
+     * <p>
+     * This is the single place that combines the two halves of the declaration: a type outside the allowlist
+     * keeps its whole region on the server thread, and an allowlisted type still keeps it there when its own
+     * chunk is a boundary chunk of the region, because the writes it starts could leave the lease.
+     */
+    public static RegionBlockEntityTickAdmission.Decision decideBlockEntityTick(@Nullable String type, boolean interiorChunk) {
+        if (!requiresInteriorRegion(type)) {
+            return RegionBlockEntityTickAdmission.Decision.TYPE_NOT_DECLARED;
+        }
+        return interiorChunk ? RegionBlockEntityTickAdmission.Decision.ADMITTED : RegionBlockEntityTickAdmission.Decision.NOT_INTERIOR_CHUNK;
+    }
 }

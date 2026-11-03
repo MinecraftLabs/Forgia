@@ -131,6 +131,9 @@ runs {
             // Measurement runs pass -PserverBenchmarkHoppers=N to vary the size of the hopper workload
             // without editing the test; unset keeps the default workload of the test.
             systemProperty("neoforge.serverBenchmarkHoppers", providers.gradleProperty("serverBenchmarkHoppers").getOrElse("2048"))
+            // Measurement runs pass -PserverBenchmarkBlockEntityAdmissionCache=false to measure the hopper
+            // workload with the per-chunk block-entity admission cache turned off; unset keeps the cache on.
+            systemProperty("neoforge.serverBenchmarkBlockEntityAdmissionCache", providers.gradleProperty("serverBenchmarkBlockEntityAdmissionCache").getOrElse("true"))
             // Measurement runs pass -PserverBenchmarkEntityWorkerTicks=false to measure the same entity
             // worker workload with its entity ticks on the server thread, which is the reference row.
             systemProperty("neoforge.serverBenchmarkEntityWorkerTicks", providers.gradleProperty("serverBenchmarkEntityWorkerTicks").getOrElse("true"))

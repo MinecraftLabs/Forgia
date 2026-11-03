@@ -1,5 +1,20 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -73,6 +_,14 @@
+         }
+     };
+     private final Map<BlockPos, LevelChunk.RebindableTickingBlockEntityWrapper> tickersInLevel = Maps.newHashMap();
++    // Neo: cached block-entity worker admission of this chunk; exactly one snapshot per loaded chunk, released
++    // with the chunk. See net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache.
++    private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache blockEntityTickAdmissionCache;
++    /**
++     * Neo: revision of the block-entity ticker set of this chunk. Every add, remove and rebind of a ticker
++     * bumps it, so a cached admission snapshot of the chunk is never reused across a change of its ticker set.
++     */
++    private long blockEntityTickerRevision;
+     private boolean loaded;
+     final Level level;
+     @Nullable
 @@ -139,6 +_,7 @@
          this.setAllStarts(p_196851_.getAllStarts());
          this.setAllReferences(p_196851_.getAllReferences());
@@ -101,6 +116,14 @@
              }
          }
  
+@@ -459,6 +_,7 @@
+     }
+ 
+     private void removeBlockEntityTicker(BlockPos p_156413_) {
++        ++this.blockEntityTickerRevision; // Neo: a ticker of this chunk is gone, so its cached admission is stale
+         LevelChunk.RebindableTickingBlockEntityWrapper levelchunk$rebindabletickingblockentitywrapper = this.tickersInLevel.remove(p_156413_);
+         if (levelchunk$rebindabletickingblockentitywrapper != null) {
+             levelchunk$rebindabletickingblockentitywrapper.rebind(NULL_TICKER);
 @@ -496,7 +_,7 @@
          p_187974_.accept((p_338077_, p_338078_, p_338079_) -> {
              BlockEntity blockentity = this.getBlockEntity(p_338077_, LevelChunk.EntityCreationType.IMMEDIATE);
@@ -110,10 +133,14 @@
              }
          });
      }
-@@ -604,6 +_,7 @@
+@@ -604,6 +_,11 @@
      }
  
      public void clearAllBlockEntities() {
++        ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
++        // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
++        // with them instead of being kept by a chunk that no longer ticks anything.
++        this.setBlockEntityTickAdmissionCache(null);
 +        this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
          this.blockEntities.values().forEach(BlockEntity::setRemoved);
          this.blockEntities.clear();
@@ -126,7 +153,15 @@
          this.blockEntities.values().forEach(p_187988_ -> {
              if (this.level instanceof ServerLevel serverlevel) {
                  this.addGameEventListener(p_187988_, serverlevel);
-@@ -662,27 +_,63 @@
+@@ -631,6 +_,7 @@
+     }
+ 
+     private <T extends BlockEntity> void updateBlockEntityTicker(T p_156407_) {
++        ++this.blockEntityTickerRevision; // Neo: a ticker of this chunk is added or rebound
+         BlockState blockstate = p_156407_.getBlockState();
+         BlockEntityTicker<T> blockentityticker = blockstate.getTicker(this.level, (BlockEntityType<T>)p_156407_.getType());
+         if (blockentityticker == null) {
+@@ -662,27 +_,92 @@
          return new LevelChunk.BoundTickingBlockEntity<>(p_156376_, p_156377_);
      }
  
@@ -152,6 +187,35 @@
 +            return bound.captureBinding(level);
 +        }
 +        return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(ticker, () -> true);
++    }
++
++    /**
++     * Neo: the cached block-entity worker admission snapshot of this chunk, or {@code null} when none was
++     * built yet.
++     */
++    @Nullable
++    public net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache blockEntityTickAdmissionCache() {
++        return this.blockEntityTickAdmissionCache;
++    }
++
++    /**
++     * Neo: replaces the cached admission snapshot of this chunk. The snapshot it replaces is released here, so
++     * a chunk never holds more than one and the memory bound of the snapshot set stays observable.
++     */
++    public void setBlockEntityTickAdmissionCache(@Nullable net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache cache) {
++        final net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache previous = this.blockEntityTickAdmissionCache;
++        this.blockEntityTickAdmissionCache = cache;
++        if (previous != null && previous != cache) {
++            previous.release();
++        }
++    }
++
++    /**
++     * Neo: the revision of the block-entity ticker set of this chunk. A cached admission snapshot is only
++     * reused while this value is unchanged.
++     */
++    public long blockEntityTickerRevision() {
++        return this.blockEntityTickerRevision;
 +    }
 +
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {

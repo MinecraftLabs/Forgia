@@ -177,6 +177,12 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private volatile boolean legacyEntityQueryHandoffForTesting;
     /**
+     * Mechanics-test seam of the per-chunk block-entity admission cache. Production keeps the cache enabled;
+     * the equivalence test of the cache compares the cached plan against the uncached evaluation over the
+     * same chunk and ticker states.
+     */
+    private volatile boolean blockEntityAdmissionCacheEnabled = true;
+    /**
      * Diagnostics-only observer of a worker entity tick failure.
      * <p>
      * The entity worker diagnostics benchmark installs it so one failing tick is recorded and the group
@@ -1041,6 +1047,26 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * {@return true when the block-entity plan reuses the cached admission of a chunk}
+     */
+    @ApiStatus.Internal
+    public boolean isBlockEntityAdmissionCacheEnabled() {
+        return this.blockEntityAdmissionCacheEnabled;
+    }
+
+    /**
+     * Turns the per-chunk block-entity admission cache off for internal tests only.
+     * <p>
+     * Production never calls this: the cache is the production plan path. The seam exists so the equivalence
+     * test can run the uncached evaluation, which is the reference behavior of the cached plan, over the same
+     * chunk and ticker states.
+     */
+    @ApiStatus.Internal
+    public void setBlockEntityAdmissionCacheEnabledForTesting(boolean enabled) {
+        this.blockEntityAdmissionCacheEnabled = enabled;
+    }
+
+    /**
      * Installs the diagnostics-only observer of worker entity tick failures, or removes it with
      * {@code null}.
      * <p>
@@ -1878,11 +1904,7 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     private boolean isRegionSafeBlockEntityGroup(List<RegionBlockEntityTickAdmission> tickers) {
         for (final RegionBlockEntityTickAdmission ticker : tickers) {
-            final String type = ticker.type();
-            if (!RegionTickCompatibility.isRegionSafeBlockEntityType(type)) {
-                return false;
-            }
-            if (RegionTickCompatibility.requiresInteriorRegion(type) && !this.isInteriorRegionChunk(new ChunkPos(ticker.position()))) {
+            if (!ticker.isAdmitted()) {
                 return false;
             }
         }
