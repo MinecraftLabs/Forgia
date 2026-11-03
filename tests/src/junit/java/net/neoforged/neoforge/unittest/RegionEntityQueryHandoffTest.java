@@ -42,6 +42,7 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.LevelEntityGetter;
@@ -612,6 +613,11 @@ class RegionEntityQueryHandoffTest {
     private static ServerLevel mockLevel(Queue<Runnable> serverTasks, Thread serverThread) {
         final ServerLevel level = mock(ServerLevel.class, CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
+        // The seed of an entity group random source is derived from the world seed, the game time and the
+        // dimension of its level.
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
+        doReturn(Level.OVERWORLD).when(level).dimension();
         doReturn("test-level").when(level).toString();
         doReturn(List.of()).when(level).getPartEntities();
         // The scheduled tick batch draws one seed from the level random before it creates a group.

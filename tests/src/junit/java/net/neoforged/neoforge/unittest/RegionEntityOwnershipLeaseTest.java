@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.function.Function;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope;
 import org.junit.jupiter.api.Test;
@@ -35,8 +36,18 @@ class RegionEntityOwnershipLeaseTest {
     private static final String REGION_PACKAGE = "net.neoforged.neoforge.server.threading.region.";
     private static final String SET_POS_RAW = "Entity.setPosRaw";
 
-    private final ServerLevel level = mock(ServerLevel.class);
+    private final ServerLevel level = leaseLevel();
     private final ServerLevel otherLevel = mock(ServerLevel.class);
+
+    /**
+     * {@return a level mock that can build an entity group, which needs the dimension key of its level for
+     * the seed of the group random source}
+     */
+    private static ServerLevel leaseLevel() {
+        final ServerLevel level = mock(ServerLevel.class);
+        when(level.dimension()).thenReturn(Level.OVERWORLD);
+        return level;
+    }
 
     @Test
     void leaseGrantsTheFieldMutationsOfAnOwnedEntity() throws ReflectiveOperationException {

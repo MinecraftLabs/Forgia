@@ -28,6 +28,7 @@ import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
@@ -339,6 +340,11 @@ class RegionWorkerChunkGuardTest {
     private static ServerLevel mockLevel(BiPredicate<Integer, Integer> loadedChunk) {
         final ServerLevel level = mock(ServerLevel.class, org.mockito.Mockito.CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
+        // The seed of an entity group random source is derived from the world seed, the game time and the
+        // dimension of its level.
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
+        doReturn(Level.OVERWORLD).when(level).dimension();
         doReturn("test-level").when(level).toString();
         final LevelChunk loadedChunkInstance = mock(LevelChunk.class);
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);

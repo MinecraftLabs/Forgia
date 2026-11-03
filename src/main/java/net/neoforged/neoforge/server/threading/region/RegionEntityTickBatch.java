@@ -14,8 +14,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
+import net.minecraft.world.level.levelgen.RandomSupport;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -107,10 +110,38 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         for (final Entity entity : entities) {
             addMembers(members, entity);
         }
-        final Group group = new Group(this, region, entities, members);
+        // The random source is created here, inside the lease release path of the caller, so a failure
+        // while building it cannot leave the region TICKING without a worker that releases it.
+        final Group group = new Group(this, region, entities, members, this.groupRandomSeed(region.coordinate()));
         this.groups.add(group);
         this.addTask("entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
+    }
+
+    /**
+     * {@return the seed of the random source of the entity group of {@code coordinate} in this tick}
+     * <p>
+     * The seed is derived from values the level already owns - its world seed, its dimension, the game time
+     * and the region coordinate - and not from a draw of the level random. Building a group therefore
+     * neither consumes the vanilla random sequence nor makes the sequence of one region depend on the
+     * groups of the other regions of the same tick: the group of a region starts from the same seed no
+     * matter how many regions tick next to it, in which order their leases were acquired and which worker
+     * runs it. Every input passes through the splitmix64 finalizer, so a step of one tick or of one region
+     * changes every bit of the {@code LegacyRandomSource} seed instead of only its low bits.
+     * <p>
+     * Determinism provided: for one world seed, dimension, game time and region coordinate the group draws
+     * a fixed sequence, independent of the other regions of the tick, of the worker count and of the order
+     * in which the regions are dispatched to workers. Not provided: this is not the vanilla sequence
+     * (vanilla draws every entity of a level from one level-wide source), and the sequence is not stable
+     * across a region merge or split, a layout change or a change of the group's entity set, because each
+     * of those changes the group and how many draws the entities before a given entity take from it.
+     */
+    long groupRandomSeed(RegionCoordinate coordinate) {
+        final ServerLevel level = this.level();
+        long seed = RandomSupport.mixStafford13(level.getSeed());
+        seed = RandomSupport.mixStafford13(seed ^ level.getGameTime());
+        seed = RandomSupport.mixStafford13(seed ^ level.dimension().location().hashCode());
+        return RandomSupport.mixStafford13(seed ^ ChunkPos.asLong(coordinate.regionX(), coordinate.regionZ()));
     }
 
     /**
@@ -418,19 +449,21 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     record RemovalDrain(List<DeferredEntityRemoval> removals, long repeats) {}
 
     /**
-     * One region's share of the batch: the region lease, the entities it ticks, and the snapshot members
-     * it is allowed to execute inline.
+     * One region's share of the batch: the region lease, the entities it ticks, the snapshot members it is
+     * allowed to execute inline, and the random source its entity ticks draw from.
      */
     static final class Group {
         private final RegionEntityTickBatch batch;
         private final RegionState region;
         private final List<Entity> entities = new ArrayList<>();
         private final Set<Entity> members;
+        private final RandomSource random;
 
-        Group(RegionEntityTickBatch batch, RegionState region, List<Entity> entities, Set<Entity> members) {
+        Group(RegionEntityTickBatch batch, RegionState region, List<Entity> entities, Set<Entity> members, long randomSeed) {
             this.batch = batch;
             this.region = region;
             this.members = members;
+            this.random = RandomSource.create(randomSeed);
             this.addEntities(entities);
         }
 
@@ -448,6 +481,18 @@ final class RegionEntityTickBatch extends RegionTickBatch {
 
         Set<Entity> members() {
             return this.members;
+        }
+
+        /**
+         * {@return the random source every entity of this group draws from while the group runs}
+         * <p>
+         * The engine installs this one instance for the whole worker tick loop, so a direct
+         * {@code level.random} read of any entity of the group resolves it through the level random
+         * wrapper. It is derived in {@link RegionEntityTickBatch#groupRandomSeed(RegionCoordinate)} and
+         * never shared with another group.
+         */
+        RandomSource random() {
+            return this.random;
         }
 
         void addEntities(List<Entity> entities) {

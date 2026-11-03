@@ -13,26 +13,36 @@ import org.jetbrains.annotations.ApiStatus;
 /**
  * Level random that redirects region tick workers to the random source of their region group.
  * <p>
- * Vanilla {@link RandomSource} implementations are not safe for concurrent use, and block or fluid code
- * may read {@code level.random} directly instead of the random passed to the tick callback. The wrapper
- * therefore resolves the region random on every call: a worker inside a scheduled tick or random tick
- * group draws from that group's random source, while the server thread and every other thread keep using
- * the wrapped vanilla random. Without an active region group the wrapper is a plain delegate, so behavior
+ * Vanilla {@link RandomSource} implementations are not safe for concurrent use, and entity, block or fluid
+ * code may read {@code level.random} directly instead of the random passed to the tick callback. The wrapper
+ * therefore resolves the random on every call: a worker inside an entity tick, scheduled tick or random tick
+ * group draws from that group's random source, while the server thread and every other thread keep using the
+ * wrapped vanilla random. Without an active region group the wrapper is a plain delegate, so behavior
  * outside the batch is unchanged.
+ * <p>
+ * The engine is resolved through {@link RegionThreadingManager} on every call instead of being captured by
+ * the wrapper. A level captures its random when it is created, while an engine can be installed, replaced or
+ * cleared afterwards (the diagnostics runs replace the configured engine), so a captured engine would keep
+ * the wrapper pointing at worker groups that no longer run. With no engine installed the wrapper delegates
+ * to the vanilla random again.
  */
 @ApiStatus.Internal
 public final class RegionAwareRandomSource implements RandomSource {
     private final RandomSource vanilla;
-    private final RegionThreadingEngine engine;
 
-    public RegionAwareRandomSource(RandomSource vanilla, RegionThreadingEngine engine) {
+    public RegionAwareRandomSource(RandomSource vanilla) {
         this.vanilla = vanilla;
-        this.engine = engine;
     }
 
     private RandomSource current() {
-        final RandomSource region = this.engine.currentRegionTickRandom();
-        return region != null ? region : this.vanilla;
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            final RandomSource group = engine.currentGroupRandom();
+            if (group != null) {
+                return group;
+            }
+        }
+        return this.vanilla;
     }
 
     @Override

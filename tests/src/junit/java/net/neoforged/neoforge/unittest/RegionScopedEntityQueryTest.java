@@ -273,6 +273,11 @@ class RegionScopedEntityQueryTest {
     private static ServerLevel mockLevel(PersistentEntitySectionManager<Entity> manager) {
         final ServerLevel level = mock(ServerLevel.class, CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
+        // The seed of an entity group random source is derived from the world seed, the game time and the
+        // dimension of its level.
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
+        doReturn(Level.OVERWORLD).when(level).dimension();
         doReturn("test-level").when(level).toString();
         doReturn(List.of()).when(level).getPartEntities();
         setField(ServerLevel.class, level, "entityManager", manager);

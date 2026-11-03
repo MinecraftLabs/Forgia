@@ -480,7 +480,7 @@ class RegionScheduledTickTest {
         this.installEngine(true);
         final RandomSource levelRandom = RandomSource.create(1234L);
         final RandomSource reference = RandomSource.create(1234L);
-        final ServerLevel level = mockLevel(new RegionAwareRandomSource(levelRandom, this.engine));
+        final ServerLevel level = mockLevel(new RegionAwareRandomSource(levelRandom));
         final LevelTicks<Block> ticks = newTicks();
         addContainer(ticks, 0, 0);
         addContainer(ticks, 16, 16);

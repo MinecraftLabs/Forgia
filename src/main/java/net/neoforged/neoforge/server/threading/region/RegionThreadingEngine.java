@@ -173,6 +173,13 @@ public final class RegionThreadingEngine implements RegionThreading {
     @Nullable
     private volatile BiConsumer<Entity, Throwable> entityTickFailureObserverForTesting;
     /**
+     * Random source of the entity tick group that executes on the current thread. It is installed once per
+     * group for the whole worker tick loop, so {@link #currentGroupRandom()} answers with it for every
+     * entity of the group and returns {@code null} again after the loop; the vanilla level random stays
+     * authoritative outside a batch.
+     */
+    private final ThreadLocal<RandomSource> currentEntityTickRandom = new ThreadLocal<>();
+    /**
      * Random source of the scheduled tick group that executes on the current thread. It is only set for
      * the duration of a worker group, so {@link #scheduledTickRandom()} returns {@code null} everywhere
      * else and the vanilla level random stays authoritative outside a batch.
@@ -914,6 +921,17 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * {@return true when the level tick of this engine ticks entities on region workers}
+     * <p>
+     * This is the configured request, not the effective dispatch: without region-owned entity storage
+     * {@link #beginEntityTickPlan} returns {@code null} and the vanilla inline entity tick runs instead.
+     */
+    @ApiStatus.Internal
+    public boolean isEntityTickWorkerExecutionEnabled() {
+        return this.entityTickWorkerExecutionEnabled;
+    }
+
+    /**
      * {@return true when scheduled block and fluid ticks execute on region workers}
      * <p>
      * This is the configured request, not the effective dispatch. Without an audited callback admission
@@ -1010,12 +1028,35 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * {@return the random source of the region tick group executing on the current thread, or
+     * {@return the random source of the region worker group executing on the current thread, or
      * {@code null} outside a worker group}
      * <p>
-     * Scheduled block/fluid ticks and random ticks both own a region random while they run. The level
-     * random wrapper uses this to redirect direct {@code level.random} reads of a worker to the random
-     * source of its group instead of the shared vanilla source.
+     * Entity, scheduled and random tick groups each own a random source while they run. The level random
+     * wrapper uses this to redirect direct {@code level.random} reads of a worker to the random source of
+     * its group instead of the shared vanilla source, which no two workers ever share because every group
+     * owns its own source.
+     */
+    @Nullable
+    public RandomSource currentGroupRandom() {
+        final RandomSource scheduled = this.currentScheduledTickRandom.get();
+        if (scheduled != null) {
+            return scheduled;
+        }
+        final RandomSource random = this.currentRandomTickRandom.get();
+        if (random != null) {
+            return random;
+        }
+        return this.currentEntityTickRandom.get();
+    }
+
+    /**
+     * {@return the random source of the block tick group executing on the current thread, or {@code null}
+     * outside a scheduled or random tick worker group}
+     * <p>
+     * This is the narrower question the block-entity access gate asks, because only a scheduled or random
+     * tick group opens that gate for the block entities of its region. An entity tick group owns a random
+     * source as well, but that one is resolved through {@link #currentGroupRandom()} and does not grant
+     * block-entity access.
      */
     @Nullable
     public RandomSource currentRegionTickRandom() {
@@ -1429,7 +1470,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Registers the worker group of a freshly leased region and releases the lease again when the group
      * cannot be built.
      * <p>
-     * Group creation runs arbitrary batch code (for example the per-group random seed draw), so a failure
+     * Group creation runs batch code (for example the creation of the per-group random source), so a failure
      * between {@link #acquireRegionLease} and {@link RegionTickBatch#addTask} must not leave the region
      * {@code TICKING}: shutdown and level unload would wait for a lease no worker owns anymore.
      */
@@ -1448,46 +1489,56 @@ public final class RegionThreadingEngine implements RegionThreading {
         final RegionCoordinate coordinate = region.coordinate();
         final List<Entity> entities = group.entities();
         final ServerLevel level = group.level();
+        final RandomSource random = group.random();
         return () -> {
             final long start = System.nanoTime();
             final int[] ticked = { 0 };
             try {
                 region.beginOwnership();
-                // The entity ownership lease covers exactly this worker tick loop: it is opened after the
-                // region lease and closed before it, so a worker task outside the loop never sees it.
-                final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
-                final BiConsumer<Entity, Throwable> failureObserver = this.entityTickFailureObserverForTesting;
+                // The group random is installed once for the whole worker tick loop, so every direct
+                // level.random read of an entity tick resolves this group's source through the level
+                // random wrapper instead of the shared vanilla one. The loop body itself writes no
+                // thread-local.
+                this.currentEntityTickRandom.set(random);
                 try {
-                    this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
-                        for (final Entity entity : entities) {
-                            if (failureObserver == null) {
+                    // The entity ownership lease covers exactly this worker tick loop: it is opened after the
+                    // region lease and closed before it, so a worker task outside the loop never sees it.
+                    final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    final BiConsumer<Entity, Throwable> failureObserver = this.entityTickFailureObserverForTesting;
+                    try {
+                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, group), () -> {
+                            for (final Entity entity : entities) {
+                                if (failureObserver == null) {
+                                    try {
+                                        if (tickOwnedEntity(level, entity)) {
+                                            ++ticked[0];
+                                        }
+                                    } catch (Throwable throwable) {
+                                        if (!handOffRefusedChunk(group, entity, throwable)) {
+                                            throw throwable;
+                                        }
+                                    }
+                                    continue;
+                                }
                                 try {
-                                    if (tickOwnedEntity(level, entity)) {
+                                    if (tickOwnedEntityForDiagnostics(level, entity)) {
                                         ++ticked[0];
                                     }
                                 } catch (Throwable throwable) {
-                                    if (!handOffRefusedChunk(group, entity, throwable)) {
-                                        throw throwable;
+                                    if (handOffRefusedChunk(group, entity, throwable)) {
+                                        continue;
                                     }
+                                    // Diagnostics only: the observer records the rejected operation and the group
+                                    // keeps ticking its remaining entities instead of aborting the batch.
+                                    failureObserver.accept(entity, throwable);
                                 }
-                                continue;
                             }
-                            try {
-                                if (tickOwnedEntityForDiagnostics(level, entity)) {
-                                    ++ticked[0];
-                                }
-                            } catch (Throwable throwable) {
-                                if (handOffRefusedChunk(group, entity, throwable)) {
-                                    continue;
-                                }
-                                // Diagnostics only: the observer records the rejected operation and the group
-                                // keeps ticking its remaining entities instead of aborting the batch.
-                                failureObserver.accept(entity, throwable);
-                            }
-                        }
-                    });
+                        });
+                    } finally {
+                        ownership.close();
+                    }
                 } finally {
-                    ownership.close();
+                    this.currentEntityTickRandom.remove();
                 }
             } finally {
                 region.endOwnership();

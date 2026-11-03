@@ -490,6 +490,11 @@ class RegionEntityOwnershipTest {
     private static ServerLevel mockLevel() {
         final ServerLevel level = mock(ServerLevel.class, org.mockito.Mockito.CALLS_REAL_METHODS);
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
+        // The seed of an entity group random source is derived from the world seed, the game time and the
+        // dimension of its level.
+        doReturn(1L).when(level).getSeed();
+        doReturn(0L).when(level).getGameTime();
+        doReturn(Level.OVERWORLD).when(level).dimension();
         // Region coordinates are part of worker task descriptions, which must not call into the level.
         doReturn("test-level").when(level).toString();
         // The target chunk acquisition of a deferred section update is server-owned storage.

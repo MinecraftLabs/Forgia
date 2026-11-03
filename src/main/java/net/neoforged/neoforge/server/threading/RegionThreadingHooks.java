@@ -555,14 +555,17 @@ public final class RegionThreadingHooks {
     }
 
     /**
-     * Wraps the level random so region tick workers draw from their region random instead of the shared
-     * level random. When no region worker slice is enabled, the vanilla random is returned unchanged.
+     * Wraps the level random so region workers draw from the random source of their group instead of the
+     * shared level random. When no worker slice that can read {@code level.random} is enabled, the vanilla
+     * random is returned unchanged.
      */
     public static RandomSource wrapLevelRandom(RandomSource vanilla) {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         if (threading instanceof RegionThreadingEngine engine
-                && (engine.isScheduledTickWorkerExecutionEnabled() || engine.isRandomTickWorkerExecutionEnabled())) {
-            return new RegionAwareRandomSource(vanilla, engine);
+                && (engine.isEntityTickWorkerExecutionEnabled()
+                        || engine.isScheduledTickWorkerExecutionEnabled()
+                        || engine.isRandomTickWorkerExecutionEnabled())) {
+            return new RegionAwareRandomSource(vanilla);
         }
         return vanilla;
     }
