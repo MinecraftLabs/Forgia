@@ -5,17 +5,23 @@
 
 package net.neoforged.neoforge.debug.level;
 
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -47,6 +53,7 @@ import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
@@ -89,10 +96,12 @@ import net.neoforged.testframework.gametest.ExtendedGameTestHelper;
  * entity storage on the server thread), so this workload measures the region threading overhead on a
  * server-thread-bound entity load and checks the entity section invariants, not a speedup.
  * <p>
- * The tests only measure: they pass as long as the workload ran and never assert a duration. A run without
+ * The tests only measure: they pass as long as the workload ran and never assert a duration. The one
+ * exception is the soak test, which asserts the end-state invariants of its window and therefore fails the
+ * batch when the entity worker path left a batch, a mapping or a ledger entry behind. A run without
  * the {@value #ENABLED_PROPERTY} system property does no work, so the normal GameTest batches stay as fast
  * as before; the measurement script sets it through {@code -PserverBenchmark=true} and greps the
- * {@code SERVER_BENCH_} lines from the log.
+ * {@code SERVER_BENCH_} and {@code SERVER_SOAK_} lines from the log.
  */
 @ForEachTest(groups = "level.serverbench")
 public class ServerLoadBenchmarkGameTests {
@@ -173,11 +182,46 @@ public class ServerLoadBenchmarkGameTests {
      * worker measurement; the reference run sets it to {@code false}.
      */
     static final String ENTITY_WORKER_TICKS_PROPERTY = "neoforge.serverBenchmarkEntityWorkerTicks";
+    /**
+     * System property that sets the measured window of the entity worker soak, in ticks. The soak is the only
+     * workload with a window longer than the {@value #MEASURED_TICKS} ticks of the profiling workloads, so it
+     * reads its own length instead of the shared constant.
+     */
+    static final String TICKS_PROPERTY = "neoforge.serverBenchmarkTicks";
+    /** Measured ticks of the soak window unless {@value #TICKS_PROPERTY} overrides it. */
+    private static final int SOAK_MEASURED_TICKS = 3000;
+    /**
+     * Trailing ticks of the soak window that the drift comparison reports next to the first half, i.e. the
+     * window the profiling workloads measure, so a soak row is comparable with their rows.
+     */
+    private static final int SOAK_DRIFT_TICKS = 600;
+    /**
+     * Annotated tick timeout of the soak batch. The window has to fit into it with one tick of slack, which
+     * the test asserts, so a misconfigured {@value #TICKS_PROPERTY} fails instead of timing the batch out.
+     */
+    private static final int SOAK_TIMEOUT_TICKS = 6000;
+    /**
+     * Zombies of the soak population when {@value #ZOMBIE_COUNT_PROPERTY} is unset. The soak is the only
+     * workload that runs at a population large enough to keep four workers busy for minutes.
+     */
+    private static final int SOAK_ZOMBIE_COUNT = 1024;
+    /**
+     * Zombies the soak kills every {@value #DEATH_INTERVAL_TICKS} ticks when {@value #ZOMBIE_DEATHS_PROPERTY}
+     * is unset. Vanilla never removes the loot of a death inside the window, so every death adds entities to
+     * the level: the rate stays low enough for the population to stay roughly constant over the window.
+     */
+    private static final int SOAK_ZOMBIE_DEATHS = 1;
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
     static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
+    static final String SOAK_MSPT_HEADER = "profile,zombies,measuredTicks,window,samples,msptAvg,msptP50,msptP95,msptP99";
+    static final String SOAK_DRIFT_HEADER = "profile,firstHalfAvgMs,lastAvgMs,driftRatio,driftPercent,firstHalfP99Ms,lastP99Ms";
+    static final String SOAK_COUNTER_HEADER = "profile,counter,before,after,delta,perTick";
+    static final String SOAK_STRUCT_HEADER = "point,measuredTick,heapUsedMiB,heapCommittedMiB,heapMaxMiB,gcCollections,gcMillis,regionCount,runningRegions,trackedEntities,trackedEntityTasks,sections,loadedChunks,pendingDeferredMoves,pendingTransfers,rememberedTransfers,activeBatches";
+    static final String SOAK_TICK_HEADER = "ticksChecked,ticksWithActiveBatches,maxActiveBatches";
+    static final String SOAK_INVARIANT_HEADER = "check,observed,expected,ok";
 
     @GameTest(batch = "benchmarkFurnace", timeoutTicks = 2000)
     @EmptyTemplate(value = "15x10x15", floor = true)
@@ -363,8 +407,8 @@ public class ServerLoadBenchmarkGameTests {
                         // Zombies burn in daylight, so the window runs at night like the entity workload.
                         daylight.set(false, level.getServer());
                         level.setDayTime(18000L);
-                        mobLoot.set(entityWorkerZombieLoot(), level.getServer());
-                        spawnZombies(level, grid, origin, zombies, helper);
+                        mobLoot.set(zombieLootEnabled(), level.getServer());
+                        spawnZombies(level, grid, origin, zombies, helper, entityWorkerZombieCount());
                     })
                     .thenExecute(() -> {
                         replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()).orElse(null));
@@ -391,6 +435,129 @@ public class ServerLoadBenchmarkGameTests {
                         reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), zombies, blockers, deathDriver, grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    /**
+     * Soaks the entity worker path: a zombie population large enough to keep four workers busy, churned by
+     * deaths, respawns and the loot of the deaths, for a window of {@value #SOAK_MEASURED_TICKS} measured
+     * ticks after {@value #WARMUP_TICKS} warmup ticks.
+     * <p>
+     * The diagnostic engine of the worker profile is installed before the grid of this test is loaded, so the
+     * chunk load, the spawn of the population and every measured tick of the window run on the engine under
+     * test. The window also runs with the level random already wrapped for region workers, because the server
+     * config requests the entity tick slice at server start and {@code RegionThreadingHooks.wrapLevelRandom}
+     * decides the wrapper when the level is created; a mid-window swap cannot recreate it. A run without an
+     * installed engine (region threading off) ticks the same workload inline on the server thread and reports
+     * the server-thread reference row of the mspt context.
+     * <p>
+     * The workload is a {@link ZombieDeathDriver} that kills {@value #SOAK_ZOMBIE_DEATHS} zombie every
+     * {@value #DEATH_INTERVAL_TICKS} ticks from inside its own tick and replaces a dead or dying zombie at
+     * the same position, so the population stays roughly constant while the death loot, the deferred removal
+     * of the dying entity and the deferred admission of the loot keep running through the batch barrier. The
+     * loot rule stays on; the death rate is deliberately low because vanilla never removes the loot of a
+     * death inside the window, so a high rate would grow the level by more entities than the window measures.
+     * <p>
+     * The report covers the mspt of the whole window, of its first half and of its last
+     * {@value #SOAK_DRIFT_TICKS} ticks, every {@link RegionThreadingDiagnostics} counter of the window, and
+     * an after-GC heap and engine structure sample at the start, the middle and the end. The end-state
+     * invariants are asserted after the report was printed: no tick leaves an active batch behind, no
+     * deferred ownership update or transfer stays queued, the regionizer mapping of every tracked entity
+     * names the region of its block position, no removed entity stays mapped, every live entity sits in the
+     * section of its position, the identity ledger live count matches the live entity count of the level, and
+     * the window produced no entity tick failure and no ownership violation.
+     */
+    @GameTest(batch = "benchmarkEntitySoak", timeoutTicks = SOAK_TIMEOUT_TICKS)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Soaks the entity worker path with a large zombie population, deaths, respawn and loot; only runs when neoforge.serverBenchmark is set")
+    static void soaksEntityTicksOnRegionWorkers(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_SOAK_NOTE skipped entity worker soak: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final int measuredTicks = soakMeasuredTicks();
+            final int zombieCount = soakZombieCount();
+            helper.assertTrue(measuredTicks > 0 && WARMUP_TICKS + measuredTicks + 1 <= SOAK_TIMEOUT_TICKS,
+                    "the soak window of " + measuredTicks + " measured ticks does not fit into the batch timeout of " + SOAK_TIMEOUT_TICKS + " ticks");
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = gridChunks(origin);
+            final List<Zombie> zombies = new ArrayList<>(zombieCount);
+            final ZombieDeathDriver deathDriver = new ZombieDeathDriver(level, zombies, soakZombieDeaths());
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, measuredTicks, deathDriver);
+            final SoakWatch watch = new SoakWatch();
+            final EntityWorkerBlockers blockers = new EntityWorkerBlockers();
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicReference<InstalledEngine> replaced = new AtomicReference<>();
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            final GameRules.BooleanValue daylight = level.getGameRules().getRule(GameRules.RULE_DAYLIGHT);
+            final boolean previousDaylight = daylight.get();
+            final GameRules.BooleanValue mobLoot = level.getGameRules().getRule(GameRules.RULE_DOMOBLOOT);
+            final boolean previousMobLoot = mobLoot.get();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    NeoForge.EVENT_BUS.unregister(deathDriver);
+                    NeoForge.EVENT_BUS.unregister(watch);
+                    cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> {
+                        // The engine of the soak is installed before any of the workload exists, so the chunk
+                        // load, every spawn and every measured tick of the window run on the engine under test.
+                        replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()).orElse(null));
+                        watch.install();
+                        forceChunks(level, grid, ENTITY_TICKING_TICKET_RADIUS);
+                    })
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the soak chunk grid never finished its entity load"))
+                    .thenExecute(() -> {
+                        // Zombies burn in daylight, so the window runs at night like the entity workload.
+                        daylight.set(false, level.getServer());
+                        level.setDayTime(18000L);
+                        mobLoot.set(zombieLootEnabled(), level.getServer());
+                        spawnZombies(level, grid, origin, zombies, helper, zombieCount);
+                    })
+                    .thenExecute(() -> {
+                        watch.startWindow(measuredTicks);
+                        // The counters of the window start when the warmup ends, so every reported delta
+                        // belongs to the measured ticks and to the load those ticks carry.
+                        sampler.onMeasuredWindowStart(() -> {
+                            deathDriver.markMeasuredWindowStart();
+                            before.set(RegionThreadingHooks.diagnostics());
+                        });
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(watch);
+                        NeoForge.EVENT_BUS.register(sampler);
+                        // The death driver hurts a zombie from inside its own tick, so it has to be a bus
+                        // listener: the entity tick of a worker profile runs on the region worker.
+                        NeoForge.EVENT_BUS.register(deathDriver);
+                    })
+                    // The middle sample splits the window in half, so the heap and the engine structures are
+                    // observed at the start, the middle and the end of the measured ticks.
+                    .thenIdle(WARMUP_TICKS + measuredTicks / 2 + 1)
+                    .thenExecute(watch::sampleMiddle)
+                    .thenIdle(measuredTicks - measuredTicks / 2)
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        NeoForge.EVENT_BUS.unregister(deathDriver);
+                        NeoForge.EVENT_BUS.unregister(watch);
+                        final List<Invariant> invariants = reportSoak(helper, new SoakWindow(level, sampler, watch, before.get(), blockers, deathDriver, zombies, grid, zombieCount, measuredTicks));
+                        if (cleaned.compareAndSet(false, true)) {
+                            cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
+                        }
+                        // The report is printed before the invariants fail the batch, so a broken soak always
+                        // leaves its evidence in the log.
+                        for (Invariant invariant : invariants) {
+                            helper.assertTrue(invariant.ok(), "soak invariant " + invariant.name() + " expected " + invariant.expected() + " but observed " + invariant.observed());
                         }
                     })
                     .thenSucceed();
@@ -469,9 +636,33 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
-     * {@return false when {@value #ZOMBIE_LOOT_PROPERTY} turns the mob loot rule off for the window}
+     * {@return the measured ticks of the soak window, {@value #SOAK_MEASURED_TICKS} unless
+     * {@value #TICKS_PROPERTY} overrides it}
      */
-    private static boolean entityWorkerZombieLoot() {
+    private static int soakMeasuredTicks() {
+        return intProperty(TICKS_PROPERTY, SOAK_MEASURED_TICKS);
+    }
+
+    /**
+     * {@return the zombie population of the soak workload, {@value #SOAK_ZOMBIE_COUNT} unless
+     * {@value #ZOMBIE_COUNT_PROPERTY} overrides it}
+     */
+    private static int soakZombieCount() {
+        return intProperty(ZOMBIE_COUNT_PROPERTY, SOAK_ZOMBIE_COUNT);
+    }
+
+    /**
+     * {@return the number of zombies the soak kills every {@value #DEATH_INTERVAL_TICKS} ticks,
+     * {@value #SOAK_ZOMBIE_DEATHS} unless {@value #ZOMBIE_DEATHS_PROPERTY} overrides it}
+     */
+    private static int soakZombieDeaths() {
+        return intProperty(ZOMBIE_DEATHS_PROPERTY, SOAK_ZOMBIE_DEATHS);
+    }
+
+    /**
+     * {@return false when {@value #ZOMBIE_LOOT_PROPERTY} turns the mob loot rule off for a window}
+     */
+    private static boolean zombieLootEnabled() {
         final String configured = System.getProperty(ZOMBIE_LOOT_PROPERTY);
         return configured == null || configured.isBlank() || Boolean.parseBoolean(configured.trim());
     }
@@ -758,18 +949,17 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
-     * Spawns the zombie population of the entity worker diagnostics workload, spread over the grid.
+     * Spawns {@code count} zombies of the entity workload, spread over the grid.
      * <p>
      * The zombies keep their vanilla AI and carry nothing, so the measured operations are the ones a plain
      * {@code Zombie.tick} reaches: despawn, collisions, pathfinding, target selection and movement.
      */
-    private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Zombie> zombies, ExtendedGameTestHelper helper) {
+    private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Zombie> zombies, ExtendedGameTestHelper helper, int count) {
         final RandomSource random = RandomSource.create(0x5EED5EEDL);
-        final int count = entityWorkerZombieCount();
         for (int index = 0; index < count; index++) {
             final ChunkPos chunk = grid.get(index % grid.size());
             final Zombie zombie = newZombie(level, new BlockPos(chunk.getMinBlockX() + 8, origin.getY() + 2, chunk.getMinBlockZ() + 8), random);
-            helper.assertTrue(level.addFreshEntity(zombie), "the entity worker diagnostics could not spawn a benchmark zombie");
+            helper.assertTrue(level.addFreshEntity(zombie), "the entity workload could not spawn a benchmark zombie");
             zombies.add(zombie);
         }
     }
@@ -1100,6 +1290,419 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /**
+     * Prints the soak report of {@code window} and {@return the end-state invariants it observed}
+     * <p>
+     * The report is printed before the caller asserts the invariants, so a broken soak always leaves its
+     * evidence in the log. The mspt rows are the whole measured window, its first half and its last
+     * {@value #SOAK_DRIFT_TICKS} ticks: the last window is the one the profiling workloads measure, and the
+     * first half against it is the drift comparison. The struct rows are the after-GC heap and the engine
+     * structures at the start, the middle and the end of the window, so a growth that the live population
+     * cannot explain is visible next to the population of the same sample.
+     */
+    private static List<Invariant> reportSoak(ExtendedGameTestHelper helper, SoakWindow window) {
+        final long[] samples = window.sampler().samplesInOrder();
+        helper.assertTrue(samples.length > 0, "the soak tick sampler recorded no server tick");
+        final ServerLevel level = window.level();
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final int measuredTicks = window.measuredTicks();
+        final int lastCount = Math.min(SOAK_DRIFT_TICKS, samples.length);
+        final TickStats whole = TickStats.of("whole", samples);
+        final TickStats firstHalf = TickStats.of("firstHalf", Arrays.copyOfRange(samples, 0, samples.length / 2));
+        final TickStats last = TickStats.of("last" + lastCount, Arrays.copyOfRange(samples, samples.length - lastCount, samples.length));
+        window.watch().sampleEnd();
+
+        System.out.println(window.sampler().note(profile, after)
+                + " soakZombies=" + window.zombieCount()
+                + " zombieSurvivors=" + aliveZombies(window.zombies())
+                + " zombieDeaths=" + window.deathDriver().deathsInWindow()
+                + " zombieReplacements=" + window.deathDriver().replacementsInWindow()
+                + " entityTickFailures=" + window.blockers().failureCount()
+                + " zombiesOutsideGrid=" + zombiesOutsideGrid(window.grid(), window.zombies())
+                + " liveEntities=" + liveLevelEntities(level).size());
+        System.out.println("SERVER_SOAK_MSPT_HEADER " + SOAK_MSPT_HEADER);
+        for (TickStats stats : List.of(whole, firstHalf, last)) {
+            System.out.println("SERVER_SOAK_MSPT " + csv(profile, window.zombieCount(), measuredTicks, stats.window(), stats.samples(),
+                    fixed(stats.avgMs()), fixed(stats.p50Ms()), fixed(stats.p95Ms()), fixed(stats.p99Ms())));
+        }
+        final double driftRatio = firstHalf.avgMs() <= 0.0 ? -1.0 : last.avgMs() / firstHalf.avgMs();
+        System.out.println("SERVER_SOAK_DRIFT_HEADER " + SOAK_DRIFT_HEADER);
+        System.out.println("SERVER_SOAK_DRIFT " + csv(profile, fixed(firstHalf.avgMs()), fixed(last.avgMs()), fixed(driftRatio),
+                fixed((driftRatio - 1.0) * 100.0), fixed(firstHalf.p99Ms()), fixed(last.p99Ms())));
+        if (after.isPresent()) {
+            printSoakCounters(profile, window.before(), after, measuredTicks);
+        } else {
+            System.out.println("SERVER_SOAK_COUNTER_NOTE no region threading engine is installed in this profile: the reference row reports server tick time only");
+        }
+        System.out.println("SERVER_SOAK_STRUCT_HEADER " + SOAK_STRUCT_HEADER);
+        for (SoakSample sample : window.watch().samples()) {
+            System.out.println("SERVER_SOAK_STRUCT " + csv(sample.point(), sample.measuredTick(),
+                    fixed(sample.heapUsedBytes() / 1048576.0), fixed(sample.heapCommittedBytes() / 1048576.0), fixed(sample.heapMaxBytes() / 1048576.0),
+                    sample.gcCollections(), sample.gcMillis(), sample.regionCount(), sample.runningRegions(), sample.trackedEntities(),
+                    sample.trackedEntityTasks(), sample.sections(), sample.loadedChunks(), sample.pendingDeferredMoves(),
+                    sample.pendingTransfers(), sample.rememberedTransfers(), sample.activeBatches()));
+        }
+        System.out.println("SERVER_SOAK_TICK_HEADER " + SOAK_TICK_HEADER);
+        System.out.println("SERVER_SOAK_TICK " + csv(window.watch().ticksChecked(), window.watch().ticksWithActiveBatches(), window.watch().maxActiveBatches()));
+
+        final List<Invariant> invariants = new ArrayList<>();
+        if (window.watch().engineState() == null || after.isEmpty()) {
+            System.out.println("SERVER_SOAK_INVARIANT_NOTE no region threading engine is installed in this profile: the end-state invariants need the engine of the worker profile");
+            return invariants;
+        }
+        final RegionThreadingDiagnostics engine = after.get();
+        final RegionMappingCheck mapping = window.watch().engineState().checkRegionMapping(level, RegionLayout.of(engine.regionPolicy(), engine.regionChunkSize()));
+        final List<Entity> liveEntities = liveLevelEntities(level);
+        final int sectionMismatches = regionMismatches(level, liveEntities);
+        final int ledgerLive = level.entityIdentityLedger().liveCount();
+        final SoakSample end = window.watch().samples().get(window.watch().samples().size() - 1);
+        invariants.add(Invariant.of("activeBatchesAfterEveryTick", window.watch().ticksWithActiveBatches(), 0));
+        invariants.add(Invariant.of("pendingDeferredEntityMoves", end.pendingDeferredMoves(), 0));
+        invariants.add(Invariant.of("pendingEntityTransfers", end.pendingTransfers(), 0));
+        invariants.add(Invariant.of("regionMappingMatchesPosition", mapping.misplacedMappings(), 0));
+        invariants.add(Invariant.of("staleRegionMappings", mapping.staleMappings(), 0));
+        invariants.add(Invariant.of("sectionMembershipMatchesPosition", sectionMismatches, 0));
+        invariants.add(Invariant.of("identityLedgerLiveCountMatchesLevel", ledgerLive, liveEntities.size()));
+        invariants.add(Invariant.of("entityTickFailures", window.blockers().failureCount(), 0));
+        invariants.add(Invariant.of("ownershipViolations", delta(window.before(), after, RegionThreadingDiagnostics::ownershipViolationCount), 0));
+        System.out.println("SERVER_SOAK_MAPPING_HEADER mappedEntities,staleMappings,misplacedMappings,unmappedLiveEntities");
+        System.out.println("SERVER_SOAK_MAPPING " + csv(mapping.mappedEntities(), mapping.staleMappings(), mapping.misplacedMappings(), mapping.unmappedLiveEntities()));
+        System.out.println("SERVER_SOAK_INVARIANT_HEADER " + SOAK_INVARIANT_HEADER);
+        for (Invariant invariant : invariants) {
+            System.out.println("SERVER_SOAK_INVARIANT " + csv(invariant.name(), invariant.observed(), invariant.expected(), invariant.ok()));
+        }
+        if (!"-".equals(mapping.firstProblem())) {
+            System.out.println("SERVER_SOAK_INVARIANT_DETAIL regionMapping " + mapping.firstProblem());
+        }
+        window.blockers().printBlockers();
+        return invariants;
+    }
+
+    /**
+     * Prints every {@link RegionThreadingDiagnostics} field of the measured window as one row: its value
+     * before the window, its value after it, the delta and the delta per measured tick. A field that is not
+     * a number reports no delta, because it is state and not work.
+     */
+    private static void printSoakCounters(String profile, Optional<RegionThreadingDiagnostics> before, Optional<RegionThreadingDiagnostics> after, int measuredTicks) {
+        System.out.println("SERVER_SOAK_COUNTER_HEADER " + SOAK_COUNTER_HEADER);
+        for (RecordComponent component : RegionThreadingDiagnostics.class.getRecordComponents()) {
+            final Object beforeValue = before.map(value -> counterValue(component, value)).orElse(null);
+            final Object afterValue = after.map(value -> counterValue(component, value)).orElse(null);
+            final boolean numeric = beforeValue instanceof Number && afterValue instanceof Number;
+            final long delta = numeric ? ((Number) afterValue).longValue() - ((Number) beforeValue).longValue() : 0L;
+            System.out.println("SERVER_SOAK_COUNTER " + csv(profile, component.getName(), beforeValue, afterValue,
+                    numeric ? Long.toString(delta) : "-", numeric && measuredTicks > 0 ? fixed(delta / (double) measuredTicks) : "-"));
+        }
+    }
+
+    private static Object counterValue(RecordComponent component, RegionThreadingDiagnostics diagnostics) {
+        try {
+            return component.getAccessor().invoke(diagnostics);
+        } catch (ReflectiveOperationException exception) {
+            throw new AssertionError("cannot read the diagnostics counter " + component.getName(), exception);
+        }
+    }
+
+    /**
+     * Watches the two things a soak has to observe continuously: the tick batches a finished tick must never
+     * leave behind, and the after-GC heap and engine structures at the start, the middle and the end of the
+     * window.
+     * <p>
+     * The per-tick check runs from {@link ServerTickEvent.Post}, i.e. after the tick body and therefore after
+     * every batch of the tick completed. It only reads the size of the engine's active batch set, so the
+     * watched ticks stay within the noise of the measurement.
+     */
+    private static final class SoakWatch {
+        private final List<SoakSample> samples = new ArrayList<>(3);
+        private SoakEngineState engineState;
+        private int measuredTicks;
+        private int ticksChecked;
+        private int ticksWithActiveBatches;
+        private int maxActiveBatches;
+
+        /**
+         * Resolves the engine of the window, or nothing when this profile runs no engine at all.
+         */
+        void install() {
+            this.engineState = RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine installed ? SoakEngineState.of(installed) : null;
+        }
+
+        void startWindow(int measuredTicks) {
+            this.measuredTicks = measuredTicks;
+            this.samples.add(this.sample("start", 0));
+        }
+
+        void sampleMiddle() {
+            this.samples.add(this.sample("middle", this.measuredTicks / 2));
+        }
+
+        SoakSample sampleEnd() {
+            final SoakSample end = this.sample("end", this.measuredTicks);
+            this.samples.add(end);
+            return end;
+        }
+
+        @SubscribeEvent
+        public void onTickPost(ServerTickEvent.Post event) {
+            if (this.engineState == null) {
+                return;
+            }
+            final int active = this.engineState.activeBatchCount();
+            this.ticksChecked++;
+            if (active > 0) {
+                this.ticksWithActiveBatches++;
+                this.maxActiveBatches = Math.max(this.maxActiveBatches, active);
+            }
+        }
+
+        List<SoakSample> samples() {
+            return this.samples;
+        }
+
+        SoakEngineState engineState() {
+            return this.engineState;
+        }
+
+        int ticksChecked() {
+            return this.ticksChecked;
+        }
+
+        int ticksWithActiveBatches() {
+            return this.ticksWithActiveBatches;
+        }
+
+        int maxActiveBatches() {
+            return this.maxActiveBatches;
+        }
+
+        private SoakSample sample(String point, int measuredTick) {
+            final Runtime runtime = Runtime.getRuntime();
+            // An after-GC sample is the only heap number the shared test JVM reports without a profiler.
+            System.gc();
+            final long used = runtime.totalMemory() - runtime.freeMemory();
+            final long committed = runtime.totalMemory();
+            final long max = runtime.maxMemory();
+            long gcCollections = 0L;
+            long gcMillis = 0L;
+            for (GarbageCollectorMXBean collector : ManagementFactory.getGarbageCollectorMXBeans()) {
+                gcCollections += Math.max(0L, collector.getCollectionCount());
+                gcMillis += Math.max(0L, collector.getCollectionTime());
+            }
+            final Optional<RegionThreadingDiagnostics> diagnostics = RegionThreadingHooks.diagnostics();
+            final SoakEngineState state = this.engineState;
+            if (diagnostics.isEmpty() || state == null) {
+                return new SoakSample(point, measuredTick, used, committed, max, gcCollections, gcMillis, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+            }
+            final RegionThreadingDiagnostics value = diagnostics.get();
+            return new SoakSample(point, measuredTick, used, committed, max, gcCollections, gcMillis,
+                    value.regionCount(), value.runningRegionCount(), value.trackedEntityCount(), value.trackedEntityTaskCount(),
+                    value.sectionCount(), value.loadedChunkCount(), state.pendingDeferredMoveCount(),
+                    value.pendingEntityTransferCount(), value.rememberedEntityTransferResultCount(), state.activeBatchCount());
+        }
+    }
+
+    /**
+     * The engine state a soak watches that no diagnostics field exposes: the tick batches that are still
+     * active, the deferred ownership updates that are still queued and the regionizer mapping of every
+     * tracked entity.
+     * <p>
+     * Every read is a test-only reflective read of private engine state, like the reflective reads of the
+     * other harnesses; the production engine is untouched.
+     */
+    private static final class SoakEngineState {
+        private final RegionThreadingEngine engine;
+        private final Field regionizer;
+        private final Field regionizerEntities;
+        private final Field regionStateCoordinate;
+        private final Field activeTickBatches;
+        private final Field pendingDeferredEntityMoves;
+
+        static SoakEngineState of(RegionThreadingEngine engine) {
+            return new SoakEngineState(engine);
+        }
+
+        private SoakEngineState(RegionThreadingEngine engine) {
+            this.engine = engine;
+            this.regionizer = declaredField(RegionThreadingEngine.class, "regionizer");
+            this.regionizerEntities = declaredField(this.regionizer.getType(), "entities");
+            this.regionStateCoordinate = declaredField(regionStateClass(), "coordinate");
+            this.activeTickBatches = declaredField(RegionThreadingEngine.class, "activeTickBatches");
+            this.pendingDeferredEntityMoves = declaredField(RegionThreadingEngine.class, "pendingDeferredEntityMoves");
+        }
+
+        int activeBatchCount() {
+            return ((Collection<?>) fieldValue(this.activeTickBatches, this.engine)).size();
+        }
+
+        int pendingDeferredMoveCount() {
+            return ((Collection<?>) fieldValue(this.pendingDeferredEntityMoves, this.engine)).size();
+        }
+
+        /**
+         * {@return the state of the regionizer entity mapping of {@code level}}
+         * <p>
+         * A mapping is misplaced when the region it names is not the region of the block position of its
+         * entity, which is what a lost or stale ownership handoff leaves behind. A stale mapping names an
+         * entity that is already removed, i.e. an ownership entry the removal did not retire. An unmapped
+         * live entity is a level entity the regionizer never learned about.
+         */
+        RegionMappingCheck checkRegionMapping(ServerLevel level, RegionLayout layout) {
+            final Map<?, ?> mapping = (Map<?, ?>) fieldValue(this.regionizerEntities, fieldValue(this.regionizer, this.engine));
+            int stale = 0;
+            int misplaced = 0;
+            String firstProblem = "-";
+            for (Map.Entry<?, ?> entry : mapping.entrySet()) {
+                final Entity entity = (Entity) entry.getKey();
+                if (entity.isRemoved()) {
+                    stale++;
+                    if ("-".equals(firstProblem)) {
+                        firstProblem = "removed entity still mapped at " + entity.blockPosition();
+                    }
+                    continue;
+                }
+                final RegionCoordinate mapped = (RegionCoordinate) fieldValue(this.regionStateCoordinate, entry.getValue());
+                final RegionCoordinate expected = layout.regionAt(level, entity.blockPosition());
+                if (mapped.regionX() != expected.regionX() || mapped.regionZ() != expected.regionZ()) {
+                    misplaced++;
+                    if ("-".equals(firstProblem)) {
+                        firstProblem = entity.blockPosition() + " mapped to " + mapped.regionX() + "/" + mapped.regionZ()
+                                + " but belongs to " + expected.regionX() + "/" + expected.regionZ();
+                    }
+                }
+            }
+            int unmapped = 0;
+            for (Entity entity : liveLevelEntities(level)) {
+                if (!mapping.containsKey(entity)) {
+                    unmapped++;
+                }
+            }
+            return new RegionMappingCheck(mapping.size(), stale, misplaced, unmapped, firstProblem);
+        }
+
+        private static Class<?> regionStateClass() {
+            try {
+                return Class.forName("net.neoforged.neoforge.server.threading.region.RegionState");
+            } catch (ClassNotFoundException exception) {
+                throw new AssertionError("the regionizer state class of the entity mapping is gone", exception);
+            }
+        }
+    }
+
+    /**
+     * {@return the state of the regionizer entity mapping at the end of a soak window}
+     *
+     * @param mappedEntities       ownership entries of the regionizer
+     * @param staleMappings        entries that name an entity which is already removed
+     * @param misplacedMappings    entries whose region is not the region of the entity's block position
+     * @param unmappedLiveEntities live level entities the mapping does not name
+     * @param firstProblem         the first problem in words, or {@code -} when there is none
+     */
+    private record RegionMappingCheck(int mappedEntities, int staleMappings, int misplacedMappings, int unmappedLiveEntities, String firstProblem) {}
+
+    /**
+     * The measured ticks of one soak window and the workload that produced them.
+     */
+    private record SoakWindow(ServerLevel level, TickSampler sampler, SoakWatch watch, Optional<RegionThreadingDiagnostics> before, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, List<Zombie> zombies, List<ChunkPos> grid, int zombieCount, int measuredTicks) {}
+
+    /**
+     * The mspt statistics of one subset of the measured ticks of a soak window.
+     */
+    private record TickStats(String window, int samples, double avgMs, double p50Ms, double p95Ms, double p99Ms) {
+        static TickStats of(String window, long[] nanos) {
+            final long[] sorted = nanos.clone();
+            Arrays.sort(sorted);
+            return new TickStats(window, sorted.length, averageMillis(sorted), percentileMillis(sorted, 0.50), percentileMillis(sorted, 0.95), percentileMillis(sorted, 0.99));
+        }
+    }
+
+    /**
+     * One after-GC heap and engine structure sample of a soak window. The engine fields are {@code -1} when
+     * the profile runs no engine.
+     */
+    private record SoakSample(String point, int measuredTick, long heapUsedBytes, long heapCommittedBytes, long heapMaxBytes, long gcCollections, long gcMillis, int regionCount, int runningRegions, int trackedEntities, int trackedEntityTasks, int sections, int loadedChunks, int pendingDeferredMoves, int pendingTransfers, int rememberedTransfers, int activeBatches) {}
+
+    /**
+     * One end-state check of a soak window: what it observed, what it expected and whether it held.
+     */
+    private record Invariant(String name, String observed, String expected, boolean ok) {
+        static Invariant of(String name, long observed, long expected) {
+            return new Invariant(name, Long.toString(observed), Long.toString(expected), observed == expected);
+        }
+    }
+
+    /** {@return the comma separated report line of {@code values}, with {@code -} for an absent value} */
+    private static String csv(Object... values) {
+        final StringJoiner joiner = new StringJoiner(",");
+        for (Object value : values) {
+            joiner.add(value == null ? "-" : String.valueOf(value));
+        }
+        return joiner.toString();
+    }
+
+    /** {@return {@code value} with a fixed number of decimals, so a report line stays locale independent} */
+    private static String fixed(double value) {
+        return String.format(Locale.ROOT, "%.3f", value);
+    }
+
+    /** {@return the live zombie population of {@code zombies}} */
+    private static int aliveZombies(List<Zombie> zombies) {
+        int alive = 0;
+        for (Zombie zombie : zombies) {
+            if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+                alive++;
+            }
+        }
+        return alive;
+    }
+
+    /** {@return the tracked zombies whose chunk is not one of the force-ticked chunks of {@code grid}} */
+    private static int zombiesOutsideGrid(List<ChunkPos> grid, List<Zombie> zombies) {
+        final Set<Long> chunks = new HashSet<>(grid.size());
+        for (ChunkPos chunk : grid) {
+            chunks.add(chunk.toLong());
+        }
+        int outside = 0;
+        for (Zombie zombie : zombies) {
+            if (zombie.isRemoved() || zombie.isDeadOrDying()) {
+                continue;
+            }
+            if (!chunks.contains(ChunkPos.asLong(zombie.blockPosition()))) {
+                outside++;
+            }
+        }
+        return outside;
+    }
+
+    /** {@return the live entities the level exposes to its entity getter} */
+    private static List<Entity> liveLevelEntities(ServerLevel level) {
+        final List<Entity> entities = new ArrayList<>();
+        for (Entity entity : level.getEntities().getAll()) {
+            if (!entity.isRemoved()) {
+                entities.add(entity);
+            }
+        }
+        return entities;
+    }
+
+    private static Field declaredField(Class<?> type, String name) {
+        try {
+            final Field field = type.getDeclaredField(name);
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException exception) {
+            throw new AssertionError("cannot read " + type.getName() + "." + name, exception);
+        }
+    }
+
+    private static Object fieldValue(Field field, Object target) {
+        try {
+            return field.get(target);
+        } catch (IllegalAccessException exception) {
+            throw new AssertionError("cannot read " + field, exception);
+        }
+    }
+
+    /**
      * {@return the entity tick mode of the measured window, so a worker row and its server-thread reference
      * row are distinguishable in the CSV}
      * <p>
@@ -1357,6 +1960,16 @@ public class ServerLoadBenchmarkGameTests {
             return copy;
         }
 
+        /**
+         * {@return the recorded samples in the order the ticks completed}
+         * <p>
+         * The report of a soak window splits this order into a first and a trailing window, so the drift of
+         * the window is comparable over time; the sorted samples cannot answer that.
+         */
+        long[] samplesInOrder() {
+            return Arrays.copyOf(this.samples, this.sampleCount);
+        }
+
         int sampleCount() {
             return this.sampleCount;
         }
@@ -1373,7 +1986,7 @@ public class ServerLoadBenchmarkGameTests {
             final double tickMillis = windowNanos <= 0L || this.sampleCount == 0 ? -1.0 : windowNanos / 1_000_000.0 / this.sampleCount;
             return "SERVER_BENCH_NOTE profile=" + profile
                     + " warmupTicks=" + this.warmupTicks
-                    + " measuredTicks=" + MEASURED_TICKS
+                    + " measuredTicks=" + this.samples.length
                     + " samples=" + this.sampleCount
                     + " windowMs=" + (windowNanos < 0L ? -1L : windowNanos / 1_000_000L)
                     + " tickMs=" + String.format(Locale.ROOT, "%.2f", tickMillis)
