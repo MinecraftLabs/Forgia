@@ -320,6 +320,61 @@
      protected boolean couldAcceptPassenger() {
          return true;
      }
+@@ -2150,18 +_,13 @@
+             this.processPortalCooldown();
+             if (this.portalProcess != null) {
+                 if (this.portalProcess.processPortalTeleportation(serverlevel, this, this.canUsePortal(false))) {
+-                    serverlevel.getProfiler().push("portal");
+-                    this.setPortalCooldown();
+-                    DimensionTransition dimensiontransition = this.portalProcess.getPortalDestination(serverlevel, this);
+-                    if (dimensiontransition != null) {
+-                        ServerLevel serverlevel1 = dimensiontransition.newLevel();
+-                        if (serverlevel.getServer().isLevelEnabled(serverlevel1)
+-                            && (serverlevel1.dimension() == serverlevel.dimension() || this.canChangeDimensions(serverlevel, serverlevel1))) {
+-                            this.changeDimension(dimensiontransition);
+-                        }
++                    // Neo: the destination search of a portal transition reads the PoiManager of the destination
++                    // level, and every entity type reaches it here, so a native region worker records the
++                    // transition for its batch barrier instead and the server thread applies it in this tick.
++                    if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferPortalTransition(serverlevel, this)) {
++                        return;
+                     }
+-
+-                    serverlevel.getProfiler().pop();
++                    this.completePortalTransition(serverlevel);
+                 } else if (this.portalProcess.hasExpired()) {
+                     this.portalProcess = null;
+                 }
+@@ -2169,6 +_,29 @@
+         }
+     }
+ 
++    // Neo: resolves and applies the portal transition of this entity, exactly the vanilla body of handlePortal.
++    // A region worker defers the call to its batch barrier, which runs it on the server thread, so the
++    // destination search never reaches the PoiManager of the destination level from a worker.
++    public void completePortalTransition(ServerLevel serverlevel) {
++        if (this.portalProcess == null) {
++            // The portal state was already dropped; the vanilla body would resolve nothing either.
++            return;
++        }
++
++        serverlevel.getProfiler().push("portal");
++        this.setPortalCooldown();
++        DimensionTransition dimensiontransition = this.portalProcess.getPortalDestination(serverlevel, this);
++        if (dimensiontransition != null) {
++            ServerLevel serverlevel1 = dimensiontransition.newLevel();
++            if (serverlevel.getServer().isLevelEnabled(serverlevel1)
++                && (serverlevel1.dimension() == serverlevel.dimension() || this.canChangeDimensions(serverlevel, serverlevel1))) {
++                this.changeDimension(dimensiontransition);
++            }
++        }
++
++        serverlevel.getProfiler().pop();
++    }
++
+     public int getDimensionChangingDelay() {
+         Entity entity = this.getFirstPassenger();
+         return entity instanceof ServerPlayer ? entity.getDimensionChangingDelay() : 300;
 @@ -2257,7 +_,7 @@
      }
  

@@ -28,9 +28,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.gametest.framework.GameTest;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.util.RandomSource;
@@ -42,8 +44,10 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.MobSpawnType;
 import net.minecraft.world.entity.SpawnPlacements;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Zombie;
+import net.minecraft.world.entity.npc.Villager;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -51,12 +55,14 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.NaturalSpawner;
+import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BedPart;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -242,6 +248,13 @@ public class ServerLoadBenchmarkGameTests {
     private static final int HOPPER_DROP_STACK_SIZE = 1;
     /** Height above the hopper block an item entity is dropped at, inside the suck box and above the block. */
     private static final double HOPPER_DROP_HEIGHT = 1.05;
+    /** Distance from the chunk corner to the first workload slot of that chunk. */
+    private static final int ENTITY_WORKER_SLOT_ORIGIN = 3;
+    /** Distance between two workload slots of one chunk, so every mob of a chunk has room for its own POI. */
+    private static final int ENTITY_WORKER_SLOT_SPACING = 6;
+    /** Slots per chunk edge of the workload grid: two by two mobs per chunk at most. */
+    private static final int ENTITY_WORKER_SLOTS_PER_EDGE = 2;
+
     /** Zombies of the entity workload. */
     private static final int ZOMBIE_COUNT = 250;
     /** Item entities of the entity workload. */
@@ -264,6 +277,18 @@ public class ServerLoadBenchmarkGameTests {
      * of silently measuring the default population.
      */
     static final String ZOMBIE_COUNT_PROPERTY = "neoforge.serverBenchmarkZombies";
+    /**
+     * System property that selects the mob of the entity worker workload, so the same window measures a work
+     * load the per-type entity policy keeps on a region worker next to the zombie load it hands to the server
+     * thread. The value is an entity type id; unset keeps {@code minecraft:zombie}.
+     */
+    static final String MOB_PROPERTY = "neoforge.serverBenchmarkMob";
+    /**
+     * System property that runs the entity worker workload with villagers instead of zombies, and with a bed
+     * and a workstation next to every villager so its tick really takes both POIs. It overrides
+     * {@value #MOB_PROPERTY} and the population of {@value #ZOMBIE_COUNT_PROPERTY}.
+     */
+    static final String VILLAGER_COUNT_PROPERTY = "neoforge.serverBenchmarkVillagers";
     /**
      * System property that drives zombie deaths in the entity worker workload: the number of zombies killed
      * every {@value #DEATH_INTERVAL_TICKS} ticks. Each death starts inside the tick of its own zombie, so the
@@ -333,7 +358,7 @@ public class ServerLoadBenchmarkGameTests {
     static final String RANDOM_TICK_CSV_HEADER = "profile,workers,regionSize,chunks,blocks,msptAvg,msptP50,msptP95,msptP99,chunkTicksOnWorkers,fallbackChunkTicks,boundaryChunkTicks,unloadedNeighborhoodChunkTicks,truncatedChunkTicks,unleasedChunkTicks,chunkTickLightningStrikes,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples,blockStateFingerprint";
     static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
     static final String SOAK_MSPT_HEADER = "profile,zombies,measuredTicks,window,samples,msptAvg,msptP50,msptP95,msptP99";
     static final String SOAK_DRIFT_HEADER = "profile,firstHalfAvgMs,lastAvgMs,driftRatio,driftPercent,firstHalfP99Ms,lastP99Ms";
@@ -748,8 +773,8 @@ public class ServerLoadBenchmarkGameTests {
             final ServerLevel level = helper.getLevel();
             final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
             final List<ChunkPos> grid = gridChunks(origin);
-            final List<Zombie> zombies = new ArrayList<>(entityWorkerZombieCount());
-            final ZombieDeathDriver deathDriver = new ZombieDeathDriver(level, zombies, entityWorkerZombieDeaths());
+            final List<Mob> mobs = new ArrayList<>(entityWorkerMobCount());
+            final ZombieDeathDriver deathDriver = new ZombieDeathDriver(level, mobs, entityWorkerZombieDeaths());
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, deathDriver);
             final EntityWorkerBlockers blockers = new EntityWorkerBlockers();
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
@@ -764,7 +789,7 @@ public class ServerLoadBenchmarkGameTests {
                 if (cleaned.compareAndSet(false, true)) {
                     NeoForge.EVENT_BUS.unregister(sampler);
                     NeoForge.EVENT_BUS.unregister(deathDriver);
-                    cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
+                    cleanupEntityWorkerWindow(level, grid, mobs, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
                 }
             });
 
@@ -778,7 +803,7 @@ public class ServerLoadBenchmarkGameTests {
                         daylight.set(false, level.getServer());
                         level.setDayTime(18000L);
                         mobLoot.set(zombieLootEnabled(), level.getServer());
-                        spawnZombies(level, grid, origin, zombies, helper, entityWorkerZombieCount());
+                        spawnEntityWorkerMobs(level, grid, origin, mobs, helper, entityWorkerMobCount());
                     })
                     .thenExecute(() -> {
                         replaced.set(installEntityWorkerEngine(blockers, entityTickWorkers()).orElse(null));
@@ -802,9 +827,9 @@ public class ServerLoadBenchmarkGameTests {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         NeoForge.EVENT_BUS.unregister(deathDriver);
                         // The counters of the diagnostic engine are read before it is replaced again.
-                        reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), zombies, blockers, deathDriver, grid.size());
+                        reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), mobs, blockers, deathDriver, grid.size());
                         if (cleaned.compareAndSet(false, true)) {
-                            cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
+                            cleanupEntityWorkerWindow(level, grid, mobs, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
                         }
                     })
                     .thenSucceed();
@@ -857,7 +882,7 @@ public class ServerLoadBenchmarkGameTests {
             final ServerLevel level = helper.getLevel();
             final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
             final List<ChunkPos> grid = gridChunks(origin);
-            final List<Zombie> zombies = new ArrayList<>(zombieCount);
+            final List<Mob> zombies = new ArrayList<>(zombieCount);
             final ZombieDeathDriver deathDriver = new ZombieDeathDriver(level, zombies, soakZombieDeaths());
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, measuredTicks, deathDriver);
             final SoakWatch watch = new SoakWatch();
@@ -1476,10 +1501,43 @@ public class ServerLoadBenchmarkGameTests {
 
     /**
      * {@return the population of the entity worker diagnostics workload,
-     * {@value #ENTITY_WORKER_ZOMBIE_COUNT} unless {@value #ZOMBIE_COUNT_PROPERTY} overrides it}
+     * {@value #ENTITY_WORKER_ZOMBIE_COUNT} unless {@value #ZOMBIE_COUNT_PROPERTY} overrides it, or the
+     * villager count when {@value #VILLAGER_COUNT_PROPERTY} runs the villager workload}
      */
-    private static int entityWorkerZombieCount() {
+    private static int entityWorkerMobCount() {
+        if (villagerWorkload()) {
+            return intProperty(VILLAGER_COUNT_PROPERTY, ENTITY_WORKER_ZOMBIE_COUNT);
+        }
         return intProperty(ZOMBIE_COUNT_PROPERTY, ENTITY_WORKER_ZOMBIE_COUNT);
+    }
+
+    /** {@return true when {@value #VILLAGER_COUNT_PROPERTY} selected the villager workload} */
+    private static boolean villagerWorkload() {
+        final String configured = System.getProperty(VILLAGER_COUNT_PROPERTY);
+        return configured != null && !configured.isBlank();
+    }
+
+    /**
+     * {@return the entity type of the entity worker workload}
+     * <p>
+     * The villager workload overrides the mob selection, because a villager without its POI blocks would not
+     * exercise the audited path. Every other run reads {@value #MOB_PROPERTY} and defaults to the zombie.
+     */
+    private static EntityType<?> entityWorkerMobType() {
+        if (villagerWorkload()) {
+            return EntityType.VILLAGER;
+        }
+        final String configured = System.getProperty(MOB_PROPERTY, "");
+        if (configured.isBlank()) {
+            return EntityType.ZOMBIE;
+        }
+        final ResourceLocation id = ResourceLocation.tryParse(configured.trim());
+        final EntityType<?> type = id == null ? null : BuiltInRegistries.ENTITY_TYPE.get(id);
+        if (type == null) {
+            // Fail instead of silently measuring a different population than the row claims.
+            throw new IllegalArgumentException("unknown entity type in " + MOB_PROPERTY + ": " + configured);
+        }
+        return type;
     }
 
     /**
@@ -2263,7 +2321,34 @@ public class ServerLoadBenchmarkGameTests {
      * The zombies keep their vanilla AI and carry nothing, so the measured operations are the ones a plain
      * {@code Zombie.tick} reaches: despawn, collisions, pathfinding, target selection and movement.
      */
-    private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Zombie> zombies, ExtendedGameTestHelper helper, int count) {
+    private static void spawnEntityWorkerMobs(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<Mob> mobs, ExtendedGameTestHelper helper, int count) {
+        final RandomSource random = RandomSource.create(0x5EED5EEDL);
+        for (int index = 0; index < count; index++) {
+            final ChunkPos chunk = grid.get(index % grid.size());
+            final int slot = index / grid.size();
+            final BlockPos pos = new BlockPos(
+                    chunk.getMinBlockX() + ENTITY_WORKER_SLOT_ORIGIN + ENTITY_WORKER_SLOT_SPACING * (slot % ENTITY_WORKER_SLOTS_PER_EDGE),
+                    origin.getY() + 2,
+                    chunk.getMinBlockZ() + ENTITY_WORKER_SLOT_ORIGIN + ENTITY_WORKER_SLOT_SPACING * (slot / ENTITY_WORKER_SLOTS_PER_EDGE));
+            if (villagerWorkload()) {
+                // Each villager of the workload gets its own platform, bed and workstation, because a bed and
+                // a workstation are one-ticket POIs: four villagers on one spot would leave three of them
+                // without a POI to claim and the workload would measure idle brains.
+                placeVillagerPoiBlocks(level, pos);
+            }
+            final Mob mob = newEntityWorkerMob(level, pos, random);
+            helper.assertTrue(level.addFreshEntity(mob), "the entity workload could not spawn a benchmark mob");
+            mobs.add(mob);
+        }
+    }
+
+    /**
+     * Spawns the zombie population of the soak and the entity workload.
+     * <p>
+     * Those two workloads always measure a zombie population; the entity worker workload selects its mob with
+     * {@value #MOB_PROPERTY} and spawns it through {@link #spawnEntityWorkerMobs}.
+     */
+    private static void spawnZombies(ServerLevel level, List<ChunkPos> grid, BlockPos origin, List<? super Zombie> zombies, ExtendedGameTestHelper helper, int count) {
         final RandomSource random = RandomSource.create(0x5EED5EEDL);
         for (int index = 0; index < count; index++) {
             final ChunkPos chunk = grid.get(index % grid.size());
@@ -2275,14 +2360,49 @@ public class ServerLoadBenchmarkGameTests {
 
     /**
      * {@return one benchmark zombie at {@code pos}, not yet added to the level}
-     * <p>
-     * Without a nearby player a mob despawns; the diagnostic needs the population to stay put.
      */
     private static Zombie newZombie(ServerLevel level, BlockPos pos, RandomSource random) {
         final Zombie zombie = new Zombie(EntityType.ZOMBIE, level);
         zombie.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, random.nextFloat() * 360.0F, 0.0F);
         zombie.setPersistenceRequired();
         return zombie;
+    }
+
+    /**
+     * {@return one mob of the workload at {@code pos}, not yet added to the level}
+     * <p>
+     * Without a nearby player a mob despawns; the diagnostic needs the population to stay put.
+     */
+    private static Mob newEntityWorkerMob(ServerLevel level, BlockPos pos, RandomSource random) {
+        final Entity spawned = entityWorkerMobType().create(level);
+        if (!(spawned instanceof Mob mob)) {
+            throw new IllegalStateException("the entity worker workload needs a mob, got " + entityWorkerMobType());
+        }
+        mob.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, random.nextFloat() * 360.0F, 0.0F);
+        mob.setPersistenceRequired();
+        return mob;
+    }
+
+    /**
+     * Places a bed and a workstation next to a villager of the workload, so its tick takes both POIs and the
+     * POI path the per-type policy pins really runs during the window.
+     */
+    private static void placeVillagerPoiBlocks(ServerLevel level, BlockPos villagerPos) {
+        // The workload spawns far above the world terrain, so every villager gets its own small platform to
+        // stand and path on; without it the population falls into the terrain and never reaches its POI.
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                level.setBlockAndUpdate(villagerPos.offset(dx, -1, dz), Blocks.STONE.defaultBlockState());
+            }
+        }
+        final BlockPos foot = villagerPos.offset(-1, 0, 0);
+        level.setBlockAndUpdate(foot, Blocks.RED_BED.defaultBlockState()
+                .setValue(BedBlock.FACING, Direction.SOUTH)
+                .setValue(BedBlock.PART, BedPart.FOOT));
+        level.setBlockAndUpdate(foot.south(), Blocks.RED_BED.defaultBlockState()
+                .setValue(BedBlock.FACING, Direction.SOUTH)
+                .setValue(BedBlock.PART, BedPart.HEAD));
+        level.setBlockAndUpdate(villagerPos.offset(1, 0, 0), Blocks.CARTOGRAPHY_TABLE.defaultBlockState());
     }
 
     /**
@@ -2301,9 +2421,9 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static final class ZombieDeathDriver implements Runnable {
         private final ServerLevel level;
-        private final List<Zombie> zombies;
-        /** Zombies whose death is due at their next tick; the identity set is written by workers and the server thread. */
-        private final Set<Zombie> scheduled = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+        private final List<Mob> mobs;
+        /** Mobs whose death is due at their next tick; the identity set is written by workers and the server thread. */
+        private final Set<Mob> scheduled = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
         private final int deathsPerInterval;
         private final RandomSource random = RandomSource.create(0xDEADBEEFL);
         private int intervalCountdown = DEATH_INTERVAL_TICKS;
@@ -2317,9 +2437,9 @@ public class ServerLoadBenchmarkGameTests {
         private int removedReplacementsAtWindowStart;
         private int failedReplacementsAtWindowStart;
 
-        ZombieDeathDriver(ServerLevel level, List<Zombie> zombies, int deathsPerInterval) {
+        ZombieDeathDriver(ServerLevel level, List<Mob> mobs, int deathsPerInterval) {
             this.level = level;
-            this.zombies = zombies;
+            this.mobs = mobs;
             this.deathsPerInterval = deathsPerInterval;
         }
 
@@ -2329,8 +2449,8 @@ public class ServerLoadBenchmarkGameTests {
          */
         @Override
         public void run() {
-            this.replaceDeadZombies();
-            if (this.deathsPerInterval <= 0 || this.zombies.isEmpty()) {
+            this.replaceDeadMobs();
+            if (this.deathsPerInterval <= 0 || this.mobs.isEmpty()) {
                 return;
             }
             if (--this.intervalCountdown > 0) {
@@ -2338,9 +2458,9 @@ public class ServerLoadBenchmarkGameTests {
             }
             this.intervalCountdown = DEATH_INTERVAL_TICKS;
             for (int index = 0; index < this.deathsPerInterval; index++) {
-                final Zombie zombie = this.zombies.get(this.nextSlot++ % this.zombies.size());
-                if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
-                    this.scheduled.add(zombie);
+                final Mob mob = this.mobs.get(this.nextSlot++ % this.mobs.size());
+                if (!mob.isRemoved() && !mob.isDeadOrDying()) {
+                    this.scheduled.add(mob);
                 }
             }
         }
@@ -2352,29 +2472,29 @@ public class ServerLoadBenchmarkGameTests {
          */
         @SubscribeEvent
         public void onEntityTickPre(EntityTickEvent.Pre event) {
-            if (!(event.getEntity() instanceof Zombie zombie) || !this.scheduled.remove(zombie)) {
+            if (!(event.getEntity() instanceof Mob mob) || !this.scheduled.remove(mob)) {
                 return;
             }
-            if (zombie.isRemoved() || zombie.isDeadOrDying()) {
+            if (mob.isRemoved() || mob.isDeadOrDying()) {
                 return;
             }
             this.deaths++;
-            zombie.hurt(zombie.damageSources().generic(), Float.MAX_VALUE);
+            mob.hurt(mob.damageSources().generic(), Float.MAX_VALUE);
         }
 
-        private void replaceDeadZombies() {
-            for (int index = 0; index < this.zombies.size(); index++) {
-                final Zombie zombie = this.zombies.get(index);
-                if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+        private void replaceDeadMobs() {
+            for (int index = 0; index < this.mobs.size(); index++) {
+                final Mob mob = this.mobs.get(index);
+                if (!mob.isRemoved() && !mob.isDeadOrDying()) {
                     continue;
                 }
-                final boolean removed = zombie.isRemoved();
-                final Zombie replacement = newZombie(this.level, zombie.blockPosition(), this.random);
+                final boolean removed = mob.isRemoved();
+                final Mob replacement = newEntityWorkerMob(this.level, mob.blockPosition(), this.random);
                 if (!this.level.addFreshEntity(replacement)) {
                     this.failedReplacements++;
                     continue;
                 }
-                this.zombies.set(index, replacement);
+                this.mobs.set(index, replacement);
                 this.replacements++;
                 if (removed) {
                     this.removedReplacements++;
@@ -2417,12 +2537,12 @@ public class ServerLoadBenchmarkGameTests {
      * Runs from the measured window and from the end listener, so a failing or timing-out test never leaves
      * the diagnostic engine installed or the grid forced.
      */
-    private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Zombie> zombies, GameRules.BooleanValue daylight, boolean previousDaylight, GameRules.BooleanValue mobLoot, boolean previousMobLoot, Optional<InstalledEngine> replaced) {
+    private static void cleanupEntityWorkerWindow(ServerLevel level, List<ChunkPos> grid, List<Mob> mobs, GameRules.BooleanValue daylight, boolean previousDaylight, GameRules.BooleanValue mobLoot, boolean previousMobLoot, Optional<InstalledEngine> replaced) {
         RegionEntityTickAttribution.setEnabled(false);
-        for (Zombie zombie : zombies) {
-            zombie.discard();
+        for (Mob mob : mobs) {
+            mob.discard();
         }
-        zombies.clear();
+        mobs.clear();
         replaced.ifPresent(ServerLoadBenchmarkGameTests::restoreConfiguredEngine);
         daylight.set(previousDaylight, level.getServer());
         mobLoot.set(previousMobLoot, level.getServer());
@@ -2457,6 +2577,9 @@ public class ServerLoadBenchmarkGameTests {
         final InstalledEngine replaced = new InstalledEngine(configured.diagnostics(), configured.regionLayout());
         RegionThreadingManager.clear();
         final RegionThreadingEngine diagnostic = replaced.rebuild(entityTickWorkers, RegionEntityStorageMode.REGION_OWNED);
+        // The measured engine carries the same per-type entity policy as the production install, so a pinned
+        // type is measured on the server-thread path it is pinned to.
+        diagnostic.installVanillaEntityPolicy();
         diagnostic.setEntityTickFailureObserverForTesting(blockers::record);
         RegionThreadingManager.install(diagnostic);
         return Optional.of(replaced);
@@ -2476,7 +2599,9 @@ public class ServerLoadBenchmarkGameTests {
     private static void restoreConfiguredEngine(InstalledEngine replaced) {
         RegionThreadingManager.clear();
         final RegionThreadingDiagnostics flags = replaced.flags();
-        RegionThreadingManager.install(replaced.rebuild(flags.entityTickWorkerExecutionEnabled(), flags.entityStorageMode()));
+        final RegionThreadingEngine restored = replaced.rebuild(flags.entityTickWorkerExecutionEnabled(), flags.entityStorageMode());
+        restored.installVanillaEntityPolicy();
+        RegionThreadingManager.install(restored);
     }
 
     /**
@@ -2506,18 +2631,25 @@ public class ServerLoadBenchmarkGameTests {
      * slices (the {@code sliceSamples} column), so each one is the per-tick wall time of that segment. A
      * segment that never ran in the window reports {@code 0}, and a window without slices reports {@code -1}.
      */
-    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionEntityTickAttribution.Snapshot attributionBefore, RegionEntityTickAttribution.Snapshot attributionAfter, List<Zombie> zombies, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, int chunks) {
+    private static void reportEntityWorkers(ExtendedGameTestHelper helper, TickSampler sampler, Optional<RegionThreadingDiagnostics> before, RegionEntityTickAttribution.Snapshot attributionBefore, RegionEntityTickAttribution.Snapshot attributionAfter, List<Mob> mobs, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, int chunks) {
         final long[] sorted = sampler.sortedSamples();
         helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
         final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
         final String profile = profileName(after);
-        final int mismatches = regionMismatches(helper.getLevel(), zombies);
+        final int mismatches = regionMismatches(helper.getLevel(), mobs);
         final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
         int survivors = 0;
-        for (Zombie zombie : zombies) {
-            if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
+        for (Mob mob : mobs) {
+            if (!mob.isRemoved() && !mob.isDeadOrDying()) {
                 survivors++;
             }
+        }
+        final int villagersWithPoi = villagersWithBedAndWorkstation(mobs);
+        if (villagerWorkload()) {
+            // The villager workload exists to show that the POI path the per-type policy pins keeps working
+            // while its ticks run on the server thread, so a window without a single claimed POI pair proves
+            // nothing and fails instead of reporting an idle population.
+            helper.assertTrue(villagersWithPoi > 0, "no villager of the workload claimed its bed and workstation");
         }
         System.out.println(sampler.note(profile, after)
                 + " entityStorageMode=" + after.map(RegionThreadingDiagnostics::entityStorageMode).map(Object::toString).orElse("NONE")
@@ -2529,9 +2661,16 @@ public class ServerLoadBenchmarkGameTests {
                 + " chunkPreloadRefusedEntityTicks=" + delta(before, after, RegionThreadingDiagnostics::chunkPreloadRefusedEntityTicks)
                 + " chunkPreloadMargin=" + RegionThreadingEngine.entityTickChunkMargin()
                 + " entityTickMode=" + entityTickMode(after)
-                + " zombieSurvivors=" + survivors + "/" + zombies.size()
-                + " zombieDeaths=" + deathDriver.deathsInWindow()
-                + " zombieReplacements=" + deathDriver.replacementsInWindow()
+                + " workloadMob=" + entityWorkerMobType()
+                + " mobSurvivors=" + survivors + "/" + mobs.size()
+                + " villagersWithBedAndWorkstation=" + villagersWithPoi + "/" + mobs.size()
+                + " serverThreadOnlyEntityTicksByReason=" + after.map(RegionThreadingDiagnostics::serverThreadOnlyEntityTicksByReason).map(Object::toString).orElse("NONE")
+                + " serverThreadOnlyEntityTicks=" + delta(before, after, RegionThreadingDiagnostics::serverThreadOnlyEntityTicks)
+                + " deferredPortalTransitions=" + delta(before, after, RegionThreadingDiagnostics::deferredPortalTransitions)
+                + " appliedPortalTransitions=" + delta(before, after, RegionThreadingDiagnostics::appliedPortalTransitions)
+                + " refusedPortalTransitions=" + delta(before, after, RegionThreadingDiagnostics::refusedPortalTransitions)
+                + " mobDeaths=" + deathDriver.deathsInWindow()
+                + " mobReplacements=" + deathDriver.replacementsInWindow()
                 + " removedReplacements=" + deathDriver.removedReplacementsInWindow()
                 + " failedReplacements=" + deathDriver.failedReplacementsInWindow()
                 + " regionMismatches=" + mismatches
@@ -2543,7 +2682,7 @@ public class ServerLoadBenchmarkGameTests {
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
-                entityWorkerZombieCount(),
+                entityWorkerMobCount(),
                 chunks,
                 averageMillis(sorted),
                 percentileMillis(sorted, 0.50),
@@ -2911,7 +3050,7 @@ public class ServerLoadBenchmarkGameTests {
     /**
      * The measured ticks of one soak window and the workload that produced them.
      */
-    private record SoakWindow(ServerLevel level, TickSampler sampler, SoakWatch watch, Optional<RegionThreadingDiagnostics> before, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, List<Zombie> zombies, List<ChunkPos> grid, int zombieCount, int measuredTicks) {}
+    private record SoakWindow(ServerLevel level, TickSampler sampler, SoakWatch watch, Optional<RegionThreadingDiagnostics> before, EntityWorkerBlockers blockers, ZombieDeathDriver deathDriver, List<Mob> zombies, List<ChunkPos> grid, int zombieCount, int measuredTicks) {}
 
     /**
      * The mspt statistics of one subset of the measured ticks of a soak window.
@@ -2954,9 +3093,9 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /** {@return the live zombie population of {@code zombies}} */
-    private static int aliveZombies(List<Zombie> zombies) {
+    private static int aliveZombies(List<Mob> zombies) {
         int alive = 0;
-        for (Zombie zombie : zombies) {
+        for (Mob zombie : zombies) {
             if (!zombie.isRemoved() && !zombie.isDeadOrDying()) {
                 alive++;
             }
@@ -2965,13 +3104,13 @@ public class ServerLoadBenchmarkGameTests {
     }
 
     /** {@return the tracked zombies whose chunk is not one of the force-ticked chunks of {@code grid}} */
-    private static int zombiesOutsideGrid(List<ChunkPos> grid, List<Zombie> zombies) {
+    private static int zombiesOutsideGrid(List<ChunkPos> grid, List<Mob> zombies) {
         final Set<Long> chunks = new HashSet<>(grid.size());
         for (ChunkPos chunk : grid) {
             chunks.add(chunk.toLong());
         }
         int outside = 0;
-        for (Zombie zombie : zombies) {
+        for (Mob zombie : zombies) {
             if (zombie.isRemoved() || zombie.isDeadOrDying()) {
                 continue;
             }
@@ -2980,6 +3119,25 @@ public class ServerLoadBenchmarkGameTests {
             }
         }
         return outside;
+    }
+
+    /**
+     * {@return the villagers of the workload that claimed both a bed and a workstation}
+     * <p>
+     * A villager claims its bed as {@code HOME} and its workstation as {@code JOB_SITE}, both through the
+     * {@code PoiManager} of the level. The count is the evidence that the POI path of an audited type still
+     * runs while its tick is handed to the server thread.
+     */
+    private static int villagersWithBedAndWorkstation(List<Mob> mobs) {
+        int claimed = 0;
+        for (Mob mob : mobs) {
+            if (mob instanceof Villager villager
+                    && villager.getBrain().getMemory(MemoryModuleType.HOME).isPresent()
+                    && villager.getBrain().getMemory(MemoryModuleType.JOB_SITE).isPresent()) {
+                claimed++;
+            }
+        }
+        return claimed;
     }
 
     /** {@return the live entities the level exposes to its entity getter} */

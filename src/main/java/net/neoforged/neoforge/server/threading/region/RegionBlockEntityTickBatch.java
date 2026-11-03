@@ -300,5 +300,11 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
         public boolean deferAddition(Entity entity, List<Entity> graph) {
             return false;
         }
+
+        @Override
+        public boolean deferPortalTransition(Entity entity) {
+            // A block-entity tick never transitions an entity, so this group has no transition to defer.
+            return false;
+        }
     }
 }

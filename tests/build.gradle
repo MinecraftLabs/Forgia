@@ -140,6 +140,13 @@ runs {
             // Measurement runs pass -PserverBenchmarkZombies=N to vary the population of the entity worker
             // workload without editing the test; unset keeps the default population of the test.
             systemProperty("neoforge.serverBenchmarkZombies", providers.gradleProperty("serverBenchmarkZombies").getOrElse("64"))
+            // Measurement runs pass -PserverBenchmarkMob=minecraft:cow to measure the same entity worker
+            // workload with a mob the per-type entity policy keeps on a region worker, next to the zombie row
+            // that measures what the policy costs. Unset keeps the zombie.
+            systemProperty("neoforge.serverBenchmarkMob", providers.gradleProperty("serverBenchmarkMob").getOrElse(""))
+            // Measurement runs pass -PserverBenchmarkVillagers=N to run the entity worker workload with
+            // villagers that own a bed and a workstation, so the POI path the policy pins really runs.
+            systemProperty("neoforge.serverBenchmarkVillagers", providers.gradleProperty("serverBenchmarkVillagers").getOrElse(""))
             // Measurement runs pass -PserverBenchmarkZombieDeaths=N to drive N zombie deaths every 10 ticks
             // of the entity worker workload; unset keeps the population alive for the whole window.
             systemProperty("neoforge.serverBenchmarkZombieDeaths", providers.gradleProperty("serverBenchmarkZombieDeaths").getOrElse("0"))

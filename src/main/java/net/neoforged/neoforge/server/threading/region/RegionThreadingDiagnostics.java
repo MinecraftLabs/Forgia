@@ -6,6 +6,7 @@
 package net.neoforged.neoforge.server.threading.region;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Snapshot of the internal region threading runtime state.
@@ -127,6 +128,22 @@ import java.util.List;
  * over and how a tick is classified as keeping up or behind. A diagnostics call without any live region -
  * including a call on a server that never installed the engine - reports an empty region list and a summary
  * of zero regions, and such a server records no per-region metric at all.
+ * <p>
+ * {@link #serverThreadOnlyEntityTicks()} counts the ticks a region handed to the server thread because the
+ * entity is always-ticking (a player).
+ * {@link #serverThreadOnlyEntityTicksByReason()} counts the ticks a region handed to the server thread because
+ * of a per-type declaration ({@link RegionThreadingEngine#serverThreadOnlyEntity(Class, String)}), one entry
+ * per reason token, ordered by token. It answers why an entity tick stayed on the server thread and not only
+ * how many did; a type without a declaration keeps the worker and never appears here.
+ * <p>
+ * {@link #deferredPortalTransitions()}, {@link #appliedPortalTransitions()} and
+ * {@link #refusedPortalTransitions()} report the portal transitions of worker-ticked entities. The
+ * destination search of a transition reads the {@code PoiManager} of the destination level, which is one
+ * storage per level, and every entity type reaches it from its own tick, so a worker records the transition
+ * instead of resolving it. A deferred transition is one record a batch barrier drained; applied is one the
+ * server thread resolved and applied in that same tick; refused is one it could not apply (the engine shut
+ * down, the level identity closed, the entity was removed or left the level). A refused transition is never
+ * lost: the entity keeps its portal state, so a later tick records it again.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -232,8 +249,12 @@ public record RegionThreadingDiagnostics(
         long entityTickRegionsWithoutEligibleChunk,
         long entityTicksOutsideRegion,
         long serverThreadOnlyEntityTicks,
+        Map<String, Long> serverThreadOnlyEntityTicksByReason,
         long unindexedEntityTickStarts,
         long entityTickIndexFallbacks,
+        long deferredPortalTransitions,
+        long appliedPortalTransitions,
+        long refusedPortalTransitions,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
     /**

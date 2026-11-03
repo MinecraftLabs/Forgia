@@ -51,6 +51,12 @@ import org.jetbrains.annotations.Nullable;
  * which is admitted whole or counted as dropped; the members the caller adds one by one (as
  * {@code addFreshEntityWithPassengers} does) are no-ops of the graph that already carries them.
  * <p>
+ * A worker whose entity enters a portal records the transition instead of resolving it: the destination search
+ * reads the {@code PoiManager} of the destination level, and every entity type reaches it through
+ * {@code Entity#handlePortal}, so no type declaration can keep it off a worker. The barrier resolves and
+ * applies at most one transition per entity on the server thread, before it applies the other deferred effects
+ * of the tick.
+ * <p>
  * An entity tick that writes a block - a placed block, a lit fire, a snow layer - records the light recheck and
  * the block update publication of the write in the deferred queue every region batch shares, so the worker
  * never drives the level-wide light engine or the level-wide block update publication. An entity whose
@@ -119,6 +125,19 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      * spawned: both slices admit the riding graph on the server thread.
      */
     private final RegionDeferredEntityAdditions deferredAdditions = new RegionDeferredEntityAdditions(this);
+    /**
+     * Portal transitions that a worker recorded for the barrier, one per entity.
+     * <p>
+     * The destination search of a transition reads the {@code PoiManager} of the destination level, and every
+     * entity type reaches it through {@code Entity#handlePortal}, so no type declaration can keep it off a
+     * worker. The record is an identity set, so an entity that enters {@code handlePortal} twice in one tick
+     * (a primitive TNT ticks {@code baseTick} and its own body) is applied once, and the barrier applies the
+     * transition at most once per entity per tick. The set is guarded by its own monitor, is only filled from
+     * workers, and is drained once per tick by the barrier.
+     */
+    private final Set<Entity> deferredPortalTransitions = Collections.newSetFromMap(new IdentityHashMap<>());
+    /** Set when the engine shuts down; guarded by the monitor of {@link #deferredPortalTransitions}. */
+    private volatile boolean portalTransitionSeamClosed;
     private final List<Runnable> deferredServerTasks = Collections.synchronizedList(new ArrayList<>());
 
     RegionEntityTickBatch(ServerLevel level, int blockUpdateEntryBudget) {
@@ -423,6 +442,50 @@ final class RegionEntityTickBatch extends RegionTickBatch {
     }
 
     /**
+     * Records the portal transition of one entity for the barrier.
+     *
+     * @return {@code false} when the seam was closed or the barrier already completed, so the caller has to
+     *         keep the inline vanilla transition
+     */
+    boolean deferPortalTransition(Entity entity) {
+        synchronized (this.deferredPortalTransitions) {
+            if (this.portalTransitionSeamClosed || this.isComplete()) {
+                return false;
+            }
+            this.deferredPortalTransitions.add(entity);
+            return true;
+        }
+    }
+
+    /**
+     * Stops accepting deferred portal transitions and releases the ones that already wait.
+     * <p>
+     * Called when the engine shuts down: the barrier of this batch will never apply a transition again, and
+     * the released records must not keep an entity reference alive.
+     *
+     * @return the number of released transitions, which the caller counts as refused
+     */
+    int closeDeferredPortalTransitions() {
+        synchronized (this.deferredPortalTransitions) {
+            this.portalTransitionSeamClosed = true;
+            final int released = this.deferredPortalTransitions.size();
+            this.deferredPortalTransitions.clear();
+            return released;
+        }
+    }
+
+    /**
+     * Takes the deferred portal transitions that wait for the end of the batch.
+     */
+    List<Entity> drainDeferredPortalTransitions() {
+        synchronized (this.deferredPortalTransitions) {
+            final List<Entity> drained = List.copyOf(this.deferredPortalTransitions);
+            this.deferredPortalTransitions.clear();
+            return drained;
+        }
+    }
+
+    /**
      * Takes the deferred section updates that wait for the end of the batch.
      */
     List<RegionDeferredEntitySectionUpdates.DeferredSectionUpdate> drainDeferredSectionUpdates() {
@@ -559,6 +622,11 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         @Override
         public boolean deferAddition(Entity entity, List<Entity> graph) {
             return this.batch.deferAddition(entity, graph);
+        }
+
+        @Override
+        public boolean deferPortalTransition(Entity entity) {
+            return this.batch.deferPortalTransition(entity);
         }
 
         @Nullable

@@ -94,6 +94,13 @@ public final class RegionEntityTickPlan {
             // The vanilla path still has to run checkDespawn for this entity.
             return false;
         }
+        if (this.engine.entityTickPolicy().recordServerThreadOnly(entity) != null) {
+            // The per-type policy is consulted before the body starts: a declared type is not collected, so
+            // the vanilla inline body of the caller ticks it on the server thread in this same pass, in its
+            // own tick-list order and in the order relative to the entities that are collected. It is also
+            // not grouped, so it never enters a region worker's membership.
+            return false;
+        }
         final RegionState region = this.engine.regionFor(entity);
         if (region == null) {
             // The entity is not tracked yet. Only this first observation has to publish the mapping; every

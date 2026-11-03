@@ -103,7 +103,12 @@ public class ServerLifecycleHooks {
             if (RegionThreadingCompatibility.canInstallBridge()) {
                 // The layout carries the fixed region edge length, so the engine, its regionizer and the
                 // physical section partitions of every level created afterwards share one region size.
-                RegionThreadingManager.install(new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(), RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get())));
+                final RegionThreadingEngine engine = new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(), RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get()));
+                // The vanilla declarations of the POI audit: a tick that reaches the level's PoiManager stays on
+                // the server thread. The engine itself starts with an empty policy, so an engine that is built
+                // outside this install path keeps every entity tick on its worker.
+                engine.installVanillaEntityPolicy();
+                RegionThreadingManager.install(engine);
             } else {
                 LOGGER.warn(SERVERHOOKS, "Region threading bridge is enabled but blocked by compatibility policy {}; unsupported mods: {}", RegionThreadingCompatibility.defaultSupport(), RegionThreadingCompatibility.unsupportedMods());
             }

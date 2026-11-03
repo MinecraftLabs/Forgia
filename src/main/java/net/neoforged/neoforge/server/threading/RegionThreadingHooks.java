@@ -245,6 +245,30 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Defers a portal transition of a worker-ticked entity to the entity batch barrier.
+     * <p>
+     * {@code Entity#handlePortal} resolves the destination of a completed portal time through
+     * {@code PortalForcer}, whose search reads the {@code PoiManager} of the destination level (and loads the
+     * chunks its search covers). Every entity type reaches that call from its own tick, so a per-type
+     * declaration cannot keep it off a worker. This hook records the transition for the barrier of the
+     * worker's entity batch instead, and the barrier resolves and applies it on the server thread in the same
+     * tick, before it applies the other deferred effects of that tick.
+     * <p>
+     * Only a native region worker whose active lease owns {@code entity} in the lease level and whose batch
+     * still accepts deferred transitions records anything, and an entity is recorded at most once per tick.
+     * The server thread, the client, every ordinary thread, a foreign entity and a lease that outlived its
+     * batch answer {@code false} and keep the inline vanilla transition.
+     *
+     * @param level  the level the transition happens in
+     * @param entity the entity that completed its portal time
+     * @return {@code true} when the caller must skip the inline transition, because the barrier runs it
+     *         instead
+     */
+    public static boolean deferPortalTransition(ServerLevel level, Entity entity) {
+        return RegionEntityOwnershipScope.deferPortalTransition(level, entity);
+    }
+
+    /**
      * Defers the server-owned level effects of a worker entity move to the entity batch barrier.
      * <p>
      * {@code Entity.setPosRaw} of an entity that is added to a level reaches two server-owned level effects

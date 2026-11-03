@@ -272,5 +272,11 @@ final class RegionSpawnBatch extends RegionTickBatch {
         public boolean deferAddition(Entity entity, List<Entity> graph) {
             return this.batch.deferAddition(entity, graph);
         }
+
+        @Override
+        public boolean deferPortalTransition(Entity entity) {
+            // A spawn body admits entities, it never transitions one, so this group has no transition to defer.
+            return false;
+        }
     }
 }

@@ -295,6 +295,28 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private final RegionEntityStorageMode entityStorageMode;
     /**
+     * The per-type declarations of the entity tick, consulted before an entity body starts.
+     * <p>
+     * The registry starts empty, so every type keeps the worker this engine admitted before the policy
+     * existed; {@link #installVanillaEntityPolicy()} adds the vanilla declarations of the POI audit and
+     * {@link #serverThreadOnlyEntity(Class, String)} is the hook of the mod compatibility layer.
+     */
+    private final RegionEntityTickPolicy entityTickPolicy = new RegionEntityTickPolicy();
+    /**
+     * Portal transitions a worker recorded for the batch barrier because the destination search reads the
+     * {@code PoiManager} of the destination level. Each one is applied on the server thread after the batch,
+     * so the transition of a worker-ticked entity never reaches that storage from a worker.
+     */
+    private final AtomicLong deferredPortalTransitionCount = new AtomicLong();
+    /** Portal transitions the barrier applied on the server thread. */
+    private final AtomicLong appliedPortalTransitionCount = new AtomicLong();
+    /**
+     * Portal transitions a barrier did not apply: the engine shut down, the level identity closed or the
+     * entity was removed or left the level before the barrier. The entity keeps its portal state, so the
+     * transition happens on a later tick instead of being lost silently.
+     */
+    private final AtomicLong refusedPortalTransitionCount = new AtomicLong();
+    /**
      * Mechanics-test seam for the scheduled/random callback slices. Production leaves it {@code false}:
      * no scheduled or random callback class is admitted as entity-storage safe yet, so a configured worker
      * slice falls back to the vanilla inline path. Only the internal mechanics tests enable it.
@@ -631,6 +653,45 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     public static int entityTickChunkMargin() {
         return ENTITY_TICK_CHUNK_MARGIN;
+    }
+
+    /**
+     * Declares that the tick of {@code type} and of every subclass of it may only run on the server thread.
+     * <p>
+     * The entity slices consult the declaration before an entity body starts and tick a declared entity on
+     * the server thread in the same tick instead: in the self-driven slice through the server-thread fallback
+     * of its batch, in the per-entity slice by not accepting the entity, which keeps the vanilla inline tick.
+     * The declaration is counted per reason and reported by the region threading status, and it covers the
+     * riding stack, because a passenger is ticked through the vehicle that carries it.
+     * <p>
+     * This is the hook of the mod compatibility layer: a mod declares the types whose tick reaches a shared
+     * server-owned structure instead of being refused a region worker as a whole. A type that is never
+     * declared keeps the worker, so this call only ever moves work back to the server thread.
+     *
+     * @param type   the declared entity class
+     * @param reason the short reason token of the declaration, e.g. the shared structure the tick reaches;
+     *               it is the key of the per reason counter and the token the status output reports
+     */
+    public void serverThreadOnlyEntity(Class<? extends Entity> type, String reason) {
+        this.entityTickPolicy.serverThreadOnly(type, reason);
+    }
+
+    /**
+     * Installs the vanilla declarations of the POI audit into this engine's entity tick policy.
+     * <p>
+     * The engine starts with an empty registry, so a caller that wants the vanilla policy has to install it:
+     * the production install path does, and a level whose engine does not install it keeps every entity tick
+     * on the worker. See {@link RegionEntityTickPolicy} for the audit behind the declarations.
+     */
+    public void installVanillaEntityPolicy() {
+        RegionEntityTickPolicy.installVanillaPoiDeclarations(this.entityTickPolicy);
+    }
+
+    /**
+     * {@return the per-type entity tick policy of this engine}
+     */
+    RegionEntityTickPolicy entityTickPolicy() {
+        return this.entityTickPolicy;
     }
 
     @Override
@@ -1199,6 +1260,10 @@ public final class RegionThreadingEngine implements RegionThreading {
         } finally {
             final long handoffStart = attribution ? System.nanoTime() : 0L;
             try {
+                // The portal transition of a worker-ticked entity runs first: it is the earliest level effect
+                // of the tick it belongs to, and the destination search may read the POI manager of the
+                // destination level, which only the server thread may touch.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredPortalTransitions(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntitySectionUpdates(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityRemovals(batch));
                 failure = runBatchCompletion(failure, () -> this.applyDeferredEntityAdditions(batch));
@@ -1315,11 +1380,10 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (!level.isInEntityTickingRange(entity.chunkPosition().toLong())) {
             return;
         }
-        final Entity vehicle = entity.getVehicle();
-        if (vehicle != null) {
-            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
-                return;
-            }
+        if (ridesLiveVehicle(entity)) {
+            return;
+        }
+        if (entity.getVehicle() != null) {
             entity.stopRiding();
         }
         if (entity.isRemoved() || entity instanceof PartEntity<?>) {
@@ -2010,6 +2074,10 @@ public final class RegionThreadingEngine implements RegionThreading {
             // the section publication are reported instead of being folded into the barrier wait.
             final long handoffStart = attribution ? System.nanoTime() : 0L;
             try {
+                // The portal transition of a worker-ticked entity runs first, exactly like in the self-driven
+                // slice: it is the earliest level effect of the tick it belongs to, and the destination search
+                // may read the POI manager of the destination level.
+                failure = runBatchCompletion(failure, () -> this.applyDeferredPortalTransitions(batch));
                 // The section publication and the target chunk acquisition of a worker entity move are the
                 // vanilla effects of the move itself, so they run before any other server-thread work observes
                 // the entity and before the ownership handoff of the batch commits a new region.
@@ -2381,6 +2449,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                             this.serverThreadOnlyEntityTicks.incrementAndGet();
                             continue;
                         }
+                        if (!ridesLiveVehicle(entry.entity())) {
+                            // The per-type policy is consulted before the body starts. A declared type is
+                            // ticked on the server thread after the batch instead of on this worker; an
+                            // entity that rides a live vehicle is decided at the vehicle, whose entry covers
+                            // the riding stack.
+                            if (this.entityTickPolicy.recordServerThreadOnly(entry.entity()) != null) {
+                                group.batch().addSelfDrivenFallback(entry.entity());
+                                continue;
+                            }
+                        }
                         tickable.add(entry.entity());
                     }
                     if (!tickable.isEmpty()) {
@@ -2501,11 +2579,11 @@ public final class RegionThreadingEngine implements RegionThreading {
             // and the entity is not ticked.
             return false;
         }
-        final Entity vehicle = entity.getVehicle();
-        if (vehicle != null) {
-            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
-                return false;
-            }
+        if (ridesLiveVehicle(entity)) {
+            // Ticked as part of the vehicle stack, which the group ticks through the vehicle.
+            return false;
+        }
+        if (entity.getVehicle() != null) {
             entity.stopRiding();
         }
         if (entity.isRemoved() || entity instanceof PartEntity<?>) {
@@ -2513,6 +2591,19 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
         level.guardEntityTick(level::tickNonPassenger, entity);
         return true;
+    }
+
+    /**
+     * {@return true when {@code entity} is ticked through the vehicle that still carries it}
+     * <p>
+     * A passenger is not ticked on its own: the tick of its vehicle runs the whole vanilla tick of every
+     * passenger ({@code Entity#rideTick}), so the vehicle is the entry the entity slices decide on. A
+     * vehicle that was removed or that no longer carries the entity is not a live ride: the vanilla body
+     * stops the ride and ticks the entity itself.
+     */
+    private static boolean ridesLiveVehicle(Entity entity) {
+        final Entity vehicle = entity.getVehicle();
+        return vehicle != null && !vehicle.isRemoved() && vehicle.hasPassenger(entity);
     }
 
     /**
@@ -4694,6 +4785,55 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Applies the portal transitions of the worker-ticked entities of {@code batch} on the server thread.
+     * <p>
+     * A worker never resolves a portal transition: the destination search reads the {@code PoiManager} of the
+     * destination level, which is one storage per level and is not partitioned per region. The worker records
+     * the transition instead and the barrier runs the vanilla resolution here, once per entity per tick.
+     * <p>
+     * The transitions run first in the handoff, because the transition is the earliest level effect of the
+     * tick it belongs to: {@code Entity#baseTick} runs it before the rest of the body. An entity the barrier
+     * cannot transition (it was removed, it left the level, the level identity retired or the engine shut
+     * down) keeps its own portal state, so the next tick of the entity records the transition again instead of
+     * losing it; the refusal is counted.
+     */
+    private void applyDeferredPortalTransitions(RegionEntityTickBatch batch) {
+        final ServerLevel level = batch.level();
+        final List<Entity> transitions = batch.drainDeferredPortalTransitions();
+        if (transitions.isEmpty()) {
+            return;
+        }
+        // Every drained record is one deferred transition, and every one of them is either applied or
+        // refused below, so the counters never lose one silently.
+        this.deferredPortalTransitionCount.addAndGet(transitions.size());
+        if (this.shutdown || this.regionizer.isLevelClosed(level)) {
+            this.refusedPortalTransitionCount.addAndGet(transitions.size());
+            return;
+        }
+        Throwable failure = null;
+        for (final Entity entity : transitions) {
+            if (entity.isRemoved() || entity.level() != level) {
+                this.refusedPortalTransitionCount.incrementAndGet();
+                continue;
+            }
+            try {
+                entity.completePortalTransition(level);
+                this.appliedPortalTransitionCount.incrementAndGet();
+            } catch (Throwable throwable) {
+                this.refusedPortalTransitionCount.incrementAndGet();
+                if (failure == null) {
+                    failure = throwable;
+                } else {
+                    failure.addSuppressed(throwable);
+                }
+            }
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /**
      * Applies the section updates of the moves that a chunk tick worker deferred to the barrier.
      * <p>
      * A precipitation tick pushes the entities standing in the snow layer it raises out of the block, which is
@@ -4961,6 +5101,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     private void closeDeferredSeams() {
         for (final RegionTickBatch active : this.activeTickBatches) {
             if (active instanceof RegionEntityTickBatch entityBatch) {
+                this.refusedPortalTransitionCount.addAndGet(entityBatch.closeDeferredPortalTransitions());
                 this.droppedDeferredSectionUpdateCount.addAndGet(entityBatch.closeDeferredSectionUpdates());
                 this.releaseDeferredRemovals(entityBatch.closeDeferredRemovals());
                 final RegionDeferredEntityAdditions.Drain releasedAdditions = entityBatch.closeDeferredAdditions();
@@ -5685,8 +5826,12 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.entityTickRegionsWithoutEligibleChunk.get(),
                 this.entityTicksOutsideRegion.get(),
                 this.serverThreadOnlyEntityTicks.get(),
+                this.entityTickPolicy.serverThreadOnlyTicks(),
                 this.unindexedEntityTickStarts.get(),
                 this.entityTickIndexFallbacks.get(),
+                this.deferredPortalTransitionCount.get(),
+                this.appliedPortalTransitionCount.get(),
+                this.refusedPortalTransitionCount.get(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
     }

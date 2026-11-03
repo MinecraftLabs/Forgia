@@ -10,30 +10,40 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.GlobalPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.util.RandomSource;
+import net.minecraft.util.Unit;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobSpawnType;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.npc.Villager;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.AbstractFurnaceBlock;
+import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
 import net.minecraft.world.level.block.entity.BeaconBlockEntity;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BedPart;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
@@ -510,6 +520,99 @@ public class RegionThreadingGameTests {
                     "random tick worker slice is enabled but the bridge did not install it");
         }
         return diagnostics;
+    }
+
+    @GameTest(batch = "regionVillagerPoiPolicy", timeoutTicks = 600)
+    @EmptyTemplate(value = "9x6x9", floor = true)
+    @TestHolder(description = "Gives a villager a bed and a workstation: it takes both POIs, and with the entity slice on its tick stays on the server thread")
+    static void villagerTakesPoi(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
+            final ServerLevel level = helper.getLevel();
+            // Relative y=1 is the iron floor block of the empty template, so the bed, the workstation and the
+            // villager stand on the layer above it.
+            final BlockPos foot = helper.absolutePos(new BlockPos(2, 2, 2));
+            final BlockPos head = helper.absolutePos(new BlockPos(2, 2, 3));
+            final BlockPos jobSite = helper.absolutePos(new BlockPos(6, 2, 6));
+            final BlockPos spawn = helper.absolutePos(new BlockPos(4, 2, 4));
+            final ChunkPos chunk = new ChunkPos(spawn);
+            final AtomicReference<Villager> villager = new AtomicReference<>();
+            final long decisionsBefore = diagnostics.map(RegionThreadingGameTests::poiEntityDecisions).orElse(0L);
+            helper.addEndListener(passed -> {
+                if (villager.get() != null) {
+                    villager.get().discard();
+                }
+                level.getChunkSource().removeRegionTicket(TicketType.START, chunk, 1, Unit.INSTANCE);
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> {
+                        // The entity tick of the villager needs an entity-ticking chunk, which the spawn ticket of
+                        // the level gives this test chunk without moving a player here.
+                        level.getChunkSource().addRegionTicket(TicketType.START, chunk, 1, Unit.INSTANCE);
+                        level.setBlockAndUpdate(foot, Blocks.RED_BED.defaultBlockState()
+                                .setValue(BedBlock.FACING, Direction.SOUTH)
+                                .setValue(BedBlock.PART, BedPart.FOOT));
+                        level.setBlockAndUpdate(head, Blocks.RED_BED.defaultBlockState()
+                                .setValue(BedBlock.FACING, Direction.SOUTH)
+                                .setValue(BedBlock.PART, BedPart.HEAD));
+                        level.setBlockAndUpdate(jobSite, Blocks.CARTOGRAPHY_TABLE.defaultBlockState());
+                        final Villager spawned = EntityType.VILLAGER.spawn(level, spawn, MobSpawnType.STRUCTURE);
+                        helper.assertTrue(spawned != null, "the test could not spawn its villager");
+                        spawned.setPersistenceRequired();
+                        villager.set(spawned);
+                    })
+                    // The villager acquires the bed through AcquirePoi and the workstation through the job site
+                    // search of its core activity; both are POI reads and takes of the level's PoiManager.
+                    .thenWaitUntil(() -> {
+                        final Villager checked = villager.get();
+                        helper.assertTrue(checked != null && !checked.isRemoved(), "the villager disappeared");
+                        helper.assertTrue(checked.getBrain().getMemory(MemoryModuleType.HOME)
+                                .map(GlobalPos::pos)
+                                .filter(pos -> pos.equals(foot) || pos.equals(head))
+                                .isPresent(), "the villager did not take the bed");
+                        // The job site search first records the workstation as POTENTIAL_JOB_SITE and claims it
+                        // as JOB_SITE once the villager reached it, which is the same tick that assigns the
+                        // cartographer profession. Both are POI takes of the level's PoiManager.
+                        helper.assertTrue(checked.getBrain().getMemory(MemoryModuleType.JOB_SITE)
+                                .map(GlobalPos::pos)
+                                .filter(jobSite::equals)
+                                .isPresent(), "the villager did not take the workstation");
+                    })
+                    .thenExecute(() -> {
+                        if (entityTickSliceEffective(diagnostics)) {
+                            helper.assertTrue(poiEntityDecisions(diagnostics()) > decisionsBefore,
+                                    "the villager acquired its POIs but was never handed to the server thread by the POI policy");
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    /**
+     * {@return the entity tick decisions the per-type policy took for a POI reason}
+     * <p>
+     * The reasons of the vanilla declarations all start with {@code poi: } and name the audited tick path, so
+     * the sum answers whether a POI-touching entity was handed to the server thread at all.
+     */
+    private static long poiEntityDecisions(RegionThreadingDiagnostics diagnostics) {
+        return diagnostics.serverThreadOnlyEntityTicksByReason().entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith("poi: "))
+                .mapToLong(java.util.Map.Entry::getValue)
+                .sum();
+    }
+
+    /**
+     * {@return true when the installed engine really ticks entities on region workers}
+     * <p>
+     * The slice is configured ({@code entityTickWorkerExecutionEnabled}) but only effective with region-owned
+     * entity storage, which production does not select. The counter assertions of the tests that need the
+     * worker path are therefore guarded by this answer, exactly like the block-entity and chunk tests guard
+     * theirs.
+     */
+    private static boolean entityTickSliceEffective(Optional<RegionThreadingDiagnostics> diagnostics) {
+        return diagnostics.map(regionDiagnostics -> regionDiagnostics.entityTickWorkerExecutionEnabled()
+                && regionDiagnostics.entityStorageMode() == RegionEntityStorageMode.REGION_OWNED).orElse(false);
     }
 
     /**

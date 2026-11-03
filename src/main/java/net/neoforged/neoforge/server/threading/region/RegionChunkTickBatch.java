@@ -294,5 +294,11 @@ final class RegionChunkTickBatch extends RegionTickBatch {
         public boolean deferAddition(Entity entity, List<Entity> graph) {
             return this.batch.deferAddition(entity, graph);
         }
+
+        @Override
+        public boolean deferPortalTransition(Entity entity) {
+            // A chunk tick never transitions an entity, so this group has no transition to defer.
+            return false;
+        }
     }
 }

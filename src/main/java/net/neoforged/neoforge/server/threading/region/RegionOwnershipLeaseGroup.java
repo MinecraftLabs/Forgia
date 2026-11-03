@@ -62,4 +62,17 @@ interface RegionOwnershipLeaseGroup {
      *         refusal
      */
     boolean deferAddition(Entity entity, List<Entity> graph);
+
+    /**
+     * Records the portal transition of one entity for the batch barrier.
+     * <p>
+     * The destination search of a portal transition ({@code PortalForcer#findClosestPortalPosition}) reads the
+     * {@code PoiManager} of the destination level, which no worker may touch, and it is reachable from every
+     * entity type through {@code Entity#handlePortal}, so it cannot be pinned per type. The group that owns the
+     * entity records the transition instead; the barrier resolves and applies it on the server thread.
+     *
+     * @return {@code false} when the group cannot defer the transition, so the caller keeps the inline
+     *         vanilla transition
+     */
+    boolean deferPortalTransition(Entity entity);
 }

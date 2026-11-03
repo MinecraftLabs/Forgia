@@ -341,6 +341,36 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     }
 
     /**
+     * Records the portal transition of {@code entity} for the batch barrier of the active lease.
+     * <p>
+     * This is the type-independent counterpart of the entity tick policy: a portal transition is reachable
+     * from every entity type through {@code Entity#handlePortal}, so no declaration can keep it off a worker.
+     * The transition the worker would have resolved inline is recorded instead, and the barrier runs it on the
+     * server thread in the same tick, where the destination search may read the {@code PoiManager} of the
+     * destination level.
+     * <p>
+     * The entity keeps its own portal state when this refuses: the caller then runs the inline vanilla
+     * transition, which is the only path that reaches the destination storage from a worker.
+     *
+     * @param level  the level the transition happens in
+     * @param entity the entity that completed its portal time
+     * @return {@code true} when the caller must skip the inline transition because the barrier runs it,
+     *         {@code false} when the caller keeps it
+     */
+    public static boolean deferPortalTransition(ServerLevel level, Entity entity) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null
+                || !scope.isActive()
+                || !RegionWorkerScope.isNativeWorkerThread()
+                || scope.coordinate.level() != level
+                || entity.level() != level
+                || entity.isRemoved()) {
+            return false;
+        }
+        return scope.group.deferPortalTransition(entity);
+    }
+
+    /**
      * {@return true when {@code pos} of {@code level} lies inside the region of the active lease {@code scope}}
      * <p>
      * The bounds are the ones of the physical section bucket of the leased region, the same block bounds the
