@@ -72,6 +72,14 @@ import java.util.List;
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
  * diagnostic consumer read the same value the engine and the physical section partitions use.
  * <p>
+ * The four block-entity chunk counters report the chunks the chunk-indexed plan did not hand to a worker, by
+ * reason. A non-ticking chunk is out of block ticking range or the tick rate is frozen, a chunk whose entities
+ * are still loading keeps the vanilla skip, and a chunk that is no longer loaded has no snapshot at all; none
+ * of them ticks this tick, exactly like the vanilla ticker loop skips them. A stale snapshot counts a chunk
+ * whose ticker set or chunk instance changed between the plan and the worker tick, so its tickers were
+ * revalidated and ticked on the server thread instead of from the stale snapshot. The first three counters
+ * therefore measure work the plan avoided, and the last one measures the safety net.
+ * <p>
  * The three chunk counters report the entity and block-entity ticks that did not run on a worker because a
  * chunk they need was not available. A guard refusal counts one chunk request that a native region worker
  * refused instead of blocking on the server chunk source
@@ -132,6 +140,10 @@ public record RegionThreadingDiagnostics(
         long blockEntityTicksOnWorkers,
         long skippedBlockEntityTicks,
         long fallbackBlockEntityTicks,
+        long nonTickingBlockEntityChunks,
+        long entitiesLoadingBlockEntityChunks,
+        long missingBlockEntityChunks,
+        long staleBlockEntityChunkSnapshots,
         long scheduledTicksOnWorkers,
         long skippedScheduledTicks,
         long fallbackScheduledTicks,

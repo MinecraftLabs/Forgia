@@ -550,8 +550,8 @@ class RegionBlockEntityTickTest {
             tickThreads.add(Thread.currentThread().getName());
             return null;
         }).when(added).tick();
-        blockEntityTickers(level).add(first);
-        blockEntityTickers(level).add(second);
+        level.addBlockEntityTicker(first);
+        level.addBlockEntityTicker(second);
 
         tickBlockEntities(level);
 
@@ -597,7 +597,7 @@ class RegionBlockEntityTickTest {
         final ServerLevel level = mockLevel();
         final TickingBlockEntity removed = mockTicker(new BlockPos(16, 64, 16));
         when(removed.isRemoved()).thenReturn(true);
-        blockEntityTickers(level).add(removed);
+        level.addBlockEntityTicker(removed);
 
         tickBlockEntities(level);
 
@@ -633,7 +633,7 @@ class RegionBlockEntityTickTest {
             }
             return null;
         }).when(ticker).tick();
-        blockEntityTickers(level).add(ticker);
+        level.addBlockEntityTicker(ticker);
 
         tickBlockEntities(level);
 
@@ -693,7 +693,7 @@ class RegionBlockEntityTickTest {
             }
             return null;
         }).when(failing).tick();
-        blockEntityTickers(level).add(failing);
+        level.addBlockEntityTicker(failing);
 
         final IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> tickBlockEntities(level));
 
@@ -961,6 +961,9 @@ class RegionBlockEntityTickTest {
         setLevelFieldUnchecked(level, "freshBlockEntities", new ArrayList<BlockEntity>());
         setLevelFieldUnchecked(level, "pendingFreshBlockEntities", new ArrayList<BlockEntity>());
         setLevelFieldUnchecked(level, "blockEntityTickerLock", new Object());
+        setLevelFieldUnchecked(level, "foreignBlockEntityTickers", new ArrayList<TickingBlockEntity>());
+        setLevelFieldUnchecked(level, "blockEntityTickerChunks", new it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<net.minecraft.world.level.chunk.LevelChunk>());
+        setLevelFieldUnchecked(level, "blockEntityTickerSequence", new java.util.concurrent.atomic.AtomicLong());
         return level;
     }
 

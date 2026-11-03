@@ -5,25 +5,25 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
-import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.minecraft.world.level.chunk.LevelChunk;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * Admission snapshot of the block-entity tickers of one loaded chunk.
  * <p>
- * Building the block-entity plan re-evaluated three decisions for every ticker of every level tick: the
- * allowlist of the compatibility declaration, the interior-chunk rule of the ticker's chunk and the region
- * the ticker's position belongs to. All three only change when the chunk's ticker set or the region layout
- * changes, so this snapshot holds them for the whole time they are valid: one {@link
- * RegionBlockEntityTickAdmission} per ticker (the exact binding capture, its position, its type and its
- * decision) and the interior-chunk flag of the chunk. The plan then costs one lookup per ticker plus one
- * chunk lookup per chunk instead of an admission, a binding capture and an interior-chunk computation per
- * ticker. The region of a ticker is not cached: the lease resolves it per ticker like it always did, so a
- * merge, a split or an empty retirement needs no invalidation here.
+ * The snapshot holds every ticker the chunk currently owns in the order the level's own ticker list would
+ * tick it, together with the three decisions the plan used to re-evaluate for every ticker of every level
+ * tick: the allowlist of the compatibility declaration, the interior-chunk rule of the ticker's chunk and the
+ * exact binding capture. Building it costs one admission per ticker; reusing it costs one chunk lookup per
+ * chunk per tick, and the workers iterate the admitted tickers themselves, so the server thread never walks
+ * the tickers.
  * <p>
  * The snapshot is stored on the {@code LevelChunk} itself, so exactly one snapshot exists per loaded chunk
  * and it is released with the chunk: {@code LevelChunk.clearAllBlockEntities()} is what
@@ -41,13 +41,18 @@ import org.jetbrains.annotations.Nullable;
  * <li>the region layout or its fixed size changed: the layout instance is part of the validity check.</li>
  * </ul>
  * A region merge, a split or an empty retirement does not invalidate the snapshot: the snapshot holds no
- * region state, and the batch resolves the region of every ticker from the regionizer.
+ * region state, and the batch resolves the region of every chunk from the regionizer.
  * Everything else is not cached here: the entity-load eligibility of the chunk stays a per-tick, per-chunk
  * read on the server thread, and the binding capture of a ticker is re-checked against the live ticker
- * before its admission is reused.
+ * before its admission is used.
  */
 @ApiStatus.Internal
 public final class RegionBlockEntityTickChunkCache {
+    /**
+     * Orders the admissions of a chunk like the level's own ticker list: the wrapper creation sequence of a
+     * chunk-owned ticker never changes, and a rebind keeps the position the ticker already had.
+     */
+    private static final Comparator<RegionBlockEntityTickAdmission> BY_TICKER_SEQUENCE = Comparator.comparingLong(RegionBlockEntityTickAdmission::sequence);
     /**
      * Snapshots that a chunk currently holds. It only proves the memory bound of the snapshot set: a chunk
      * holds at most one snapshot, and a released snapshot is not counted.
@@ -57,13 +62,56 @@ public final class RegionBlockEntityTickChunkCache {
     private final RegionLayout layout;
     private final long tickerRevision;
     private final boolean interiorChunk;
-    private final Map<TickingBlockEntity, RegionBlockEntityTickAdmission> admissions = new IdentityHashMap<>();
+    private final List<RegionBlockEntityTickAdmission> admissions;
+    private final boolean allAdmitted;
+    private boolean released;
 
-    RegionBlockEntityTickChunkCache(RegionLayout layout, long tickerRevision, boolean interiorChunk) {
+    private RegionBlockEntityTickChunkCache(RegionLayout layout, long tickerRevision, boolean interiorChunk,
+            List<RegionBlockEntityTickAdmission> admissions) {
         this.layout = layout;
         this.tickerRevision = tickerRevision;
         this.interiorChunk = interiorChunk;
+        this.admissions = admissions;
+        boolean admitted = true;
+        for (final RegionBlockEntityTickAdmission admission : admissions) {
+            // A capture that is already stale, or a declaration that does not admit the type or the chunk,
+            // keeps the whole region of the chunk on the server thread, exactly like a collected ticker the
+            // declaration does not admit.
+            admitted &= admission.isAdmitted() && admission.isCurrent();
+        }
+        this.allAdmitted = admitted;
         LIVE_SNAPSHOTS.incrementAndGet();
+    }
+
+    /**
+     * Builds the snapshot of {@code chunk} from the tickers it currently holds.
+     * <p>
+     * Runs on the server thread while no worker ticks, so the chunk's ticker set cannot change underneath it.
+     * The chunk's own ticker revision is read first, so a ticker added while the snapshot is built makes the
+     * snapshot stale instead of silently missing from it.
+     *
+     * @param level         the level the tickers belong to
+     * @param chunk         the chunk whose tickers the snapshot holds
+     * @param layout        the region layout the snapshot is built for
+     * @param interiorChunk whether the chunk is an interior chunk of its region
+     */
+    static RegionBlockEntityTickChunkCache build(ServerLevel level, LevelChunk chunk, RegionLayout layout, boolean interiorChunk) {
+        final long tickerRevision = chunk.blockEntityTickerRevision();
+        final List<TickingBlockEntity> tickers = new ArrayList<>(chunk.blockEntityTickers());
+        tickers.sort(Comparator.comparingLong(LevelChunk::blockEntityTickerSequence));
+        final List<RegionBlockEntityTickAdmission> admissions = new ArrayList<>(tickers.size());
+        for (final TickingBlockEntity ticker : tickers) {
+            final String type = ticker.getType();
+            admissions.add(new RegionBlockEntityTickAdmission(
+                    level,
+                    ticker,
+                    ticker.getPos(),
+                    type,
+                    LevelChunk.captureBlockEntityTickBinding(ticker, level),
+                    RegionTickCompatibility.decideBlockEntityTick(type, interiorChunk),
+                    LevelChunk.blockEntityTickerSequence(ticker)));
+        }
+        return new RegionBlockEntityTickChunkCache(layout, tickerRevision, interiorChunk, List.copyOf(admissions));
     }
 
     /**
@@ -80,17 +128,35 @@ public final class RegionBlockEntityTickChunkCache {
         return this.layout == layout && this.tickerRevision == tickerRevision;
     }
 
+    /** {@return the admissions of this chunk, ordered like the level's own ticker list} */
+    public List<RegionBlockEntityTickAdmission> admissions() {
+        return this.admissions;
+    }
+
     /**
-     * {@return the cached admission of {@code ticker}, or {@code null} when the snapshot has none yet}
+     * {@return the admission of {@code ticker} in this snapshot, or {@code null} when the chunk does not hold
+     * it}
+     * <p>
+     * Only the explicit per-ticker admission looks a ticker up; the chunk-indexed plan reads the whole list.
      */
     @Nullable
     RegionBlockEntityTickAdmission admission(TickingBlockEntity ticker) {
-        return this.admissions.get(ticker);
+        for (final RegionBlockEntityTickAdmission admission : this.admissions) {
+            if (admission.ticker() == ticker) {
+                return admission;
+            }
+        }
+        return null;
     }
 
-    /** Replaces the cached admission of {@code ticker}. */
-    void putAdmission(TickingBlockEntity ticker, RegionBlockEntityTickAdmission admission) {
-        this.admissions.put(ticker, admission);
+    /**
+     * {@return true when every ticker of the chunk is admitted to a worker tick and its capture is current}
+     * <p>
+     * The batch keeps a whole region on the server thread when one of its chunks is not fully admitted, so the
+     * conservative whole-region fallback needs one boolean per chunk instead of a pass over the tickers.
+     */
+    public boolean allAdmitted() {
+        return this.allAdmitted;
     }
 
     /** {@return true when the chunk is an interior chunk of its region, so its types may write around it} */
@@ -102,11 +168,14 @@ public final class RegionBlockEntityTickChunkCache {
      * Releases the snapshot when the chunk unloads or replaces its ticker set.
      * <p>
      * A released snapshot must not be used again: the chunk drops its reference in the same step, so the
-     * release is the last transition of the object.
+     * release is the last transition of the object. The admissions stay readable, because a worker group that
+     * already holds the snapshot may still iterate it until the batch finishes.
      */
     public void release() {
-        this.admissions.clear();
-        LIVE_SNAPSHOTS.decrementAndGet();
+        if (!this.released) {
+            this.released = true;
+            LIVE_SNAPSHOTS.decrementAndGet();
+        }
     }
 
     /** {@return the number of snapshots the loaded chunks currently hold} */

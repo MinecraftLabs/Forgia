@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
-@@ -73,6 +_,14 @@
+@@ -73,6 +_,15 @@
          }
      };
      private final Map<BlockPos, LevelChunk.RebindableTickingBlockEntityWrapper> tickersInLevel = Maps.newHashMap();
@@ -10,8 +10,9 @@
 +    /**
 +     * Neo: revision of the block-entity ticker set of this chunk. Every add, remove and rebind of a ticker
 +     * bumps it, so a cached admission snapshot of the chunk is never reused across a change of its ticker set.
++     * It is volatile because a worker revalidates the snapshot it was handed against it.
 +     */
-+    private long blockEntityTickerRevision;
++    private volatile long blockEntityTickerRevision;
      private boolean loaded;
      final Level level;
      @Nullable
@@ -116,7 +117,7 @@
              }
          }
  
-@@ -459,6 +_,7 @@
+@@ -459,9 +_,16 @@
      }
  
      private void removeBlockEntityTicker(BlockPos p_156413_) {
@@ -124,6 +125,15 @@
          LevelChunk.RebindableTickingBlockEntityWrapper levelchunk$rebindabletickingblockentitywrapper = this.tickersInLevel.remove(p_156413_);
          if (levelchunk$rebindabletickingblockentitywrapper != null) {
              levelchunk$rebindabletickingblockentitywrapper.rebind(NULL_TICKER);
++            // Neo: the removed wrapper stays in the level's own ticker list until it is pruned, and a chunk
++            // without tickers leaves the plan's chunk index.
++            this.level.markBlockEntityTickerRemoved();
++        }
++        if (this.tickersInLevel.isEmpty()) {
++            this.level.unregisterBlockEntityTickerChunk(this);
+         }
+     }
+ 
 @@ -496,7 +_,7 @@
          p_187974_.accept((p_338077_, p_338078_, p_338079_) -> {
              BlockEntity blockentity = this.getBlockEntity(p_338077_, LevelChunk.EntityCreationType.IMMEDIATE);
@@ -133,14 +143,17 @@
              }
          });
      }
-@@ -604,6 +_,11 @@
+@@ -604,6 +_,14 @@
      }
  
      public void clearAllBlockEntities() {
 +        ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
 +        // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
-+        // with them instead of being kept by a chunk that no longer ticks anything.
++        // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
++        // plan's chunk index.
 +        this.setBlockEntityTickAdmissionCache(null);
++        this.level.unregisterBlockEntityTickerChunk(this);
++        this.level.markBlockEntityTickerRemoved();
 +        this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
          this.blockEntities.values().forEach(BlockEntity::setRemoved);
          this.blockEntities.clear();
@@ -161,7 +174,18 @@
          BlockState blockstate = p_156407_.getBlockState();
          BlockEntityTicker<T> blockentityticker = blockstate.getTicker(this.level, (BlockEntityType<T>)p_156407_.getType());
          if (blockentityticker == null) {
-@@ -662,27 +_,92 @@
+@@ -656,33 +_,147 @@
+                     }
+                 );
+         }
++        // Neo: a chunk that holds tickers joins the level's chunk index, so the block-entity worker plan can
++        // visit chunks instead of tickers. A chunk outside the level registers no ticker at all.
++        if (!this.tickersInLevel.isEmpty()) {
++            this.level.registerBlockEntityTickerChunk(this);
++        }
+     }
+ 
+     private <T extends BlockEntity> TickingBlockEntity createTicker(T p_156376_, BlockEntityTicker<T> p_156377_) {
          return new LevelChunk.BoundTickingBlockEntity<>(p_156376_, p_156377_);
      }
  
@@ -216,6 +240,50 @@
 +     */
 +    public long blockEntityTickerRevision() {
 +        return this.blockEntityTickerRevision;
++    }
++
++    /** Neo: whether this chunk is currently loaded in its level. */
++    public boolean isLoaded() {
++        return this.loaded;
++    }
++
++    /**
++     * Neo: bumps the ticker revision of this chunk without changing its tickers.
++     * <p>
++     * The stale-snapshot test uses it to put the chunk into the state a chunk that changed its ticker set
++     * between the plan and the worker tick is in, so the worker has to refuse the snapshot the plan handed
++     * over and tick the chunk on the server thread instead.
++     */
++    @org.jetbrains.annotations.VisibleForTesting
++    public void bumpBlockEntityTickerRevision() {
++        ++this.blockEntityTickerRevision;
++    }
++
++    /**
++     * Neo: the block-entity tickers this chunk currently holds, in no particular order.
++     * <p>
++     * The chunk's admission snapshot is built from this view, so the block-entity worker plan can decide for
++     * a whole chunk without walking the level's ticker list. Only the server thread reads it, and only while
++     * no worker ticks.
++     */
++    public java.util.Collection<TickingBlockEntity> blockEntityTickers() {
++        return java.util.Collections.unmodifiableCollection(this.tickersInLevel.values());
++    }
++
++    /** Neo: whether {@code ticker} is owned by a chunk instead of added to the level directly. */
++    public static boolean isChunkOwnedTicker(TickingBlockEntity ticker) {
++        return ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper;
++    }
++
++    /**
++     * Neo: the creation sequence of {@code ticker}, which orders it exactly like the level's own ticker list
++     * orders the tickers it was appended to.
++     *
++     * @return the sequence of a chunk-owned ticker wrapper, or {@link Long#MAX_VALUE} for a ticker the level
++     *         owns itself
++     */
++    public static long blockEntityTickerSequence(TickingBlockEntity ticker) {
++        return ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper wrapper ? wrapper.tickerSequence() : Long.MAX_VALUE;
 +    }
 +
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {
@@ -291,15 +359,22 @@
          }
  
          @Override
-@@ -740,6 +_,7 @@
+@@ -740,13 +_,29 @@
  
      class RebindableTickingBlockEntityWrapper implements TickingBlockEntity {
          private TickingBlockEntity ticker;
 +        private long bindingVersion;
++        /** Neo: creation order of this wrapper, so the plan can order a chunk's tickers like the level does. */
++        private final long tickerSequence;
  
          RebindableTickingBlockEntityWrapper(TickingBlockEntity p_156447_) {
              this.ticker = p_156447_;
-@@ -747,6 +_,14 @@
++            this.tickerSequence = LevelChunk.this.level.nextBlockEntityTickerSequence();
++        }
++
++        long tickerSequence() {
++            return this.tickerSequence;
+         }
  
          void rebind(TickingBlockEntity p_156450_) {
              this.ticker = p_156450_;

@@ -9,6 +9,7 @@ import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -142,6 +143,14 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong blockEntityTicksOnWorkers = new AtomicLong();
     private final AtomicLong skippedBlockEntityTicks = new AtomicLong();
     private final AtomicLong fallbackBlockEntityTicks = new AtomicLong();
+    /** Chunks the plan did not hand over because they are not block-ticking (or the tick rate is frozen). */
+    private final AtomicLong nonTickingBlockEntityChunks = new AtomicLong();
+    /** Chunks the plan did not hand over because their entities are still loading. */
+    private final AtomicLong entitiesLoadingBlockEntityChunks = new AtomicLong();
+    /** Chunks the plan did not hand over because they are no longer loaded, so no snapshot exists. */
+    private final AtomicLong missingBlockEntityChunks = new AtomicLong();
+    /** Chunks whose snapshot went stale between the plan and the worker, so the server thread ticked them. */
+    private final AtomicLong staleBlockEntityChunkSnapshots = new AtomicLong();
     private final AtomicLong scheduledTicksOnWorkers = new AtomicLong();
     private final AtomicLong skippedScheduledTicks = new AtomicLong();
     private final AtomicLong fallbackScheduledTicks = new AtomicLong();
@@ -1732,8 +1741,23 @@ public final class RegionThreadingEngine implements RegionThreading {
         level.guardEntityTick(level::tickNonPassenger, entity);
     }
 
+    /** Records a chunk the plan did not hand over because it is not block-ticking this tick. */
+    void countNonTickingBlockEntityChunk() {
+        this.nonTickingBlockEntityChunks.incrementAndGet();
+    }
+
+    /** Records a chunk the plan did not hand over because its entities are still loading. */
+    void countEntitiesLoadingBlockEntityChunk() {
+        this.entitiesLoadingBlockEntityChunks.incrementAndGet();
+    }
+
+    /** Records a chunk the plan did not hand over because it is no longer loaded. */
+    void countMissingBlockEntityChunk() {
+        this.missingBlockEntityChunks.incrementAndGet();
+    }
+
     /**
-     * Ticks {@code tickers} on their owning region workers and waits for the batch.
+     * Ticks {@code chunks} on their owning region workers and waits for the batch.
      * <p>
      * Runs on the server thread: while the workers tick, the server thread only services chunk source
      * tasks, so off thread chunk requests issued by block-entity code cannot deadlock against the barrier.
@@ -1744,16 +1768,17 @@ public final class RegionThreadingEngine implements RegionThreading {
      * published batch, so the batch must be able to acquire leases and retire its regions without taking
      * the gate again. Region ownership is re-resolved from the regionizer after the snapshot, so a region
      * that merged or split between collection and lease acquisition is replaced by its authoritative
-     * successor instead of dropping the ticker. Tickers whose region cannot be leased safely are ticked on
-     * the server thread after the batch rather than being dropped.
+     * successor instead of dropping the chunk. Chunks whose region cannot be leased safely, and chunks whose
+     * admission snapshot went stale before the worker ticked them, are ticked on the server thread after the
+     * batch rather than being dropped.
      * <p>
      * The two server-owned effects a worker group defers are applied here, after the workers finished and
      * before the batch is released: the removals of the entities an owned ticker removed, and the scheduled
      * ticks its neighbor updates started. The fallback ticks run between them, so a ticker the server thread
      * ticks after the batch observes the removals of the batch it belongs to.
      */
-    void tickBlockEntities(ServerLevel level, List<RegionBlockEntityTickAdmission> tickers, RegionTickBarrier barrier) {
-        if (tickers.isEmpty()) {
+    void tickBlockEntities(ServerLevel level, List<RegionBlockEntityTickChunk> chunks, RegionTickBarrier barrier) {
+        if (chunks.isEmpty()) {
             return;
         }
 
@@ -1763,14 +1788,14 @@ public final class RegionThreadingEngine implements RegionThreading {
             // The level clear completed after this snapshot was collected. Its region state is retired
             // and no batch may be published for it: the collected tickers must not tick for a level
             // that already unloaded.
-            this.skippedBlockEntityTicks.addAndGet(tickers.size());
+            this.skippedBlockEntityTicks.addAndGet(countBlockEntityTickers(chunks));
             return;
         }
         if (publication == TickBatchPublication.SHUTDOWN) {
             // The engine was shut down between the snapshot and the batch; the collected tickers still
             // have to tick, but no batch may be published after shutdown started.
-            for (final RegionBlockEntityTickAdmission ticker : tickers) {
-                this.tickBlockEntityInline(level, ticker.ticker());
+            for (final RegionBlockEntityTickChunk chunk : chunks) {
+                this.tickBlockEntityChunkInline(level, chunk);
             }
             return;
         }
@@ -1784,7 +1809,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         try {
             final long leaseStart = attribution ? System.nanoTime() : 0L;
             try {
-                this.leaseBlockEntityTickGroups(batch, tickers, barrier);
+                this.leaseBlockEntityTickGroups(batch, chunks, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
@@ -1838,18 +1863,18 @@ public final class RegionThreadingEngine implements RegionThreading {
      * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt.
      * Anything that cannot be resolved to a live, leasable region is recorded as a server-thread fallback.
      */
-    private void leaseBlockEntityTickGroups(RegionBlockEntityTickBatch batch, List<RegionBlockEntityTickAdmission> pending, RegionTickBarrier barrier) {
-        List<RegionBlockEntityTickAdmission> remaining = pending;
+    private void leaseBlockEntityTickGroups(RegionBlockEntityTickBatch batch, List<RegionBlockEntityTickChunk> pending, RegionTickBarrier barrier) {
+        List<RegionBlockEntityTickChunk> remaining = pending;
         int batchedTickers = 0;
         for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
-            final RegionTickGrouping<RegionState, RegionBlockEntityTickAdmission> grouping = new RegionTickGrouping<>();
-            final List<RegionBlockEntityTickAdmission> retry = new ArrayList<>();
-            for (final RegionBlockEntityTickAdmission ticker : remaining) {
-                final RegionState region = this.regionizer.getOrCreate(this.layout.regionAt(batch.level(), ticker.position()));
+            final RegionTickGrouping<RegionState, RegionBlockEntityTickChunk> grouping = new RegionTickGrouping<>();
+            final List<RegionBlockEntityTickChunk> retry = new ArrayList<>();
+            for (final RegionBlockEntityTickChunk chunk : remaining) {
+                final RegionState region = this.regionizer.getOrCreate(chunk.region(this.layout, batch.level()));
                 if (region == null || region.isDead()) {
-                    retry.add(ticker);
+                    retry.add(chunk);
                 } else {
-                    grouping.add(region, ticker);
+                    grouping.add(region, chunk);
                 }
             }
             if (grouping.isEmpty()) {
@@ -1857,34 +1882,34 @@ public final class RegionThreadingEngine implements RegionThreading {
                 break;
             }
 
-            final List<RegionBlockEntityTickAdmission> next = new ArrayList<>(retry);
+            final List<RegionBlockEntityTickChunk> next = new ArrayList<>(retry);
             boolean leasedAny = false;
             for (final RegionState region : grouping.regions()) {
-                final List<RegionBlockEntityTickAdmission> regionTickers = grouping.items(region);
-                if (!this.isRegionSafeBlockEntityGroup(regionTickers)) {
+                final List<RegionBlockEntityTickChunk> regionChunks = grouping.items(region);
+                if (!this.isRegionSafeBlockEntityGroup(regionChunks)) {
                     // Conservative whole-region fallback: a region that contains at least one ticker whose
                     // compatibility declaration does not prove region-local, storage-free work keeps all
                     // of its tickers on the server thread after the batch. The order inside the region is
                     // preserved and no query consumer ever runs on a worker.
-                    for (final RegionBlockEntityTickAdmission ticker : regionTickers) {
-                        batch.addFallback(ticker);
-                        this.fallbackBlockEntityTicks.incrementAndGet();
+                    for (final RegionBlockEntityTickChunk chunk : regionChunks) {
+                        batch.addFallbackChunk(chunk);
+                        this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
                     }
                     continue;
                 }
                 if (batch.leases(region)) {
                     // An earlier group of this same batch already owns the lease. It cannot be
                     // acquired again and must never be awaited on this thread.
-                    batch.group(region).ifPresent(group -> group.addTickers(regionTickers));
+                    batch.group(region).ifPresent(group -> group.addChunks(regionChunks));
                     continue;
                 }
                 if (!this.acquireRegionLease(region, barrier)) {
-                    next.addAll(regionTickers);
+                    next.addAll(regionChunks);
                     continue;
                 }
                 leasedAny = true;
-                batchedTickers += regionTickers.size();
-                this.addLeasedGroup(region, () -> batch.addGroup(region, regionTickers, group -> this.blockEntityTickGroup(group)));
+                batchedTickers += countBlockEntityTickers(regionChunks);
+                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks, group -> this.blockEntityTickGroup(group)));
             }
             remaining = next;
             if (!leasedAny) {
@@ -1893,34 +1918,44 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
         }
 
-        for (final RegionBlockEntityTickAdmission ticker : remaining) {
-            batch.addFallback(ticker);
-            this.fallbackBlockEntityTicks.incrementAndGet();
+        for (final RegionBlockEntityTickChunk chunk : remaining) {
+            batch.addFallbackChunk(chunk);
+            this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
         }
         if (batchedTickers > 0 && this.blockEntityTickWorkersNoticeLogged.compareAndSet(false, true)) {
             LOGGER.info("Region block entity ticks are now executing on region workers: {} block entities", batchedTickers);
         }
     }
 
-    private boolean isRegionSafeBlockEntityGroup(List<RegionBlockEntityTickAdmission> tickers) {
-        for (final RegionBlockEntityTickAdmission ticker : tickers) {
-            if (!ticker.isAdmitted()) {
+    private boolean isRegionSafeBlockEntityGroup(List<RegionBlockEntityTickChunk> chunks) {
+        for (final RegionBlockEntityTickChunk chunk : chunks) {
+            if (!chunk.allAdmitted()) {
                 return false;
             }
         }
         return true;
     }
 
+    /** {@return the number of tickers {@code chunks} hand to a worker group} */
+    private static int countBlockEntityTickers(List<RegionBlockEntityTickChunk> chunks) {
+        int tickers = 0;
+        for (final RegionBlockEntityTickChunk chunk : chunks) {
+            tickers += chunk.admissions().size();
+        }
+        return tickers;
+    }
+
     private Runnable blockEntityTickGroup(RegionBlockEntityTickBatch.Group group) {
         final RegionState region = group.region();
         final RegionCoordinate coordinate = region.coordinate();
-        final List<RegionBlockEntityTickAdmission> tickers = group.tickers();
+        final List<RegionBlockEntityTickChunk> chunks = group.chunks();
         final ServerLevel level = group.batch().level();
         final RandomSource random = group.random();
         return () -> {
             final long start = System.nanoTime();
             final int[] ticked = { 0 };
             try {
+                final List<RegionBlockEntityTickAdmission> tickers = this.orderBlockEntityGroup(group, chunks);
                 region.beginOwnership();
                 // The group random is installed once for the whole worker tick loop, so a direct
                 // level.random read of a ticker resolves this group's source through the level random
@@ -1990,13 +2025,64 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Ticks the block-entity tickers whose region could not be leased safely on the server thread after
-     * the batch.
+     * Orders the tickers of a worker group's chunks like the level's own ticker list, and hands the chunks
+     * whose snapshot went stale back to the server thread.
+     * <p>
+     * Each chunk's admissions are already in ticker order, so a group of one chunk needs no work. A group of
+     * several chunks merges them by ticker sequence, which reproduces the order the level's ticker list would
+     * have ticked that region in. A chunk that unloaded or changed its ticker set since the plan handed it
+     * over is not ticked from its stale snapshot: its tickers are revalidated and ticked on the server thread
+     * after the batch, and the stale snapshot is counted.
+     */
+    private List<RegionBlockEntityTickAdmission> orderBlockEntityGroup(RegionBlockEntityTickBatch.Group group, List<RegionBlockEntityTickChunk> chunks) {
+        final RegionLayout layout = this.layout;
+        if (chunks.size() == 1) {
+            final RegionBlockEntityTickChunk chunk = chunks.get(0);
+            if (!chunk.isCurrent(layout)) {
+                this.deferStaleBlockEntityChunk(group, chunk);
+                return List.of();
+            }
+            return chunk.admissions();
+        }
+        final List<RegionBlockEntityTickAdmission> ordered = new ArrayList<>(countBlockEntityTickers(chunks));
+        for (final RegionBlockEntityTickChunk chunk : chunks) {
+            if (!chunk.isCurrent(layout)) {
+                this.deferStaleBlockEntityChunk(group, chunk);
+                continue;
+            }
+            ordered.addAll(chunk.admissions());
+        }
+        ordered.sort(Comparator.comparingLong(RegionBlockEntityTickAdmission::sequence));
+        return ordered;
+    }
+
+    /**
+     * Hands the tickers of a chunk whose snapshot went stale to the server-thread fallback of {@code group}.
+     */
+    private void deferStaleBlockEntityChunk(RegionBlockEntityTickBatch.Group group, RegionBlockEntityTickChunk chunk) {
+        this.staleBlockEntityChunkSnapshots.incrementAndGet();
+        this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
+        group.batch().addFallbackChunk(chunk);
+    }
+
+    /**
+     * Ticks the block-entity chunks whose region could not be leased safely, whose snapshot went stale before
+     * the worker ticked it, and the tickers a worker handed back, on the server thread after the batch.
      */
     private void tickFallbackBlockEntities(RegionBlockEntityTickBatch batch) {
         final ServerLevel level = batch.level();
+        for (final RegionBlockEntityTickChunk chunk : batch.fallbackChunks()) {
+            this.tickBlockEntityChunkInline(level, chunk);
+        }
         for (final RegionBlockEntityTickAdmission ticker : batch.fallbackTickers()) {
             this.tickBlockEntityInline(level, ticker.ticker());
+        }
+    }
+
+    /** Ticks the tickers of one chunk on the server thread, in their collected order. */
+    private void tickBlockEntityChunkInline(ServerLevel level, RegionBlockEntityTickChunk chunk) {
+        for (final RegionBlockEntityTickAdmission admission : chunk.admissions()) {
+            this.tickBlockEntityInline(level, admission.ticker());
         }
     }
 
@@ -3843,6 +3929,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.blockEntityTicksOnWorkers.get(),
                 this.skippedBlockEntityTicks.get(),
                 this.fallbackBlockEntityTicks.get(),
+                this.nonTickingBlockEntityChunks.get(),
+                this.entitiesLoadingBlockEntityChunks.get(),
+                this.missingBlockEntityChunks.get(),
+                this.staleBlockEntityChunkSnapshots.get(),
                 this.scheduledTicksOnWorkers.get(),
                 this.skippedScheduledTicks.get(),
                 this.fallbackScheduledTicks.get(),

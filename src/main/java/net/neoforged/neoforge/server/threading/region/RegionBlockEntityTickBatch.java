@@ -24,10 +24,11 @@ import org.jetbrains.annotations.ApiStatus;
 /**
  * One level block-entity tick that is executed on region workers.
  * <p>
- * The batch is a snapshot of the tickers the vanilla server thread would tick this tick. Each group owns
- * the lease of exactly one region and ticks the snapshot tickers of that region in their original order,
- * so different regions run in parallel while a region never ticks against itself. Tickers whose region
- * cannot be leased safely are ticked on the server thread after the batch instead of being dropped.
+ * The batch is the set of chunks the plan handed over, each with the tickers it admitted. Each group owns the
+ * lease of exactly one region and ticks the chunks of that region, whose tickers it merges back into the
+ * order of the level's own ticker list, so different regions run in parallel while a region never ticks
+ * against itself. Chunks whose region cannot be leased safely, and chunks whose snapshot went stale before
+ * the worker ticked them, are ticked on the server thread after the batch instead of being dropped.
  * <p>
  * A group also carries the entity ownership lease of its region, so a ticker whose compatibility declaration
  * admits entity work reaches the entities of its own region through the region-scoped query and its mutations
@@ -43,6 +44,7 @@ import org.jetbrains.annotations.ApiStatus;
 final class RegionBlockEntityTickBatch extends RegionTickBatch {
     private final List<Group> groups = new ArrayList<>();
     private final Set<RegionState> leasedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Collection<RegionBlockEntityTickChunk> fallbackChunks = new ConcurrentLinkedQueue<>();
     private final Collection<RegionBlockEntityTickAdmission> fallbackTickers = new ConcurrentLinkedQueue<>();
     /**
      * Scheduled block and fluid ticks a worker could not schedule inline, because {@code LevelTicks} is
@@ -65,17 +67,29 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
      * Adds one region group and registers its worker task.
      *
      * @param region      the region whose lease the group holds
-     * @param tickers     the block-entity tickers the group ticks
+     * @param chunks      the block-entity chunks the group ticks
      * @param workFactory builds the worker task; it receives the group so later retries can extend it
      */
-    Group addGroup(RegionState region, List<RegionBlockEntityTickAdmission> tickers, Function<Group, Runnable> workFactory) {
+    Group addGroup(RegionState region, List<RegionBlockEntityTickChunk> chunks, Function<Group, Runnable> workFactory) {
         this.leasedRegions.add(region);
         // The random source is created here, inside the lease release path of the caller, so a failure
         // while building it cannot leave the region TICKING without a worker that releases it.
-        final Group group = new Group(this, region, tickers, this.groupRandomSeed(region.coordinate()));
+        final Group group = new Group(this, region, chunks, this.groupRandomSeed(region.coordinate()));
         this.groups.add(group);
         this.addTask("block entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
+    }
+
+    /**
+     * Records a chunk whose tickers could not be leased safely or whose snapshot went stale before the
+     * worker ticked it; its tickers are ticked on the server thread after the batch instead of being dropped.
+     */
+    void addFallbackChunk(RegionBlockEntityTickChunk chunk) {
+        this.fallbackChunks.add(chunk);
+    }
+
+    Collection<RegionBlockEntityTickChunk> fallbackChunks() {
+        return this.fallbackChunks;
     }
 
     /**
@@ -147,7 +161,7 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
     }
 
     /**
-     * One region's share of the batch: the region lease, the tickers it ticks and the random source its
+     * One region's share of the batch: the region lease, the chunks it ticks and the random source their
      * tickers draw from.
      * <p>
      * The group is also the ownership lease of the block entities of that region: a ticker of this group owns
@@ -158,14 +172,14 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
     static final class Group implements RegionOwnershipLeaseGroup {
         private final RegionBlockEntityTickBatch batch;
         private final RegionState region;
-        private final List<RegionBlockEntityTickAdmission> tickers = new ArrayList<>();
+        private final List<RegionBlockEntityTickChunk> chunks = new ArrayList<>();
         private final RandomSource random;
 
-        Group(RegionBlockEntityTickBatch batch, RegionState region, List<RegionBlockEntityTickAdmission> tickers, long randomSeed) {
+        Group(RegionBlockEntityTickBatch batch, RegionState region, List<RegionBlockEntityTickChunk> chunks, long randomSeed) {
             this.batch = batch;
             this.region = region;
             this.random = RandomSource.create(randomSeed);
-            this.tickers.addAll(tickers);
+            this.chunks.addAll(chunks);
         }
 
         RegionBlockEntityTickBatch batch() {
@@ -176,12 +190,12 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
             return this.region;
         }
 
-        List<RegionBlockEntityTickAdmission> tickers() {
-            return this.tickers;
+        List<RegionBlockEntityTickChunk> chunks() {
+            return this.chunks;
         }
 
-        void addTickers(List<RegionBlockEntityTickAdmission> tickers) {
-            this.tickers.addAll(tickers);
+        void addChunks(List<RegionBlockEntityTickChunk> chunks) {
+            this.chunks.addAll(chunks);
         }
 
         /**

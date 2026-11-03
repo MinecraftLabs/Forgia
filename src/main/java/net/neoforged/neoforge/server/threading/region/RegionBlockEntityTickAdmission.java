@@ -18,6 +18,9 @@ import org.jetbrains.annotations.ApiStatus;
  * whether the compatibility declaration admits the ticker to a worker tick. It is evaluated once per ticker
  * and reused while the chunk's snapshot is current (see {@link RegionBlockEntityTickChunkCache}), so the
  * batch does not re-evaluate the allowlist and the interior-chunk rule of every ticker on every tick.
+ * <p>
+ * {@code sequence} is the creation order of the ticker, so a worker group can tick the admissions of its
+ * chunks in the order the level's own ticker list would have ticked them.
  */
 @ApiStatus.Internal
 public record RegionBlockEntityTickAdmission(
@@ -26,7 +29,8 @@ public record RegionBlockEntityTickAdmission(
         BlockPos position,
         String type,
         Binding binding,
-        Decision decision) {
+        Decision decision,
+        long sequence) {
 
     public RegionBlockEntityTickAdmission {
         position = position.immutable();

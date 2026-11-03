@@ -256,7 +256,7 @@ public class ServerLoadBenchmarkGameTests {
     private static final int SOAK_ZOMBIE_DEATHS = 1;
 
     static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
-    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
+    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
     static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,zombies,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,zombieSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,zombieDeaths,zombieReplacements";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
@@ -1288,7 +1288,7 @@ public class ServerLoadBenchmarkGameTests {
                 + " hopperItemsConserved=" + conserved
                 + " blockEntityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_HOPPER_HEADER " + HOPPER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%b,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%b%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%b,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%b%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -1300,6 +1300,10 @@ public class ServerLoadBenchmarkGameTests {
                 percentileMillis(sorted, 0.99),
                 delta(before, after, RegionThreadingDiagnostics::blockEntityTicksOnWorkers),
                 delta(before, after, RegionThreadingDiagnostics::fallbackBlockEntityTicks),
+                delta(before, after, RegionThreadingDiagnostics::nonTickingBlockEntityChunks),
+                delta(before, after, RegionThreadingDiagnostics::entitiesLoadingBlockEntityChunks),
+                delta(before, after, RegionThreadingDiagnostics::missingBlockEntityChunks),
+                delta(before, after, RegionThreadingDiagnostics::staleBlockEntityChunkSnapshots),
                 delta(before, after, RegionThreadingDiagnostics::totalRegionTickCount),
                 delta(before, after, RegionThreadingDiagnostics::entityQueriesAllowedByLease),
                 delta(before, after, RegionThreadingDiagnostics::entityQueriesTruncatedByLease),

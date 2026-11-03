@@ -23,6 +23,7 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -503,6 +504,14 @@ class RegionBlockEntityTickEligibilityTest {
             return null;
         }).when(chunkSource).managedBlockOnMainThread(any());
         doReturn(chunkSource).when(level).getChunkSource();
+        // A Mockito mock does not run the level constructor, so the block-entity ticker bookkeeping of the
+        // patched level has to be installed explicitly.
+        setField(Level.class, level, "blockEntityTickerLock", new Object());
+        setField(Level.class, level, "blockEntityTickers", new ArrayList<TickingBlockEntity>());
+        setField(Level.class, level, "pendingBlockEntityTickers", new ArrayList<TickingBlockEntity>());
+        setField(Level.class, level, "foreignBlockEntityTickers", new ArrayList<TickingBlockEntity>());
+        setField(Level.class, level, "blockEntityTickerChunks", new it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<LevelChunk>());
+        setField(Level.class, level, "blockEntityTickerSequence", new java.util.concurrent.atomic.AtomicLong());
         return level;
     }
 

@@ -9,11 +9,22 @@
      public static final Codec<ResourceKey<Level>> RESOURCE_KEY_CODEC = ResourceKey.codec(Registries.DIMENSION);
      public static final ResourceKey<Level> OVERWORLD = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("overworld"));
      public static final ResourceKey<Level> NETHER = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("the_nether"));
-@@ -91,6 +_,7 @@
+@@ -91,6 +_,18 @@
      protected final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
      protected final NeighborUpdater neighborUpdater;
      private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
 +    private final Object blockEntityTickerLock = new Object();
++    // Neo: the chunks that currently hold block-entity tickers, in registration order. The block-entity
++    // worker plan visits these chunks instead of the ticker list, so its server-thread cost is per chunk.
++    private final it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<LevelChunk> blockEntityTickerChunks = new it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<>();
++    // Neo: block-entity tickers a caller added to the level instead of through a chunk. The chunk-indexed
++    // plan cannot see them, so the level keeps them itself and the plan ticks them on the server thread.
++    private final List<TickingBlockEntity> foreignBlockEntityTickers = Lists.newArrayList();
++    // Neo: creation sequence of the chunk-owned block-entity tickers, so a chunk's tickers can be ordered
++    // like the level's own ticker list without reading that list.
++    private final java.util.concurrent.atomic.AtomicLong blockEntityTickerSequence = new java.util.concurrent.atomic.AtomicLong();
++    // Neo: a ticker left its chunk while the plan iterates chunks, so the level's ticker list still holds it.
++    private boolean blockEntityTickerPrunePending;
      private boolean tickingBlockEntities;
      private final Thread thread;
      private final boolean isDebug;
@@ -109,7 +120,7 @@
      }
  
      public void updateNeighborsAtExceptFromFacing(BlockPos p_46591_, Block p_46592_, Direction p_46593_) {
-@@ -486,42 +_,116 @@
+@@ -486,42 +_,217 @@
      }
  
      public void addBlockEntityTicker(TickingBlockEntity p_151526_) {
@@ -118,6 +129,103 @@
 +        // that receives those additions is guarded like the server thread's own additions.
 +        synchronized (this.blockEntityTickerLock) {
 +            (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(p_151526_);
++            // Neo: a ticker that is not owned by a chunk is invisible to the chunk-indexed plan, so the
++            // level keeps it here and the plan ticks it on the server thread.
++            if (!LevelChunk.isChunkOwnedTicker(p_151526_)) {
++                this.foreignBlockEntityTickers.add(p_151526_);
++            }
++        }
++    }
++
++    /**
++     * Neo: registers {@code chunk} as a chunk that currently holds block-entity tickers.
++     * <p>
++     * The block-entity worker plan visits the registered chunks instead of the level's ticker list, so the
++     * server thread decides per chunk and never walks the tickers. Registration is keyed by the chunk
++     * position and keeps the instance that registered, so a chunk that is replaced by a new instance of the
++     * same position replaces the entry instead of leaving the old instance behind.
++     */
++    public void registerBlockEntityTickerChunk(LevelChunk chunk) {
++        synchronized (this.blockEntityTickerLock) {
++            this.blockEntityTickerChunks.put(chunk.getPos().toLong(), chunk);
++        }
++    }
++
++    /** Neo: unregisters {@code chunk} once it holds no block-entity ticker. */
++    public void unregisterBlockEntityTickerChunk(LevelChunk chunk) {
++        synchronized (this.blockEntityTickerLock) {
++            final long key = chunk.getPos().toLong();
++            if (this.blockEntityTickerChunks.get(key) == chunk) {
++                this.blockEntityTickerChunks.remove(key);
++            }
++        }
++    }
++
++    /**
++     * Neo: copies the chunks that currently hold block-entity tickers into {@code into}, in registration
++     * order.
++     * <p>
++     * The copy is taken under the ticker lock because a region worker can add a ticker to its chunk while the
++     * server thread collects the plan; the plan then visits the chunk on its next tick.
++     */
++    public void collectBlockEntityTickerChunks(List<LevelChunk> into) {
++        synchronized (this.blockEntityTickerLock) {
++            into.addAll(this.blockEntityTickerChunks.values());
++        }
++    }
++
++    /**
++     * Neo: copies the tickers a caller added to the level instead of through a chunk into {@code into}.
++     * <p>
++     * Removed ones are dropped here, so the list cannot grow with tickers that are already gone; they are
++     * skipped by the plan otherwise. A ticker that is still in the level's own ticker list is skipped the
++     * same way: the plan ticks these on the server thread, not on a worker.
++     */
++    public void collectForeignBlockEntityTickers(List<TickingBlockEntity> into) {
++        synchronized (this.blockEntityTickerLock) {
++            final int size = this.foreignBlockEntityTickers.size();
++            this.foreignBlockEntityTickers.removeIf(TickingBlockEntity::isRemoved);
++            if (this.foreignBlockEntityTickers.size() != size) {
++                // A removed foreign ticker is still in the level's own ticker list, which this plan path
++                // does not walk; the prune below drops it in the same tick.
++                this.blockEntityTickerPrunePending = true;
++            }
++            into.addAll(this.foreignBlockEntityTickers);
++        }
++    }
++
++    /** Neo: the next creation sequence of a chunk-owned block-entity ticker of this level. */
++    public long nextBlockEntityTickerSequence() {
++        return this.blockEntityTickerSequence.getAndIncrement();
++    }
++
++    /**
++     * Neo: records that a ticker left its chunk while the block-entity worker plan iterates chunks.
++     * <p>
++     * The plan does not walk the level's ticker list, so it cannot drop the removed ticker the way the
++     * vanilla loop does. The flag makes the plan prune the list once on a tick that removed a ticker, which
++     * bounds the list without a per-ticker pass on every tick.
++     */
++    public void markBlockEntityTickerRemoved() {
++        synchronized (this.blockEntityTickerLock) {
++            this.blockEntityTickerPrunePending = true;
++        }
++    }
++
++    /**
++     * Neo: drops the tickers that left their chunk from the level's own ticker list.
++     * <p>
++     * Only runs on a tick whose plan is chunk-indexed and that removed a ticker since the last prune, so a
++     * level whose tickers do not change pays nothing here. A ticker that is still live is never removed, so
++     * the list keeps exactly the tickers the vanilla loop would see.
++     */
++    private void pruneRemovedBlockEntityTickers() {
++        synchronized (this.blockEntityTickerLock) {
++            if (!this.blockEntityTickerPrunePending) {
++                return;
++            }
++            this.blockEntityTickerPrunePending = false;
++            this.blockEntityTickers.removeIf(TickingBlockEntity::isRemoved);
 +        }
 +    }
 +
@@ -186,27 +294,31 @@
 +                }
 +            }
 +
-+            // Neo: experimental region block-entity tick slice. The tickers the vanilla loop would tick are
-+            // collected on the server thread and ticked on their owning region worker after this pass; the
-+            // tickers that cannot be leased safely are ticked inline after the worker batch instead.
++            // Neo: experimental region block-entity tick slice. The plan decides per chunk which of its
++            // tickers tick on their owning region worker, and the workers iterate the chunks and tickers
++            // themselves; a ticker that cannot be leased safely is ticked on the server thread after the
++            // batch instead.
 +            final net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan blockEntityTickPlan = this instanceof net.minecraft.server.level.ServerLevel serverLevel
 +                    ? net.neoforged.neoforge.server.threading.RegionThreadingHooks.beginBlockEntityTickPlan(serverLevel, serverLevel.getChunkSource()::managedBlockOnMainThread)
 +                    : null;
-+            Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
-+            boolean flag = this.tickRateManager().runsNormally();
++            if (blockEntityTickPlan == null) {
++                Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
++                boolean flag = this.tickRateManager().runsNormally();
 +
-+            while (iterator.hasNext()) {
-+                TickingBlockEntity tickingblockentity = iterator.next();
-+                if (tickingblockentity.isRemoved()) {
-+                    iterator.remove();
-+                } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
-+                    // Neo: the plan admits a ticker only when its entity-load eligibility was evaluated on
-+                    // this server thread; a rejected ticker keeps the unchanged vanilla inline path, which
-+                    // re-evaluates the whole isTicking condition and skips the tick while the load is pending.
-+                    if (blockEntityTickPlan == null || !blockEntityTickPlan.accept(tickingblockentity)) {
++                while (iterator.hasNext()) {
++                    TickingBlockEntity tickingblockentity = iterator.next();
++                    if (tickingblockentity.isRemoved()) {
++                        iterator.remove();
++                    } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
 +                        tickingblockentity.tick();
 +                    }
 +                }
++            } else {
++                // Neo: the plan iterates the chunks that hold tickers, so the server thread does no
++                // per-ticker work. The tickers a chunk no longer holds are pruned from the list here,
++                // because this path does not walk it.
++                blockEntityTickPlan.collect();
++                this.pruneRemovedBlockEntityTickers();
 +            }
 +            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockEntityTickPlan(blockEntityTickPlan);
 +        } finally {
