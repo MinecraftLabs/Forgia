@@ -24,6 +24,32 @@
          for (Entry<Heightmap.Types, Heightmap> entry : p_196851_.getHeightmaps()) {
              if (ChunkStatus.FULL.heightmapsAfter().contains(entry.getKey())) {
                  this.setHeightmap(entry.getKey(), entry.getValue().getRawData());
+@@ -256,7 +_,11 @@
+                 this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
+                 boolean flag1 = levelchunksection.hasOnlyAir();
+                 if (flag != flag1) {
+-                    this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
++                    // Neo: a region chunk tick worker may not drive the light engine of the level itself. It records
++                    // the section status change and the server thread applies it at the batch barrier.
++                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickLightSectionStatus(p_62865_, flag1)) {
++                        this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
++                    }
+                 }
+ 
+                 if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
+@@ -264,7 +_,11 @@
+                     profilerfiller.push("updateSkyLightSources");
+                     this.skyLightSources.update(this, j, i, l);
+                     profilerfiller.popPush("queueCheckLight");
+-                    this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
++                    // Neo: same for the recheck of one position; the sky light sources above are per chunk and stay
++                    // on the worker.
++                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickLightCheck(p_62865_)) {
++                        this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
++                    }
+                     profilerfiller.pop();
+                 }
+ 
 @@ -278,7 +_,7 @@
                  if (!levelchunksection.getBlockState(j, k, l).is(block)) {
                      return null;

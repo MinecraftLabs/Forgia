@@ -406,7 +406,7 @@
          this.server
              .getPlayerList()
              .broadcast(
-@@ -1019,6 +_,7 @@
+@@ -1019,11 +_,20 @@
  
      @Override
      public void gameEvent(Holder<GameEvent> p_316597_, Vec3 p_215042_, GameEvent.Context p_215043_) {
@@ -414,6 +414,19 @@
          this.gameEventDispatcher.post(p_316597_, p_215042_, p_215043_);
      }
  
+     @Override
+     public void sendBlockUpdated(BlockPos p_8755_, BlockState p_8756_, BlockState p_8757_, int p_8758_) {
++        // Neo: a region chunk tick worker may not publish a block update itself. The publication marks the changed
++        // sections of the chunk holder, invalidates the level-wide path type cache and recomputes the paths of
++        // every navigating mob of the level - a mob that can live in any region. The worker records the write and
++        // the server thread publishes it at the batch barrier, before the level's per-chunk broadcast.
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferChunkTickBlockUpdate(p_8755_, p_8756_, p_8757_, p_8758_)) {
++            return;
++        }
++
+         if (this.isUpdatingNavigations) {
+             String s = "recursive call to sendBlockUpdated";
+             Util.logAndPauseIfInIde("recursive call to sendBlockUpdated", new IllegalStateException("recursive call to sendBlockUpdated"));
 @@ -1057,11 +_,16 @@
  
      @Override

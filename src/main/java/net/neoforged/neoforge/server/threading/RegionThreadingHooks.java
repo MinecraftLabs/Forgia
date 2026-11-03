@@ -623,6 +623,52 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Defers the light section status change of one block write of a chunk tick to the server thread.
+     * <p>
+     * The light engine of a level is one engine with one set of queues and one light thread, so a region worker
+     * records the change and the server thread applies it at the batch barrier, in the order the chunk body
+     * produced it.
+     *
+     * @param pos   the written position, already immutable
+     * @param empty whether the light section of the position holds only air now
+     * @return {@code true} when the change was deferred, {@code false} when the caller has to call the light
+     *         engine itself
+     */
+    public static boolean deferChunkTickLightSectionStatus(net.minecraft.core.BlockPos pos, boolean empty) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferChunkTickLightSectionStatus(pos, empty);
+    }
+
+    /**
+     * Defers the light recheck of one block write of a chunk tick to the server thread.
+     *
+     * @param pos the written position, already immutable
+     * @return {@code true} when the recheck was deferred, {@code false} when the caller has to call the light
+     *         engine itself
+     */
+    public static boolean deferChunkTickLightCheck(net.minecraft.core.BlockPos pos) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferChunkTickLightCheck(pos);
+    }
+
+    /**
+     * Defers the block update publication of one block write of a chunk tick to the server thread.
+     * <p>
+     * The publication is level-wide: it marks the changed sections of the chunk holder, invalidates the
+     * level-wide path type cache and recomputes the paths of every navigating mob of the level, which can live
+     * in any region. Inside a chunk tick worker group the write is recorded and the server thread publishes it at
+     * the batch barrier, before the level's per-chunk broadcast.
+     *
+     * @return {@code true} when the publication was deferred, {@code false} when the caller has to publish it
+     *         itself
+     */
+    public static boolean deferChunkTickBlockUpdate(net.minecraft.core.BlockPos pos, net.minecraft.world.level.block.state.BlockState oldState,
+            net.minecraft.world.level.block.state.BlockState newState, int flags) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferChunkTickBlockUpdate(pos, oldState, newState, flags);
+    }
+
+    /**
      * {@return the server-owned queue a region tick worker has to use for mutations, or {@code null}
      * when the current thread is not executing a region tick worker group}
      * <p>

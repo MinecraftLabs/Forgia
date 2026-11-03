@@ -88,6 +88,15 @@ public final class RegionChunkTickPlan {
             this.level.tickChunk(chunk, this.randomTickSpeed);
             return;
         }
+        if (this.chunks.size() >= this.engine.chunkTickDeferredUpdateBudget()) {
+            // Every block write of a worker chunk is recorded for the server thread, because the light engine
+            // and the block update publication of a level are not partitioned per region. The batch reserves
+            // that space per chunk before the body starts: a chunk that does not fit keeps the server-thread
+            // body, where its writes need no deferred record at all.
+            this.engine.countDeferredUpdateBudgetChunkTick();
+            this.level.tickChunk(chunk, this.randomTickSpeed);
+            return;
+        }
         this.chunks.add(RegionChunkTickEntry.of(chunk));
     }
 

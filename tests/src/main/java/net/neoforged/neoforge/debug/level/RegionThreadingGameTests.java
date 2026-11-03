@@ -457,14 +457,25 @@ public class RegionThreadingGameTests {
                     })
                     .thenIdle(2)
                     .thenExecute(() -> level.setBlock(icePos, Blocks.ICE.defaultBlockState(), 3))
-                    .thenIdle(60)
+                    // A random tick that lands on the ice melts it on the first hit, so 60 ticks are enough in
+                    // almost every run. The window is longer because a chunk can lose the random ticks of a tick
+                    // (a truncated worker chunk tick, a chunk that is not randomly ticking yet) and one lost
+                    // window must not fail the test. The message reports the counters that say which happened.
+                    .thenIdle(180)
                     .thenExecute(() -> {
+                        final RegionThreadingDiagnostics after = diagnostics.isPresent() ? diagnostics() : null;
                         helper.assertTrue(
                                 level.getBlockState(icePos).is(Blocks.WATER),
                                 "ice did not melt, so the selected random tick was not executed; state="
-                                        + level.getBlockState(icePos));
+                                        + level.getBlockState(icePos)
+                                        + " randomTickSpeed=" + randomTickSpeed.get()
+                                        + (after == null ? " slice=absent"
+                                                : " workers=" + after.chunkTicksOnWorkers()
+                                                        + " fallback=" + after.fallbackChunkTicks()
+                                                        + " boundary=" + after.boundaryChunkTicks()
+                                                        + " truncated=" + after.truncatedChunkTicks()
+                                                        + " deferredBudget=" + after.deferredUpdateBudgetChunkTicks()));
                         if (diagnostics.isPresent() && diagnostics.get().chunkTickWorkerExecutionEnabled()) {
-                            final RegionThreadingDiagnostics after = diagnostics();
                             helper.assertTrue(
                                     after.chunkTickWorkerDispatchEffective(),
                                     "a configured chunk tick slice must report the effective dispatch");
