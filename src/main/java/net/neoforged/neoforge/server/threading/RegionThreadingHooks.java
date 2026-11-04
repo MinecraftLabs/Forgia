@@ -1347,6 +1347,34 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Opens the block event phase of {@code level} as a quiescent server-thread scope when the native engine is
+     * installed.
+     * <p>
+     * The vanilla block event phase runs on the server thread after every region batch of the level tick returned,
+     * so no worker runs and no region is leased by another thread. The scope takes the lease of each region its
+     * events run in once, keeps it until the phase ends and captures no border update, so a write of an event body
+     * to another region is the vanilla inline call and the phase needs no border fixpoint. Without an engine this
+     * is a no-op: the phase is the vanilla one.
+     *
+     * @return {@code true} when the phase runs as a scope; the caller closes it in a finally either way
+     */
+    public static boolean beginBlockEventPhase(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.beginBlockEventPhase(level);
+    }
+
+    /**
+     * Closes the block event phase opened by {@link #beginBlockEventPhase(ServerLevel)} and releases every region
+     * lease it took, whether the phase completed or threw. Without an engine this is a no-op.
+     */
+    public static void endBlockEventPhase(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.endBlockEventPhase(level);
+        }
+    }
+
+    /**
      * Runs {@code task} in the owning block region context when the native engine is installed.
      * <p>
      * Called once per block-entity ticker, so it reads the installed engine without allocating the

@@ -557,7 +557,10 @@ public class RegionThreadingGameTests {
             // villager stand on the layer above it.
             final BlockPos foot = helper.absolutePos(new BlockPos(2, 2, 2));
             final BlockPos head = helper.absolutePos(new BlockPos(2, 2, 3));
-            final BlockPos jobSite = helper.absolutePos(new BlockPos(6, 2, 6));
+            // The workstation has to be within the two blocks AssignProfessionFromJobSite requires, otherwise the
+            // villager has to walk to it first and the test depends on pathfinding timing: at a diagonal distance
+            // of 2.8 it failed about one run in five.
+            final BlockPos jobSite = helper.absolutePos(new BlockPos(5, 2, 5));
             final BlockPos spawn = helper.absolutePos(new BlockPos(4, 2, 4));
             final ChunkPos chunk = new ChunkPos(spawn);
             final AtomicReference<Villager> villager = new AtomicReference<>();

@@ -12,6 +12,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -79,6 +80,16 @@ import org.jetbrains.annotations.Nullable;
  * admissions. Entity construction events ({@code EntityEvent.EntityConstructing}, {@code EntityEvent.Size})
  * therefore fire on the worker thread; that is a documented compatibility exposure, not a defect of the
  * admission.
+ * <p>
+ * The block event phase is the one part of the level tick that is not a region slice: it drains the level's
+ * ordered block event set on the server thread after every region batch of the tick returned, so no worker runs
+ * and no region is leased by another thread. The phase therefore runs as a server-thread quiescent scope
+ * ({@link #beginBlockEventPhase(ServerLevel)}): it takes the lease of each region its events run in once, keeps it
+ * until the phase ends and captures no border update, so a write of an event body to another region is the
+ * vanilla inline call and the phase needs no border fixpoint at all. That is both cheaper than leasing and
+ * flushing per event and faithful to the inline run: an event body reads back what it wrote, so a piston that
+ * pushes across a border resolves its structure against the moved blocks and queues the single block event
+ * vanilla queues, not a second one from a stale read.
  */
 public final class RegionThreadingEngine implements RegionThreading {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -307,8 +318,59 @@ public final class RegionThreadingEngine implements RegionThreading {
     private volatile boolean foreignReadRerunEnabled = true;
     /** Block events a region worker recorded for the server thread's block event phase. */
     private final AtomicLong deferredBlockEvents = new AtomicLong();
+    /** Block event phases that ran as a quiescent server-thread scope. */
+    private final AtomicLong blockEventPhases = new AtomicLong();
+    /** Region leases the block event phases took, i.e. one per region and phase that ran an event. */
+    private final AtomicLong blockEventPhaseLeases = new AtomicLong();
+    /** Region leases the block event phases released, which equals the leases unless a phase was cut short. */
+    private final AtomicLong blockEventPhaseReleases = new AtomicLong();
+    /** Events the block event phases ran inside their scope. */
+    private final AtomicLong blockEventPhaseEvents = new AtomicLong();
+    /** Events of a phase that ran without a region lease because its region could not be leased. */
+    private final AtomicLong blockEventPhaseLeaseFallbacks = new AtomicLong();
+    /** Border fixpoints a block event phase ran, which is zero for every quiescent phase. */
+    private final AtomicLong blockEventPhaseFixpoints = new AtomicLong();
+    /** Wall time of the block event phases that ran as a quiescent scope. */
+    private final AtomicLong blockEventPhaseNanos = new AtomicLong();
+    /** Wall time of the slowest block event phase that ran as a quiescent scope. */
+    private final AtomicLong blockEventPhaseMaxNanos = new AtomicLong();
+    /**
+     * The block event phase of the current thread, or {@code null} outside one.
+     * <p>
+     * A phase is opened on the server thread while every region batch of the level has returned, so no worker
+     * runs and no region is leased by another thread. The scope holds the lease of each region its events run in
+     * until the phase ends, and it does not capture border updates: a write to another region is applied inline
+     * by the server thread, which is the vanilla call and needs no fixpoint. See
+     * {@link #beginBlockEventPhase(ServerLevel)}.
+     */
+    private final ThreadLocal<BlockEventPhase> blockEventPhase = new ThreadLocal<>();
     /** Block entity reads a region group made against a quiescent foreign region. */
     private final AtomicLong foreignBlockEntityReads = new AtomicLong();
+
+    /**
+     * One block event phase of one level on the server thread.
+     * <p>
+     * The scope holds the lease of every region an event of the phase ran in, keyed by the region coordinate, so
+     * a phase that runs several events of the same region takes that region's lease once. Every lease is released
+     * in {@link #endBlockEventPhase(ServerLevel)}, including when an event throws.
+     */
+    private static final class BlockEventPhase {
+        private final ServerLevel level;
+        private final Map<RegionCoordinate, RegionState> leases = new LinkedHashMap<>();
+        private final long startNanos;
+        private int events;
+        /**
+         * Openings that share this scope. A second opening of the same level's phase reuses the scope and only
+         * the matching close ends it, so a caller that opens and closes symmetrically can never close the scope
+         * of an enclosing phase.
+         */
+        private int openings = 1;
+
+        private BlockEventPhase(ServerLevel level) {
+            this.level = level;
+            this.startNanos = System.nanoTime();
+        }
+    }
 
     /** One level's chunk-load answers and the loaded chunk count they were read at. */
     private static final class ChunkLoadAnswers {
@@ -1430,6 +1492,11 @@ public final class RegionThreadingEngine implements RegionThreading {
     private void runBorderUpdateFixpoint(ServerLevel level) {
         if (!this.borderUpdatesEnabled) {
             return;
+        }
+        // A quiescent block event phase captures nothing, so it never needs a fixpoint. Counting an entry here
+        // keeps that invariant observable: a phase that reports a fixpoint is a phase that captured something.
+        if (this.blockEventPhase.get() != null) {
+            this.blockEventPhaseFixpoints.incrementAndGet();
         }
         // The regions whose reads of the worker phase observed a chunk version that changed before the phase
         // ended. They re-run their propagation in the first pass even when no border update is pending, because
@@ -3051,9 +3118,15 @@ public final class RegionThreadingEngine implements RegionThreading {
      * lease and a worker whose target is inside its own region all keep the vanilla inline path. The check runs
      * before the record is allocated, so a server with the switch on but no cross-region update pays no
      * allocation per neighbor update.
+     * <p>
+     * A block event phase never captures: it runs on the server thread while every region batch of the level has
+     * returned, so no worker can observe a write to another region and the vanilla inline call is both safe and
+     * the exact behaviour the event body would have inline. Capturing there would only queue the write for a
+     * fixpoint and hide it from the body's own reads, which is how a piston that pushes across a border used to
+     * queue a second block event vanilla never queues.
      */
     private boolean capturesBorderUpdate(ServerLevel level, BlockPos pos) {
-        if (!this.borderUpdatesEnabled) {
+        if (!this.borderUpdatesEnabled || this.blockEventPhase.get() != null) {
             return false;
         }
         final RegionThreadingContext context = this.currentContext();
@@ -5824,9 +5897,18 @@ public final class RegionThreadingEngine implements RegionThreading {
      * the tick runs in the next tick of that region. When the current thread already holds a region lease,
      * the tick is always deferred: taking a second region's lease from inside a region tick would nest
      * leases and let a cross-region tick run while another region is still being ticked.
+     * <p>
+     * Inside a block event phase the task runs under the lease the phase already holds for the region, and the
+     * phase takes that lease once however many events it runs in the region; see
+     * {@link #beginBlockEventPhase(ServerLevel)}.
      */
     @ApiStatus.Internal
     public void runInBlockRegion(ServerLevel level, BlockPos pos, Runnable task) {
+        final BlockEventPhase phase = this.blockEventPhase.get();
+        if (phase != null && phase.level == level) {
+            this.runInBlockEventPhase(phase, level, pos, task);
+            return;
+        }
         if (this.isOwnedByCurrentRegion(level, pos)) {
             task.run();
             return;
@@ -5844,6 +5926,143 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
         if (!this.runBlockTaskUnderLease(level, pos, task)) {
             this.enqueueRegionTask(level, pos, task);
+        }
+    }
+
+    /**
+     * Opens the block event phase of {@code level} as a quiescent server-thread scope.
+     * <p>
+     * The vanilla block event phase drains the level's ordered event set on the server thread after every region
+     * batch of the level tick has returned: the chunk tick batch, the block-entity batch and every fallback after
+     * them. No worker runs and no region is leased by another thread, so the phase is the one part of the tick in
+     * which the whole level is quiescent. Inside that scope a region lease exists only to establish the region
+     * context an event body runs in - the ownership checks, the block-entity read gate and the neighbour updater
+     * scope - and the phase keeps it until the phase ends instead of taking and releasing one per event.
+     * <p>
+     * Because no worker can observe the level, the scope also does not capture border updates
+     * ({@link #capturesBorderUpdate}): a write to another region is the vanilla inline call, exactly what the
+     * event body would do inline. Nothing is queued for a fixpoint, so a phase needs no fixpoint at all, and the
+     * body reads back what it wrote instead of the state before the write.
+     * <p>
+     * The scope is only opened when the phase really is quiescent: the engine must be running, the calling thread
+     * must not be a region worker, and no batch of the engine may be in flight. A batch in flight is what the
+     * inline write has to rule out - it is the only state in which a worker holds or can take a region lease -
+     * and it also covers a thread that is executing a region tick, because a region tick runs inside a batch. The
+     * global region is not part of the check: it is the server-global task queue, it holds no region lease, and a
+     * drain of it can be in flight at any point of the server tick. When the check fails the phase runs the
+     * per-event lease and the border capture of every other server-thread region task, which is the correct but
+     * slower path.
+     *
+     * @return {@code true} when the phase runs as a scope, {@code false} when it keeps the per-event path
+     */
+    @ApiStatus.Internal
+    public boolean beginBlockEventPhase(ServerLevel level) {
+        if (this.shutdown) {
+            return false;
+        }
+        final BlockEventPhase open = this.blockEventPhase.get();
+        if (open != null) {
+            if (open.level == level) {
+                open.openings++;
+            }
+            return false;
+        }
+        if (RegionWorkerScope.isNativeWorkerThread()
+                || this.workerPool.isWorkerThread(Thread.currentThread())
+                || !this.activeTickBatches.isEmpty()) {
+            return false;
+        }
+        this.blockEventPhase.set(new BlockEventPhase(level));
+        return true;
+    }
+
+    /**
+     * Closes the block event phase opened by {@link #beginBlockEventPhase(ServerLevel)} and releases every region
+     * lease the phase took, in the reverse order it took them.
+     * <p>
+     * The release runs whether the phase completed or threw, so no lease survives an event that failed. A phase
+     * that was not opened as a scope is a no-op.
+     */
+    @ApiStatus.Internal
+    public void endBlockEventPhase(ServerLevel level) {
+        final BlockEventPhase phase = this.blockEventPhase.get();
+        if (phase == null || phase.level != level || --phase.openings > 0) {
+            return;
+        }
+        this.blockEventPhase.remove();
+        final long duration = System.nanoTime() - phase.startNanos;
+        this.blockEventPhases.incrementAndGet();
+        this.blockEventPhaseEvents.addAndGet(phase.events);
+        this.blockEventPhaseNanos.addAndGet(duration);
+        this.blockEventPhaseMaxNanos.accumulateAndGet(duration, Math::max);
+        this.releaseBlockEventPhase(phase);
+    }
+
+    /**
+     * Releases every region lease of {@code phase}, newest first.
+     * <p>
+     * Every lease the phase took is released exactly once, so the lease and release counters always add up: the
+     * phase released everything it held whether it succeeded, threw, or the engine shut down while it ran.
+     */
+    private void releaseBlockEventPhase(BlockEventPhase phase) {
+        final List<RegionState> leases = new ArrayList<>(phase.leases.values());
+        phase.leases.clear();
+        for (int index = leases.size() - 1; index >= 0; --index) {
+            final RegionState region = leases.get(index);
+            region.endOwnership();
+            region.clearRunning();
+            this.regionizer.removeIfEmpty(region);
+            this.blockEventPhaseReleases.incrementAndGet();
+        }
+    }
+
+    /**
+     * Runs one event of {@code phase} under the phase's lease of the event's region.
+     * <p>
+     * The lease is taken on demand the first time an event of the region runs and kept until the phase ends. A
+     * region that cannot be leased - it is dead, a worker owns it, or the engine shut down - runs the event without
+     * a region context instead of dropping it: no worker runs during a phase, so the vanilla body is correct without
+     * one, and the fallback is counted.
+     */
+    private void runInBlockEventPhase(BlockEventPhase phase, ServerLevel level, BlockPos pos, Runnable task) {
+        final RegionCoordinate coordinate = this.layout.regionAt(level, pos);
+        RegionState region = phase.leases.get(coordinate);
+        if (region == null) {
+            region = this.leaseBlockEventRegion(coordinate);
+            if (region == null) {
+                this.blockEventPhaseLeaseFallbacks.incrementAndGet();
+                task.run();
+                return;
+            }
+            phase.leases.put(coordinate, region);
+            this.blockEventPhaseLeases.incrementAndGet();
+        }
+        phase.events++;
+        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), task);
+    }
+
+    /**
+     * Takes the lease of {@code coordinate} for a block event phase.
+     *
+     * @return the leased region, or {@code null} when it cannot be leased and the event has to run without one
+     */
+    @Nullable
+    private RegionState leaseBlockEventRegion(RegionCoordinate coordinate) {
+        if (this.shutdown || !this.acquireLifecycleReadLock(false)) {
+            return null;
+        }
+        try {
+            if (this.shutdown) {
+                return null;
+            }
+            final RegionState region = this.regionizer.getOrCreate(coordinate);
+            if (region == null || region.isDead() || !region.tryMarkRunning()) {
+                return null;
+            }
+            region.beginOwnership();
+            return region;
+        } finally {
+            this.lifecycleGate.readLock().unlock();
         }
     }
 
@@ -5887,9 +6106,10 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
         // The task ran under a region lease outside a batch: a neighbour, shape, comparator or block-entity
         // update it sent to another region was captured for the fixpoint, and no batch barrier follows this
-        // call. Flush the fixpoint here so a block event or a server-thread fallback tick still converges in
-        // the tick it runs in. The fixpoint is not entered from a native worker: a worker's target region is
-        // queued, not leased inline.
+        // call. Flush the fixpoint here so a server-thread fallback tick still converges in the tick it runs in.
+        // A block event phase does not come through here when its scope is open: the phase applies its writes
+        // inline and has nothing to flush. The fixpoint is not entered from a native worker either: a worker's
+        // target region is queued, not leased inline.
         if (!RegionWorkerScope.isNativeWorkerThread()) {
             this.runBorderUpdateFixpoint(level);
         }
@@ -7497,6 +7717,15 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.borderBlockWritesOverflowed.get(),
                         this.borderBlockWritesDropped.get(),
                         this.readAfterDeferredBlockWrite.get()),
+                new RegionThreadingDiagnostics.BlockEventPhaseCounters(
+                        this.blockEventPhases.get(),
+                        this.blockEventPhaseLeases.get(),
+                        this.blockEventPhaseReleases.get(),
+                        this.blockEventPhaseEvents.get(),
+                        this.blockEventPhaseFixpoints.get(),
+                        this.blockEventPhaseLeaseFallbacks.get(),
+                        this.blockEventPhaseNanos.get(),
+                        this.blockEventPhaseMaxNanos.get()),
                 RegionPoiCounters.snapshot(),
                 this.workerDispatchCounters(),
                 RegionMetricsSummary.summarize(regionTicks),
@@ -7554,6 +7783,13 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.entityTasksByEntity.clear();
                 this.chunkLoadAnswers.clear();
                 this.seededEntityTickLevels.clear();
+                // A shutdown from inside a block event phase releases the leases the phase still holds, so no
+                // lease outlives the regions it was taken on. The phase itself closes through its own finally.
+                final BlockEventPhase openPhase = this.blockEventPhase.get();
+                if (openPhase != null) {
+                    this.blockEventPhase.remove();
+                    this.releaseBlockEventPhase(openPhase);
+                }
                 this.regionizer.clear();
                 // Every mailbox is closed before the pool goes away: its queued messages are dropped and
                 // counted, and a post from a worker that is still unwinding is refused instead of queued for a

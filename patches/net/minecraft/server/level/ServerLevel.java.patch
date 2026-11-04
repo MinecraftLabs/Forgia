@@ -458,7 +458,7 @@
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215052_, p_215053_, p_215054_);
      }
  
-@@ -1136,32 +_,49 @@
+@@ -1136,34 +_,62 @@
  
      @Override
      public void blockEvent(BlockPos p_8746_, Block p_8747_, int p_8748_, int p_8749_) {
@@ -474,10 +474,9 @@
      private void runBlockEvents() {
          this.blockEventsToReschedule.clear();
  
-+        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginPhase(this);
-         while (!this.blockEvents.isEmpty()) {
-             BlockEventData blockeventdata = this.blockEvents.removeFirst();
-             if (this.shouldTickBlocksAt(blockeventdata.pos())) {
+-        while (!this.blockEvents.isEmpty()) {
+-            BlockEventData blockeventdata = this.blockEvents.removeFirst();
+-            if (this.shouldTickBlocksAt(blockeventdata.pos())) {
 -                if (this.doBlockEvent(blockeventdata)) {
 -                    this.server
 -                        .getPlayerList()
@@ -490,37 +489,57 @@
 -                            this.dimension(),
 -                            new ClientboundBlockEventPacket(blockeventdata.pos(), blockeventdata.block(), blockeventdata.paramA(), blockeventdata.paramB())
 -                        );
--                }
-+                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, blockeventdata.pos(), () -> {
-+                    // Neo: the move of a piston event runs here, so the attribution of one event is the
-+                    // attribution of one multi-block move.
-+                    final long eventStart = net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginEvent();
-+                    try {
-+                        if (this.doBlockEvent(blockeventdata)) {
-+                            this.server
-+                                .getPlayerList()
-+                                .broadcast(
-+                                    null,
-+                                    (double)blockeventdata.pos().getX(),
-+                                    (double)blockeventdata.pos().getY(),
-+                                    (double)blockeventdata.pos().getZ(),
-+                                    64.0,
-+                                    this.dimension(),
-+                                    new ClientboundBlockEventPacket(blockeventdata.pos(), blockeventdata.block(), blockeventdata.paramA(), blockeventdata.paramB())
-+                                );
++        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginPhase(this);
++        // Neo: every region batch of the level tick has returned by the time the block event phase runs, so no
++        // worker holds or can take a region lease and the whole level is quiescent. The phase therefore runs as a
++        // scope: it leases each region its events run in once and keeps the lease until the phase ends, and a
++        // write of an event body to another region is the vanilla inline call instead of a captured border update
++        // that only a fixpoint could apply - which is also why the body reads back what it wrote and no longer
++        // queues a second block event for a piston that pushes across a border. The scope is closed in a finally
++        // so every lease is released when an event throws.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.beginBlockEventPhase(this);
++        try {
++            while (!this.blockEvents.isEmpty()) {
++                BlockEventData blockeventdata = this.blockEvents.removeFirst();
++                if (this.shouldTickBlocksAt(blockeventdata.pos())) {
++                    net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, blockeventdata.pos(), () -> {
++                        // Neo: the move of a piston event runs here, so the attribution of one event is the
++                        // attribution of one multi-block move.
++                        final long eventStart = net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginEvent();
++                        try {
++                            if (this.doBlockEvent(blockeventdata)) {
++                                this.server
++                                    .getPlayerList()
++                                    .broadcast(
++                                        null,
++                                        (double)blockeventdata.pos().getX(),
++                                        (double)blockeventdata.pos().getY(),
++                                        (double)blockeventdata.pos().getZ(),
++                                        64.0,
++                                        this.dimension(),
++                                        new ClientboundBlockEventPacket(blockeventdata.pos(), blockeventdata.block(), blockeventdata.paramA(), blockeventdata.paramB())
++                                    );
++                            }
++                        } finally {
++                            net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endEvent(eventStart);
 +                        }
-+                    } finally {
-+                        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endEvent(eventStart);
-+                    }
-+                });
-             } else {
-                 this.blockEventsToReschedule.add(blockeventdata);
++                    });
++                } else {
++                    this.blockEventsToReschedule.add(blockeventdata);
+                 }
+-            } else {
+-                this.blockEventsToReschedule.add(blockeventdata);
              }
++        } finally {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.endBlockEventPhase(this);
++            net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endPhase();
++            this.blockEvents.addAll(this.blockEventsToReschedule);
          }
-+        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endPhase();
- 
-         this.blockEvents.addAll(this.blockEventsToReschedule);
+-
+-        this.blockEvents.addAll(this.blockEventsToReschedule);
      }
+ 
+     private boolean doBlockEvent(BlockEventData p_8699_) {
 @@ -1600,7 +_,34 @@
  
      @Override

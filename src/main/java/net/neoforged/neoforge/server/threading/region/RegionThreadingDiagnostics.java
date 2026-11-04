@@ -296,6 +296,7 @@ public record RegionThreadingDiagnostics(
         long mailboxDroppedOnCloseMessages,
         long mailboxDeliveryFailures,
         BorderUpdateCounters borderUpdates,
+        BlockEventPhaseCounters blockEventPhase,
         PoiCounters poiCounters,
         WorkerDispatchCounters workerDispatch,
         RegionMetricsSummary regionMetrics,
@@ -411,6 +412,46 @@ public record RegionThreadingDiagnostics(
                     + "/blockWritesOverflowed=" + this.blockWritesOverflowed
                     + "/blockWritesDropped=" + this.blockWritesDropped
                     + "/readAfterBlockWrite=" + this.readAfterBlockWrite;
+        }
+    }
+
+    /**
+     * The counters of the block event phase of a level.
+     * <p>
+     * The phase drains the level's ordered block event set on the server thread after every region batch of the
+     * tick has returned. It therefore runs as a quiescent scope: the lease of each region its events run in is
+     * taken once and released when the phase ends, and the scope captures no border update, so a phase needs no
+     * border fixpoint at all.
+     * <p>
+     * {@code phases} counts the phases that ran as a scope, {@code leases} the region leases they took and
+     * {@code releasedLeases} the leases they gave back: a phase that completed, threw or was cut short by a
+     * shutdown releases every lease it took, so the two counters differ only while a phase is open.
+     * {@code events} counts the events the scopes ran and {@code leaseFallbacks} the events that ran without a
+     * region context because its region could not be leased. {@code fixpoints} counts the border fixpoints a
+     * phase ran: a quiescent phase captures nothing, so it has nothing to flush and the counter stays zero.
+     * {@code nanos} is the wall time of the phases the scopes covered and {@code maxNanos} the slowest of them.
+     *
+     * @param phases         the block event phases that ran as a quiescent scope
+     * @param leases         the region leases those phases took, one per region and phase
+     * @param releasedLeases the region leases those phases released
+     * @param events         the events those phases ran
+     * @param fixpoints      the border fixpoints a phase ran, zero for every quiescent phase
+     * @param leaseFallbacks the events of a phase that ran without a region lease
+     * @param nanos          the wall time of the phases that ran as a scope
+     * @param maxNanos       the wall time of the slowest phase that ran as a scope
+     */
+    public record BlockEventPhaseCounters(long phases, long leases, long releasedLeases, long events, long fixpoints,
+            long leaseFallbacks, long nanos, long maxNanos) {
+        @Override
+        public String toString() {
+            return "phases=" + this.phases
+                    + "/leases=" + this.leases
+                    + "/releasedLeases=" + this.releasedLeases
+                    + "/events=" + this.events
+                    + "/fixpoints=" + this.fixpoints
+                    + "/leaseFallbacks=" + this.leaseFallbacks
+                    + "/nanos=" + this.nanos
+                    + "/maxNanos=" + this.maxNanos;
         }
     }
 

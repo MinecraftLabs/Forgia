@@ -90,9 +90,10 @@ import org.junit.jupiter.api.Timeout;
  * and its same-tick fixpoint are enabled, so every cross-region update the components produce is exercised.
  * <p>
  * Every run is compared tick by tick: block state and block-entity state of a box that contains the whole
- * circuit, plus the first tick each of those states appeared. A difference in the tick a state appears fails
- * the test, not only a difference in the final state. The layouts are deterministic from a seed and the
- * failure message names the layout, the seed and the first differing tick.
+ * circuit, the first tick each of those states appeared, and the block event stream in the order the phase
+ * drains it. A difference in the tick a state appears or in the stream fails the test, not only a difference in
+ * the final state. The layouts are deterministic from a seed and the failure message names the layout, the seed
+ * and the first differing tick.
  * <p>
  * The circuit is driven by a component tick, not by the test thread, whenever a component under test has a
  * scheduled tick: a repeater, torch, comparator or observer is placed between the source and the component, so
@@ -290,6 +291,9 @@ class RegionRedstoneComponentEquivalenceTest {
         assertEquals(off.firstSeen(), on.firstSeen(),
                 "layout '" + layout.name() + "' seed " + seed + " disagrees about the tick a state first appeared: "
                         + this.lastOnDiagnostics);
+        assertEquals(off.events(), on.events(),
+                "layout '" + layout.name() + "' seed " + seed + " runs a different block event stream: "
+                        + this.lastOnDiagnostics);
     }
 
     private RunResult run(boolean regionThreading, Layout layout, long seed) {
@@ -316,6 +320,7 @@ class RegionRedstoneComponentEquivalenceTest {
         // cascade can start on a region worker of the on run.
         layout.applyActions(world, 0);
         final List<String> perTick = new ArrayList<>(TICKS);
+        final List<String> events = new ArrayList<>();
         final Map<String, Integer> firstSeen = new LinkedHashMap<>();
         for (int tick = 1; tick <= TICKS; tick++) {
             this.gameTime.set(tick);
@@ -334,6 +339,7 @@ class RegionRedstoneComponentEquivalenceTest {
             for (final String entry : snapshot.split("\n")) {
                 firstSeen.putIfAbsent(entry, tick);
             }
+            events.addAll(world.drainEventTrace());
         }
         if (this.engine != null) {
             final String name = layout.name();
@@ -350,6 +356,9 @@ class RegionRedstoneComponentEquivalenceTest {
                     assertTrue(this.engine.foreignBlockEntityReads() > 0,
                             "layout '" + name + "' has to exercise the quiescent foreign block-entity read");
                 }
+                assertTrue(this.engine.diagnostics().blockEventPhase().phases() > 0,
+                        "the block event phase of layout '" + name + "' has to run as a quiescent scope: "
+                                + this.engine.diagnostics().blockEventPhase());
             }
             this.lastOnDiagnostics = this.engine.diagnostics().borderUpdates() + ", deferredBlockEvents="
                     + this.engine.deferredBlockEvents() + ", scheduledOnWorkers="
@@ -361,10 +370,10 @@ class RegionRedstoneComponentEquivalenceTest {
             this.engine = null;
         }
         RegionThreadingManager.clear();
-        return new RunResult(perTick, firstSeen);
+        return new RunResult(perTick, firstSeen, events);
     }
 
-    private record RunResult(List<String> perTick, Map<String, Integer> firstSeen) {}
+    private record RunResult(List<String> perTick, Map<String, Integer> firstSeen, List<String> events) {}
 
     /** The box of positions a layout traces: the state and block entity of every position inside it. */
     record TraceBox(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {}
@@ -737,6 +746,13 @@ class RegionRedstoneComponentEquivalenceTest {
         private final Map<BlockPos, BlockState> states = new ConcurrentHashMap<>();
         private final Map<BlockPos, BlockEntity> blockEntities = new ConcurrentHashMap<>();
         private final ConcurrentLinkedQueue<BlockEvent> blockEvents = new ConcurrentLinkedQueue<>();
+        /**
+         * The block events the phase of one tick drained, in order, as {@code tick:pos:block:id:param}.
+         * <p>
+         * Recorded before the event body runs, so the trace is the phase's input and not its effect: an event
+         * whose block changed since it was queued is part of the stream of both runs alike.
+         */
+        private final List<String> eventTrace = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final LevelTicks<Block> blockTicks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
         private final RandomSource scheduledRandom = RandomSource.create(0x5EEDL);
         private final RegionAwareNeighborUpdater neighborUpdater;
@@ -1016,19 +1032,38 @@ class RegionRedstoneComponentEquivalenceTest {
             return this.blockEntities.get(pos);
         }
 
+        private List<String> drainEventTrace() {
+            final List<String> drained = new ArrayList<>(this.eventTrace);
+            this.eventTrace.clear();
+            return drained;
+        }
+
         private void runBlockEvents(boolean regionThreading) {
-            BlockEvent event;
-            while ((event = this.blockEvents.poll()) != null) {
-                final BlockEvent current = event;
-                final BlockState state = this.states.getOrDefault(current.pos(), Blocks.AIR.defaultBlockState());
-                if (!state.is(current.block())) {
-                    continue;
+            if (regionThreading) {
+                // The production phase opens its quiescent scope around the whole drain; the harness mirrors it so
+                // the same lease pool and the same inline cross-region writes are exercised.
+                RegionThreadingHooks.beginBlockEventPhase(this.level);
+            }
+            try {
+                BlockEvent event;
+                while ((event = this.blockEvents.poll()) != null) {
+                    final BlockEvent current = event;
+                    this.eventTrace.add(gameTime.get() + ":" + current.pos().toShortString() + ":"
+                            + BuiltInRegistries.BLOCK.getKey(current.block()) + ":" + current.id() + ":" + current.param());
+                    final BlockState state = this.states.getOrDefault(current.pos(), Blocks.AIR.defaultBlockState());
+                    if (!state.is(current.block())) {
+                        continue;
+                    }
+                    final Runnable body = () -> state.triggerEvent(this.level, current.pos(), current.id(), current.param());
+                    if (regionThreading) {
+                        RegionThreadingHooks.runBlockTickTask(this.level, current.pos(), body);
+                    } else {
+                        body.run();
+                    }
                 }
-                final Runnable body = () -> state.triggerEvent(this.level, current.pos(), current.id(), current.param());
+            } finally {
                 if (regionThreading) {
-                    RegionThreadingHooks.runBlockTickTask(this.level, current.pos(), body);
-                } else {
-                    body.run();
+                    RegionThreadingHooks.endBlockEventPhase(this.level);
                 }
             }
         }
