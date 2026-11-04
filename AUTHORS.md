@@ -2,7 +2,15 @@
 
 ## Forgia-Specific Work
 
-- Simon Horak (`SajmonOriginal`) - project author and maintainer.
+- Simon Horak (`SajmonOriginal`) - author of the original Forgia project this repository descends from.
+- The continuation maintained in this repository (`yuchen1204/Forgia`) - the regionized runtime described in
+  `region-threading/STATUS.md`, which is developed here since the original project stopped updating.
+
+## Lineage
+
+The original Forgia project stopped updating. This repository continues it: it keeps the original project's
+documentation attribution, but the region threading implementation, the tests, the benchmarks and the status
+documents in `region-threading/` are maintained here and no longer track that upstream.
 
 ## Upstream Projects
 
