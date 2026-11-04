@@ -73,6 +73,24 @@ import java.util.Map;
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
  * diagnostic consumer read the same value the engine and the physical section partitions use.
  * <p>
+ * The four phase counters report the explicit global/region phase of the level tick ({@link LevelTickPhase}).
+ * {@link #globalPhases()} counts the global segments the engine bridge opened, {@link #regionPhases()} the
+ * region batches it entered, {@link #regionPhasesWithoutGlobalPhase()} the region batches that ran outside a
+ * level tick (direct engine use from a mechanics test or a benchmark, never production) and
+ * {@link #abandonedGlobalSegments()} the global segments a level tick left open because it threw. A phase
+ * violation - a global segment opened while a batch was in flight, or two batches of one level at once - is
+ * counted with {@link #ownershipViolationCount()}.
+ * <p>
+ * The seven mailbox counters report the cross-region mailbox of every level that has one
+ * ({@link RegionMailbox}). {@link #mailboxAcceptedMessages()} counts the posts that were queued,
+ * {@link #mailboxDeliveredMessages()} the messages a delivery actually ran, and the remaining counters the
+ * messages that never ran: {@link #mailboxRefusedFullMessages()} the posts refused by a full queue,
+ * {@link #mailboxRefusedClosedMessages()} the posts refused by a closed mailbox,
+ * {@link #mailboxDroppedRetiredMessages()} the messages whose target region did not exist or retired before the
+ * delivery, {@link #mailboxDroppedOnCloseMessages()} the messages dropped by a close or by a post that raced it,
+ * and {@link #mailboxDeliveryFailures()} the delivered messages whose body threw. Every message reaches exactly
+ * one of accepted, refused or dropped, so no message is ever lost silently.
+ * <p>
  * The per-slice block-update counters report the light rechecks and block update publications every region batch
  * defers: one batch of the block-entity, entity, chunk or scheduled tick slice records the writes of its workers
  * and the server thread applies them at its barrier, because the light engine and the block update publication
@@ -262,6 +280,17 @@ public record RegionThreadingDiagnostics(
         long deferredPortalTransitions,
         long appliedPortalTransitions,
         long refusedPortalTransitions,
+        long globalPhases,
+        long regionPhases,
+        long regionPhasesWithoutGlobalPhase,
+        long abandonedGlobalSegments,
+        long mailboxAcceptedMessages,
+        long mailboxDeliveredMessages,
+        long mailboxRefusedFullMessages,
+        long mailboxRefusedClosedMessages,
+        long mailboxDroppedRetiredMessages,
+        long mailboxDroppedOnCloseMessages,
+        long mailboxDeliveryFailures,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
     /**

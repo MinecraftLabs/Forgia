@@ -31,6 +31,14 @@ public final class RegionOwnershipViolationHandler {
     }
 
     /**
+     * Counts one ownership violation whose report was already produced by the same caller, so a repeated
+     * violation keeps the count exact without repeating the log line.
+     */
+    static void recordViolation() {
+        VIOLATION_COUNT.incrementAndGet();
+    }
+
+    /**
      * Rejects a server-owned entity storage access issued from a native region worker.
      * <p>
      * Unlike {@link #handle(String)} this rejection is unconditional: it never consults

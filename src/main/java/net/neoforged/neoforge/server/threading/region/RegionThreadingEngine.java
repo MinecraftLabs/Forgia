@@ -184,6 +184,32 @@ public final class RegionThreadingEngine implements RegionThreading {
      * it ticks.
      */
     private final Map<ServerLevel, ChunkLoadAnswers> chunkLoadAnswers = new ConcurrentHashMap<>();
+    /**
+     * The global/region phase state of the tick of each level.
+     * <p>
+     * The state exists for every level whose tick was opened by the engine bridge, so the state machine can
+     * assert that no region batch is in flight while the level's global statements run. A level without a
+     * tick entry - direct engine use from a mechanics test or a benchmark - reads as
+     * {@link LevelTickPhase#GLOBAL} and counts its region phases as work outside a level tick; see
+     * {@link LevelTickPhase}.
+     */
+    private final Map<ServerLevel, LevelTickPhaseState> levelTickPhases = new ConcurrentHashMap<>();
+    /**
+     * The cross-region mailbox of each level that has one. A level without an entry has no mailbox and pays
+     * one map lookup per level tick entry and per region phase end; the entry is created by the first post.
+     */
+    private final Map<ServerLevel, RegionMailbox> mailboxes = new ConcurrentHashMap<>();
+    /*
+     * The mailbox counters belong to the engine, not to one mailbox: a mailbox dies with its level, and the
+     * messages it dropped on the close have to stay observable in the diagnostics after that.
+     */
+    private final AtomicLong mailboxAcceptedMessages = new AtomicLong();
+    private final AtomicLong mailboxDeliveredMessages = new AtomicLong();
+    private final AtomicLong mailboxRefusedFullMessages = new AtomicLong();
+    private final AtomicLong mailboxRefusedClosedMessages = new AtomicLong();
+    private final AtomicLong mailboxDroppedRetiredMessages = new AtomicLong();
+    private final AtomicLong mailboxDroppedOnCloseMessages = new AtomicLong();
+    private final AtomicLong mailboxDeliveryFailures = new AtomicLong();
 
     /** One level's chunk-load answers and the loaded chunk count they were read at. */
     private static final class ChunkLoadAnswers {
@@ -941,6 +967,199 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * {@return the phase of the tick of {@code level}}
+     * <p>
+     * A level whose tick was not opened through {@link #beginLevelTick(ServerLevel)} reads as
+     * {@link LevelTickPhase#GLOBAL}: no region batch of it is in flight, so its global statements are the only
+     * thing that could run.
+     */
+    @ApiStatus.Internal
+    public LevelTickPhase levelTickPhase(ServerLevel level) {
+        final LevelTickPhaseState state = this.levelTickPhases.get(level);
+        return state == null ? LevelTickPhase.GLOBAL : state.phase();
+    }
+
+    /**
+     * Opens the global phase of the tick of {@code level} and drains the level's global mailbox.
+     * <p>
+     * Called on the server thread at the head of the level tick, before the queued region work of the tick and
+     * before every vanilla statement. The global messages a worker posted since the last global phase are
+     * delivered here, in posting order, so no region batch can be in flight while they run. A level tick that
+     * throws skips its close; the next entry counts the leftover segment as abandoned and continues from it.
+     */
+    @ApiStatus.Internal
+    public void beginLevelTick(ServerLevel level) {
+        this.levelTickPhaseState(level).beginGlobalPhase();
+        this.drainGlobalMessages(level);
+    }
+
+    /**
+     * Closes the global phase of the tick of {@code level}.
+     */
+    @ApiStatus.Internal
+    public void endLevelTick(ServerLevel level) {
+        final LevelTickPhaseState state = this.levelTickPhases.get(level);
+        if (state != null) {
+            state.endGlobalPhase();
+        }
+    }
+
+    /**
+     * Enters the region phase of one slice batch of {@code level}.
+     * <p>
+     * The batch that submits region work owns the phase from here until {@link #endRegionPhase(ServerLevel)}:
+     * exactly one batch of a level is in flight, and none is in flight while the level's global statements run.
+     */
+    @ApiStatus.Internal
+    public void beginRegionPhase(ServerLevel level) {
+        this.levelTickPhaseState(level).beginRegionPhase();
+    }
+
+    /**
+     * Leaves the region phase, which returns the level to its global phase and delivers the global messages the
+     * workers of the batch posted.
+     */
+    @ApiStatus.Internal
+    public void endRegionPhase(ServerLevel level) {
+        final LevelTickPhaseState state = this.levelTickPhaseState(level);
+        state.endRegionPhase();
+        if (!state.isRegionPhase()) {
+            this.drainGlobalMessages(level);
+        }
+    }
+
+    /**
+     * {@return the mailbox of {@code level}}, creating it on first use.
+     * <p>
+     * The mailbox of a shut-down engine is closed: a post through it is refused and counted instead of being
+     * queued for a tick that never comes.
+     */
+    @ApiStatus.Internal
+    public RegionMailbox mailbox(ServerLevel level) {
+        final RegionMailbox mailbox = this.mailboxes.computeIfAbsent(level,
+                key -> new RegionMailbox(this, key, RegionMailbox.DEFAULT_QUEUE_CAPACITY, RegionMailbox.DEFAULT_QUEUE_CAPACITY));
+        if (this.shutdown) {
+            mailbox.close();
+        }
+        return mailbox;
+    }
+
+    /**
+     * Rejects a write of the state the global phase owns from a region phase.
+     * <p>
+     * The rule and the state it covers are the ownership table of {@link LevelTickPhase}. The check is two
+     * volatile reads, so it is cheap enough for the single accessors it guards. It is an ownership assertion,
+     * not a storage guard: the configured {@code regionThreadingOwnershipViolationMode} decides whether the
+     * caller is interrupted, and the violation is always counted.
+     *
+     * @param level     the level whose state is written
+     * @param operation the operation that writes it, named in the report
+     */
+    @ApiStatus.Internal
+    public void assertGlobalStateWrite(ServerLevel level, String operation) {
+        if (RegionWorkerScope.isNativeWorkerThread()) {
+            RegionOwnershipViolationHandler.handle("Region phase wrote global state: " + operation);
+            return;
+        }
+        final LevelTickPhaseState state = this.levelTickPhases.get(level);
+        if (state != null && state.phase() == LevelTickPhase.REGION) {
+            RegionOwnershipViolationHandler.handle("Region phase wrote global state: " + operation);
+        }
+    }
+
+    /** {@return the region state of {@code coordinate}, or {@code null} when the coordinate has no live region} */
+    @Nullable
+    RegionState regionStateFor(RegionCoordinate coordinate) {
+        return this.regionizer.get(coordinate);
+    }
+
+    /**
+     * Runs one region slice batch of {@code level}: the level leaves its global phase for the lifetime of the
+     * batch and returns to it when the batch and its server-thread wait are over.
+     * <p>
+     * Every submission of a region slice batch goes through here, so the phase covers exactly the submitted
+     * worker work plus the barrier - the interval in which workers may run - and closes before the batch's
+     * server-thread handoff, which is not region work.
+     */
+    private void runRegionBatch(ServerLevel level, Runnable batch) {
+        this.beginRegionPhase(level);
+        try {
+            batch.run();
+        } finally {
+            this.endRegionPhase(level);
+        }
+    }
+
+    /**
+     * Wraps one region group body so the messages the mailbox queued to {@code region} are delivered before it,
+     * on the thread that runs the group.
+     */
+    private Runnable withRegionMailboxDelivery(ServerLevel level, RegionState region, Runnable body) {
+        return () -> this.deliverRegionMessages(level, region, body);
+    }
+
+    /**
+     * Delivers the messages queued to {@code region} and then runs {@code body}, at the start of the group the
+     * worker executes for that region.
+     */
+    void deliverRegionMessages(ServerLevel level, RegionState region, Runnable body) {
+        final RegionMailbox mailbox = this.mailboxes.get(level);
+        if (mailbox != null) {
+            mailbox.deliverRegion(region.coordinate(), region);
+        }
+        body.run();
+    }
+
+    /** Delivers the global messages of {@code level} on the current thread, in posting order. */
+    private void drainGlobalMessages(ServerLevel level) {
+        final RegionMailbox mailbox = this.mailboxes.get(level);
+        if (mailbox != null) {
+            mailbox.drainGlobal();
+        }
+    }
+
+    private LevelTickPhaseState levelTickPhaseState(ServerLevel level) {
+        return this.levelTickPhases.computeIfAbsent(level, key -> new LevelTickPhaseState());
+    }
+
+    void recordMailboxAccepted() {
+        this.mailboxAcceptedMessages.incrementAndGet();
+    }
+
+    void recordMailboxDelivered() {
+        this.mailboxDeliveredMessages.incrementAndGet();
+    }
+
+    void recordMailboxRefusedFull() {
+        this.mailboxRefusedFullMessages.incrementAndGet();
+    }
+
+    void recordMailboxRefusedClosed() {
+        this.mailboxRefusedClosedMessages.incrementAndGet();
+    }
+
+    void recordMailboxDroppedRetired(long messages) {
+        this.mailboxDroppedRetiredMessages.addAndGet(messages);
+    }
+
+    void recordMailboxDroppedOnClose(long messages) {
+        this.mailboxDroppedOnCloseMessages.addAndGet(messages);
+    }
+
+    /** {@return the delivery failures counted so far, after counting one more} */
+    long recordMailboxDeliveryFailure() {
+        return this.mailboxDeliveryFailures.incrementAndGet();
+    }
+
+    /** Closes and forgets the mailbox of {@code level}, dropping and counting every queued message. */
+    private void closeLevelMailbox(ServerLevel level) {
+        final RegionMailbox mailbox = this.mailboxes.remove(level);
+        if (mailbox != null) {
+            mailbox.close();
+        }
+    }
+
+    /**
      * Runs {@code task} while the current thread owns the entity's current region context.
      * <p>
      * Inside an entity tick batch the task runs inline only when the entity belongs to the batch group
@@ -1243,7 +1462,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                         continue;
                     }
                     this.entityTickRegionsOnWorkers.incrementAndGet();
-                    this.addLeasedGroup(region, () -> batch.addSelfDrivenGroup(activation, group -> this.selfDrivenEntityTickGroup(group, activation)));
+                    this.addLeasedGroup(region, () -> batch.addSelfDrivenGroup(activation,
+                            group -> this.withRegionMailboxDelivery(batch.level(), region, this.selfDrivenEntityTickGroup(group, activation))));
                 }
             } catch (Throwable throwable) {
                 failure = throwable;
@@ -1254,7 +1474,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             final long awaitStart = attribution ? System.nanoTime() : 0L;
             try {
-                batch.submitAndAwait(this.workerPool, barrier);
+                this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, barrier));
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
@@ -2064,7 +2284,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             final long awaitStart = attribution ? System.nanoTime() : 0L;
             try {
-                batch.submitAndAwait(this.workerPool, barrier);
+                this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, barrier));
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
@@ -2179,7 +2399,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 leasedAny = true;
                 batchedEntities += grouping.size(region);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region), group -> this.entityTickGroup(group)));
+                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region),
+                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.entityTickGroup(group))));
             }
             remaining = next;
             if (!leasedAny) {
@@ -2787,10 +3008,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // The barrier is the level's main-thread chunk-source block, so the batch waits by polling the
                 // main-thread queue. Counting the polls and the CPU time of the wait shows how much of the wait
                 // the server thread runs instead of parking, which is what competes with the workers.
-                batch.submitAndAwait(this.workerPool, attribution ? condition -> barrier.await(() -> {
+                this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, attribution ? condition -> barrier.await(() -> {
                     RegionBlockEntityTickAttribution.recordAwaitPoll();
                     return condition.getAsBoolean();
-                }) : barrier);
+                }) : barrier));
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
@@ -2913,7 +3134,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 leasedAny = true;
                 batchedTickers += countBlockEntityTickers(regionChunks);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks, group -> this.blockEntityTickGroup(group)));
+                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks,
+                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.blockEntityTickGroup(group))));
             }
             remaining = next;
             if (!leasedAny) {
@@ -3211,7 +3433,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 failure = throwable;
             } finally {
                 try {
-                    batch.submitAndAwait(this.workerPool, barrier);
+                    this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, barrier));
                 } catch (Throwable throwable) {
                     if (failure == null) {
                         failure = throwable;
@@ -3277,7 +3499,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 leasedAny = true;
                 batchedTicks += grouping.size(region);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region), batch.nextRandomSeed(), group -> this.scheduledTickGroup(group, callback)));
+                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region), batch.nextRandomSeed(),
+                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.scheduledTickGroup(group, callback))));
             }
             remaining = next;
             if (!leasedAny) {
@@ -3444,7 +3667,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             final long awaitStart = attribution ? System.nanoTime() : 0L;
             try {
-                batch.submitAndAwait(this.workerPool, barrier);
+                this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, barrier));
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
@@ -3535,7 +3758,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             }
             final long awaitStart = attribution ? System.nanoTime() : 0L;
             try {
-                batch.submitAndAwait(this.workerPool, barrier);
+                this.runRegionBatch(level, () -> batch.submitAndAwait(this.workerPool, barrier));
             } catch (Throwable throwable) {
                 if (failure == null) {
                     failure = throwable;
@@ -3617,7 +3840,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // the same full-chunk getter the vanilla state uses; its cap is the level-wide counter of the
                     // tick, which the plan counted before any worker ran.
                     final RegionSpawnState.Built built = plan.buildRegionState(region, regionChunks);
-                    batch.addGroup(region, regionChunks, built.state(), built.neighborhood(), this::spawnGroup);
+                    batch.addGroup(region, regionChunks, built.state(), built.neighborhood(),
+                            group -> this.withRegionMailboxDelivery(batch.level(), region, this.spawnGroup(group)));
                 });
             }
             remaining = next;
@@ -3821,7 +4045,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 leasedAny = true;
                 batchedChunks += regionChunks.size();
-                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks, this::chunkTickGroup));
+                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks,
+                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.chunkTickGroup(group))));
             }
             remaining = next;
             if (!leasedAny) {
@@ -4425,10 +4650,19 @@ public final class RegionThreadingEngine implements RegionThreading {
      * uses the level chunk source barrier, exactly like an entity batch, so off-thread chunk requests can
      * still be serviced. A pool worker never waits here: work it submitted may only be runnable after the
      * current worker returns.
+     * <p>
+     * The drain is a region phase of the level tick: it is opened before the first region is activated and
+     * closed after the last worker was awaited, so no queued region task of the level runs next to a global
+     * statement of the same level.
      */
     @ApiStatus.Internal
     public void drainLevelRegionTasks(ServerLevel level) {
-        this.drainLevelRegionTasks(level, levelBarrier(level));
+        this.beginRegionPhase(level);
+        try {
+            this.drainLevelRegionTasks(level, levelBarrier(level));
+        } finally {
+            this.endRegionPhase(level);
+        }
     }
 
     private void drainLevelRegionTasks(ServerLevel level, @Nullable RegionTickBarrier barrier) {
@@ -4540,6 +4774,12 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.chunkLoadAnswers.remove(level);
                     this.seededEntityTickLevels.remove(level);
                     this.regionizer.clearLevel(level);
+                    // The mailbox and the phase state of the level die with its region state: the queued
+                    // messages are dropped and counted, and a later post is refused instead of waiting for a
+                    // tick of a level that no longer exists. No batch of the level is in flight here, so no
+                    // worker can be inside a delivery or a phase transition either.
+                    this.closeLevelMailbox(level);
+                    this.levelTickPhases.remove(level);
                     for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                         if (task.isOwnedBy(level)) {
                             task.cancel();
@@ -5754,6 +5994,16 @@ public final class RegionThreadingEngine implements RegionThreading {
     @ApiStatus.Internal
     public RegionThreadingDiagnostics diagnostics() {
         final List<RegionTickSnapshot> regionTicks = this.regionizer.regionTickSnapshots();
+        long globalPhases = 0L;
+        long regionPhases = 0L;
+        long regionPhasesWithoutGlobalPhase = 0L;
+        long abandonedGlobalSegments = 0L;
+        for (final LevelTickPhaseState state : this.levelTickPhases.values()) {
+            globalPhases += state.globalPhaseCount();
+            regionPhases += state.regionPhaseCount();
+            regionPhasesWithoutGlobalPhase += state.regionPhasesWithoutGlobalPhase();
+            abandonedGlobalSegments += state.abandonedGlobalSegments();
+        }
         return new RegionThreadingDiagnostics(
                 this.regionizer.size(),
                 this.regionizer.runningRegionCount(),
@@ -5865,6 +6115,17 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.deferredPortalTransitionCount.get(),
                 this.appliedPortalTransitionCount.get(),
                 this.refusedPortalTransitionCount.get(),
+                globalPhases,
+                regionPhases,
+                regionPhasesWithoutGlobalPhase,
+                abandonedGlobalSegments,
+                this.mailboxAcceptedMessages.get(),
+                this.mailboxDeliveredMessages.get(),
+                this.mailboxRefusedFullMessages.get(),
+                this.mailboxRefusedClosedMessages.get(),
+                this.mailboxDroppedRetiredMessages.get(),
+                this.mailboxDroppedOnCloseMessages.get(),
+                this.mailboxDeliveryFailures.get(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
     }
@@ -5921,6 +6182,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.chunkLoadAnswers.clear();
                 this.seededEntityTickLevels.clear();
                 this.regionizer.clear();
+                // Every mailbox is closed before the pool goes away: its queued messages are dropped and
+                // counted, and a post from a worker that is still unwinding is refused instead of queued for a
+                // tick that never comes. The phase state of the levels is meaningless after this point.
+                for (final RegionMailbox mailbox : this.mailboxes.values()) {
+                    mailbox.close();
+                }
+                this.mailboxes.clear();
+                this.levelTickPhases.clear();
                 // The global region has no coordinate and is not part of the region metrics, so its window is
                 // released here: a shut-down engine holds no metric buffer at all.
                 this.globalRegion.tickMetrics().release();

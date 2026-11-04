@@ -340,6 +340,10 @@ abstract class RegionTickBatch {
 
     /**
      * Submits every group and waits for the workers. Safe to call once; a second call only waits.
+     * <p>
+     * The caller opens the region phase of the level around this call (see
+     * {@code RegionThreadingEngine#runRegionBatch}), so the interval in which the groups may run is exactly one
+     * region phase of the level tick.
      */
     final void submitAndAwait(RegionWorkerExecutor executor, RegionTickBarrier barrier) {
         synchronized (this) {

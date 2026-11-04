@@ -19,6 +19,7 @@ import net.minecraft.world.level.entity.EntityTypeTest;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.ticks.LevelTicks;
+import net.neoforged.neoforge.server.threading.region.LevelTickPhase;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
@@ -32,6 +33,7 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
+import net.neoforged.neoforge.server.threading.region.RegionMailbox;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
 import net.neoforged.neoforge.server.threading.region.RegionScopedEntityQuery;
 import net.neoforged.neoforge.server.threading.region.RegionSpawnAttribution;
@@ -846,6 +848,72 @@ public final class RegionThreadingHooks {
             engine.runInLevelTick(level, task);
         } else {
             task.run();
+        }
+    }
+
+    /**
+     * Opens the global phase of the tick of {@code level} and drains the level's global mailbox.
+     * <p>
+     * Called on the server thread at the head of the level tick, before the queued region work of the tick and
+     * before every vanilla statement. Without an installed engine this is a no-op: there is no region phase, so
+     * the level is global for its whole tick and the vanilla order is unchanged.
+     */
+    public static void beginLevelTick(ServerLevel level) {
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.beginLevelTick(level);
+            }
+        });
+    }
+
+    /**
+     * Closes the global phase of the tick of {@code level}. A no-op without an installed engine.
+     */
+    public static void endLevelTick(ServerLevel level) {
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.endLevelTick(level);
+            }
+        });
+    }
+
+    /**
+     * {@return the phase of the tick of {@code level}, or {@code null} when no engine is installed}
+     * <p>
+     * Without an engine no slice ever leaves the server thread, so there is no phase boundary to report.
+     */
+    @Nullable
+    public static LevelTickPhase levelTickPhase(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine ? engine.levelTickPhase(level) : null;
+    }
+
+    /**
+     * {@return the mailbox of {@code level}, or {@code null} when no engine is installed}
+     * <p>
+     * The mailbox is the only supported way for region work to affect another region or to ask the server thread
+     * to change global state at a defined point; see {@link RegionMailbox}.
+     */
+    @Nullable
+    public static RegionMailbox mailbox(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine ? engine.mailbox(level) : null;
+    }
+
+    /**
+     * Rejects a write of the state the global phase owns from a region phase; see the ownership table of
+     * {@link LevelTickPhase}.
+     * <p>
+     * Called by the single accessors of the owned state ({@code ServerLevel.setDayTime},
+     * {@code setDayTimeFraction}, {@code setDayTimePerTick} and {@code setWeatherParameters}). A write from a
+     * native region worker, or from the server thread while a region phase of the level is in flight, is an
+     * ownership violation: it is counted and reported according to the configured ownership violation mode.
+     * Without an installed engine the call is a no-op.
+     */
+    public static void assertGlobalStateWrite(ServerLevel level, String operation) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.assertGlobalStateWrite(level, operation);
         }
     }
 

@@ -64,6 +64,14 @@
      }
  
      @Deprecated
+@@ -307,6 +_,7 @@
+     }
+ 
+     public void setWeatherParameters(int p_8607_, int p_8608_, boolean p_8609_, boolean p_8610_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertGlobalStateWrite(this, "ServerLevel.setWeatherParameters");
+         this.serverLevelData.setClearWeatherTime(p_8607_);
+         this.serverLevelData.setRainTime(p_8608_);
+         this.serverLevelData.setThunderTime(p_8608_);
 @@ -342,7 +_,7 @@
          if (this.sleepStatus.areEnoughSleeping(i) && this.sleepStatus.areEnoughDeepSleeping(i, this.players)) {
              if (this.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) {
@@ -139,7 +147,7 @@
              profilerfiller.pop();
              this.tickBlockEntities();
          }
-@@ -432,13 +_,40 @@
+@@ -432,18 +_,46 @@
          return this.chunkSource.chunkMap.getDistanceManager().inBlockTickingRange(p_184059_);
      }
  
@@ -181,6 +189,12 @@
              }
          }
      }
+ 
+     public void setDayTime(long p_8616_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertGlobalStateWrite(this, "ServerLevel.setDayTime");
+         this.serverLevelData.setDayTime(p_8616_);
+     }
+ 
 @@ -472,28 +_,12 @@
          ProfilerFiller profilerfiller = this.getProfiler();
          profilerfiller.push("thunder");
@@ -554,7 +568,7 @@
                      ServerLevel.this.dragonParts.put(enderdragonpart.getId(), enderdragonpart);
                  }
              }
-@@ -1733,24 +_,111 @@
+@@ -1733,24 +_,113 @@
                  if (ServerLevel.this.isUpdatingNavigations) {
                      String s = "onTrackingStart called during navigation iteration";
                      Util.logAndPauseIfInIde(
@@ -628,6 +642,7 @@
 +
 +    @org.jetbrains.annotations.ApiStatus.Internal
 +    public void setDayTimeFraction(float dayTimeFraction) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertGlobalStateWrite(this, "ServerLevel.setDayTimeFraction");
 +        serverLevelData.setDayTimeFraction(dayTimeFraction);
 +    }
 +
@@ -662,6 +677,7 @@
 +     */
 +    @Override
 +    public void setDayTimePerTick(float dayTimePerTick) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertGlobalStateWrite(this, "ServerLevel.setDayTimePerTick");
 +        if (dayTimePerTick != getDayTimePerTick() && dayTimePerTick != 0f) {
 +            serverLevelData.setDayTimePerTick(dayTimePerTick);
 +            server.forceTimeSynchronization();
