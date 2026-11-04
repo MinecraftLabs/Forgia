@@ -458,7 +458,7 @@
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215052_, p_215053_, p_215054_);
      }
  
-@@ -1136,6 +_,12 @@
+@@ -1136,32 +_,49 @@
  
      @Override
      public void blockEvent(BlockPos p_8746_, Block p_8747_, int p_8748_, int p_8749_) {
@@ -471,7 +471,10 @@
          this.blockEvents.add(new BlockEventData(p_8746_, p_8747_, p_8748_, p_8749_));
      }
  
-@@ -1145,19 +_,21 @@
+     private void runBlockEvents() {
+         this.blockEventsToReschedule.clear();
+ 
++        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginPhase(this);
          while (!this.blockEvents.isEmpty()) {
              BlockEventData blockeventdata = this.blockEvents.removeFirst();
              if (this.shouldTickBlocksAt(blockeventdata.pos())) {
@@ -489,23 +492,35 @@
 -                        );
 -                }
 +                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this, blockeventdata.pos(), () -> {
-+                    if (this.doBlockEvent(blockeventdata)) {
-+                        this.server
-+                            .getPlayerList()
-+                            .broadcast(
-+                                null,
-+                                (double)blockeventdata.pos().getX(),
-+                                (double)blockeventdata.pos().getY(),
-+                                (double)blockeventdata.pos().getZ(),
-+                                64.0,
-+                                this.dimension(),
-+                                new ClientboundBlockEventPacket(blockeventdata.pos(), blockeventdata.block(), blockeventdata.paramA(), blockeventdata.paramB())
-+                            );
++                    // Neo: the move of a piston event runs here, so the attribution of one event is the
++                    // attribution of one multi-block move.
++                    final long eventStart = net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.beginEvent();
++                    try {
++                        if (this.doBlockEvent(blockeventdata)) {
++                            this.server
++                                .getPlayerList()
++                                .broadcast(
++                                    null,
++                                    (double)blockeventdata.pos().getX(),
++                                    (double)blockeventdata.pos().getY(),
++                                    (double)blockeventdata.pos().getZ(),
++                                    64.0,
++                                    this.dimension(),
++                                    new ClientboundBlockEventPacket(blockeventdata.pos(), blockeventdata.block(), blockeventdata.paramA(), blockeventdata.paramB())
++                                );
++                        }
++                    } finally {
++                        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endEvent(eventStart);
 +                    }
 +                });
              } else {
                  this.blockEventsToReschedule.add(blockeventdata);
              }
+         }
++        net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution.endPhase();
+ 
+         this.blockEvents.addAll(this.blockEventsToReschedule);
+     }
 @@ -1600,7 +_,34 @@
  
      @Override

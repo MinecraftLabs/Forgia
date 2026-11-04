@@ -47,6 +47,32 @@ Block entities remain at ~8 % on workers on purpose: a hopper or furnace reads t
 and a foreign block-entity read answers null — a wrong value, not an approximation — so relaxing that rule
 needs a deferred foreign block-entity read first.
 
+## Structure claims: measured, not built
+
+A piston move runs inside the server-thread block event phase, and every block event of a level tick is
+serialized there: `PistonBaseBlock.triggerEvent` resolves the structure and writes the blocks on the server
+thread, under a region lease the server thread takes for that one event. The mechanism a claim would add —
+claim the chunks a move touches, run the move on the region worker, make the target region skip the claimed
+chunks — was measured before it was built, with the `benchmarkPiston` GameTest: 128 sticky pistons on a
+20-tick farm clock, columns of 1..12 blocks, half of them pushing across a 3-chunk region border, 200 warmup
++ 600 measured ticks.
+
+| profile | moves/tick | block event phase ms/tick | share of a 50 ms tick | mspt mean | p95 | p99 |
+|---|---|---|---|---|---|---|
+| off (vanilla) | 13.0 | 0.82 | 1.6 % | 2.78 | 10.4 | 13.2 |
+| on, border updates off | 13.0 | 0.76 | 1.5 % | 4.66 | 10.8 | 16.5 |
+| on, every move inside its region | 13.0 | 0.76 | 1.5 % | 4.61 | 12.7 | 17.5 |
+| on (everything) | 14.4 | 2.18 | 4.4 % | 5.92 | 22.8 | 38.9 |
+| off, 512 pistons | 51.9 | 1.66 | 3.3 % | 3.95 | 16.3 | 27.0 |
+
+The move itself costs 30–60 µs, so the phase is 1.5 % of a tick for a workload that already moves a column
+every tick; the regionized cross-border path adds 1.4 ms per tick of capture and fixpoint work for the half
+of the moves that cross a border, which is the cost a claim would have to remove and does not. The phase also
+sits between the chunk tick batch and the entity and block-entity slices of the same level tick, so no region
+slice runs while a move runs and a claim has nothing to exclude today; running the move on a worker would
+first require moving the phase into the batch, which changes the tick order. The mechanism was therefore not
+built; the numbers and the reasoning are in `.pi/tasks/structure-claims.md`.
+
 ## Roadmap
 
 | # | Milestone | State |
@@ -57,7 +83,7 @@ needs a deferred foreign block-entity read first.
 | A3 | Continuous region ticking (tick clock instead of a per-tick barrier) | planned |
 | A4 | Dynamic region size (split/merge by load) | planned |
 | B1 | Cross-region game events (sculk vibration) | planned |
-| B2 | Structure leases (piston multi-block moves, Create contraptions) | planned |
+| B2 | Structure leases (piston multi-block moves, Create contraptions) | measured, not worth it (see above) |
 | B3 | Player regionization (teleport, portals, cross-dimension) | planned |
 | B4 | Large randomized redstone soak | planned |
 | C1 | Save/load and crash recovery of regionized state | planned |

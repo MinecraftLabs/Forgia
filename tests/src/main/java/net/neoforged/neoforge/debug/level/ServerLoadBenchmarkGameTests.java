@@ -63,6 +63,7 @@ import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BedPart;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntitySectionStorage;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -77,6 +78,7 @@ import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionChunkTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
@@ -248,6 +250,75 @@ public class ServerLoadBenchmarkGameTests {
     private static final int HOPPER_DROP_STACK_SIZE = 1;
     /** Height above the hopper block an item entity is dropped at, inside the suck box and above the block. */
     private static final double HOPPER_DROP_HEIGHT = 1.05;
+    /**
+     * Sticky pistons of the piston workload when {@value #PISTON_COUNT_PROPERTY} is unset.
+     * <p>
+     * A piston clock unit carries two pistons, so the count is rounded up to an even number. The default is
+     * the size at which a farm clock that fires every piston at once still moves a whole block column per
+     * tick over a window of ten ticks: it is the workload at which the serialized block event phase would
+     * first be expected to matter.
+     */
+    private static final int PISTON_COUNT = 128;
+    /**
+     * System property that overrides {@link #PISTON_COUNT}, so the size of the piston workload can be varied
+     * without editing the test. An odd count is rounded up to the next even one, because a clock unit carries
+     * two pistons.
+     */
+    static final String PISTON_COUNT_PROPERTY = "neoforge.serverBenchmarkPistons";
+    /**
+     * Ticks of one piston clock period when {@value #PISTON_CLOCK_PROPERTY} is unset: the redstone block of a
+     * clock is placed for the first half of the period and removed for the second half, so every piston of the
+     * workload extends once and retracts once per period.
+     */
+    private static final int PISTON_CLOCK_TICKS = 20;
+    /**
+     * System property that overrides {@link #PISTON_CLOCK_TICKS}. A farm clock of a piston door or a flying
+     * machine runs between four and twenty ticks; the workload asserts the range because a faster clock would
+     * fire into a move that has not finished its two-tick animation.
+     */
+    static final String PISTON_CLOCK_PROPERTY = "neoforge.serverBenchmarkPistonClockTicks";
+    /**
+     * Largest column a piston of the workload moves: vanilla resolves at most twelve pushed blocks, so one
+     * clock unit per size class covers the whole range of a piston move.
+     */
+    private static final int PISTON_MAX_SIZE = 12;
+    /**
+     * Column size of every piston of the workload when {@value #PISTON_SIZE_PROPERTY} is unset: the size cycles
+     * through 1..{@value #PISTON_MAX_SIZE} over the clock units, so one window covers the whole range.
+     */
+    private static final int PISTON_SIZE_MIXED = 0;
+    /**
+     * System property that pins the column size of every piston of the workload to one value between 1 and
+     * {@value #PISTON_MAX_SIZE}, so the cost of one move can be reported per size class. Unset mixes the sizes.
+     */
+    static final String PISTON_SIZE_PROPERTY = "neoforge.serverBenchmarkPistonSize";
+    /**
+     * Y of the piston workload. The units stand in open sky far above the generated terrain of the test level,
+     * so every pushed column moves into air and the workload does not depend on the terrain under it.
+     */
+    private static final int PISTON_HEIGHT = 250;
+    /**
+     * Blocks between two piston clock columns. A unit spans the clock, the two pistons and a column of at most
+     * {@value #PISTON_MAX_SIZE} blocks on each side, which is 27 blocks; 48 is the width of a 3x3-chunk region,
+     * so every column of the workload starts on the same block of its region.
+     */
+    private static final int PISTON_COLUMN_SPACING = 48;
+    /** Clock units per row of the piston workload. */
+    private static final int PISTON_UNITS_PER_ROW = 4;
+    /** Blocks between two rows of the piston workload; a unit occupies a single z line. */
+    private static final int PISTON_ROW_SPACING = 2;
+    /**
+     * Clock units of a row that push across a region border, as a period of the row index. Every second row is
+     * placed on the first block of its region and pushes west into the previous one, so half of the moves of the
+     * workload cross a border.
+     */
+    private static final int PISTON_BORDER_ROW_PERIOD = 2;
+    /**
+     * System property that overrides {@link #PISTON_BORDER_ROW_PERIOD}, so a measurement can place the whole
+     * workload inside its own region ({@code 0}) and compare it with the half-crossing default. Every positive
+     * value keeps the row pattern of the default workload.
+     */
+    static final String PISTON_BORDER_PERIOD_PROPERTY = "neoforge.serverBenchmarkPistonBorderRowPeriod";
     /** Distance from the chunk corner to the first workload slot of that chunk. */
     private static final int ENTITY_WORKER_SLOT_ORIGIN = 3;
     /** Distance between two workload slots of one chunk, so every mob of a chunk has room for its own POI. */
@@ -364,6 +435,11 @@ public class ServerLoadBenchmarkGameTests {
     static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
     static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
+    /**
+     * Columns of the piston workload row: the profile and its load, the server tick distribution, the block
+     * event phase and the distribution of one move.
+     */
+    static final String PISTON_CSV_HEADER = "profile,workers,regionSize,pistons,units,borderUnits,clockTicks,msptAvg,msptP50,msptP95,msptP99,blockEventPhases,blockEvents,movesPerTick,blockEventMsPerTick,blockEventMicrosPerMove,eventP50Micros,eventP95Micros,eventP99Micros,blockEventPhaseMaxMs,ownershipViolations";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
     static final String SOAK_MSPT_HEADER = "profile,zombies,measuredTicks,window,samples,msptAvg,msptP50,msptP95,msptP99";
     static final String SOAK_DRIFT_HEADER = "profile,firstHalfAvgMs,lastAvgMs,driftRatio,driftPercent,firstHalfP99Ms,lastP99Ms";
@@ -505,6 +581,72 @@ public class ServerLoadBenchmarkGameTests {
                         reportHoppers(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, hoppers, grid.size(), itemCountStart.get(), drops.injectedItems(), admissionCache);
                         if (cleaned.compareAndSet(false, true)) {
                             removeHoppers(level, hoppers);
+                            releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                        }
+                    })
+                    .thenSucceed();
+        });
+    }
+
+    @GameTest(batch = "benchmarkPiston", timeoutTicks = 2000)
+    @EmptyTemplate(value = "15x10x15", floor = true)
+    @TestHolder(description = "Measures the server-thread block event phase under a piston clock load; only runs when neoforge.serverBenchmark is set")
+    static void measuresServerTickTimeUnderPistonLoad(final DynamicTest test) {
+        test.onGameTest(helper -> {
+            if (!Boolean.getBoolean(ENABLED_PROPERTY)) {
+                System.out.println("SERVER_BENCH_NOTE skipped piston workload: -D" + ENABLED_PROPERTY + "=true is not set");
+                helper.succeed();
+                return;
+            }
+            final int clockTicks = pistonClockTicks();
+            final ServerLevel level = helper.getLevel();
+            final BlockPos origin = helper.absolutePos(BlockPos.ZERO);
+            final List<ChunkPos> grid = gridChunks(origin);
+            final List<PistonUnit> units = pistonUnits(origin);
+            final PistonClock clock = new PistonClock(level, units, clockTicks);
+            final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, clock);
+            // The attribution is reported per measured tick, so it starts from zero when the warmup ends and
+            // the warmup itself stays unmeasured.
+            sampler.onMeasuredWindowStart(() -> {
+                RegionBlockEventAttribution.setMeasuredLevel(level);
+                RegionBlockEventAttribution.setEnabled(true);
+            });
+            final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
+            final AtomicBoolean cleaned = new AtomicBoolean();
+            helper.addEndListener(passed -> {
+                if (cleaned.compareAndSet(false, true)) {
+                    NeoForge.EVENT_BUS.unregister(sampler);
+                    RegionBlockEventAttribution.setEnabled(false);
+                    RegionBlockEventAttribution.setMeasuredLevel(null);
+                    removePistonUnits(level, units);
+                    releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
+                }
+            });
+
+            helper.startSequence()
+                    .thenExecute(() -> forceChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS))
+                    // The clock units stand in chunks that have to exist before a piston of them can move.
+                    .thenWaitUntil(() -> helper.assertTrue(
+                            grid.stream().allMatch(chunk -> level.areEntitiesLoaded(chunk.toLong())),
+                            "the benchmark chunk grid never finished its entity load"))
+                    .thenExecute(() -> placePistonUnits(level, units, helper))
+                    .thenExecute(() -> {
+                        before.set(RegionThreadingHooks.diagnostics());
+                        sampler.startWindow(level.getGameTime());
+                        NeoForge.EVENT_BUS.register(sampler);
+                    })
+                    // Two extra ticks: the sequence runs inside the tick body, so the last sampled tick only
+                    // completes its Post event after this sequence step would otherwise have read it, and the
+                    // sampler closes its window on the tick after that.
+                    .thenIdle(WARMUP_TICKS + MEASURED_TICKS + 2)
+                    .thenExecute(() -> {
+                        NeoForge.EVENT_BUS.unregister(sampler);
+                        final RegionBlockEventAttribution.Snapshot attribution = RegionBlockEventAttribution.snapshot();
+                        RegionBlockEventAttribution.setEnabled(false);
+                        RegionBlockEventAttribution.setMeasuredLevel(null);
+                        reportPistons(helper, level, sampler, before.get(), attribution, units, clockTicks, clock.writes());
+                        if (cleaned.compareAndSet(false, true)) {
+                            removePistonUnits(level, units);
                             releaseChunks(level, grid, BLOCK_TICKING_TICKET_RADIUS);
                         }
                     })
@@ -1730,6 +1872,367 @@ public class ServerLoadBenchmarkGameTests {
                 level.setBlock(pos.below(), Blocks.AIR.defaultBlockState(), 3);
             }
         }
+    }
+
+    /**
+     * One piston clock unit of the piston workload: a redstone block clock, the sticky piston on each side of
+     * it and the stone column each piston moves.
+     * <p>
+     * The redstone block powers both pistons from the side they do not push into, so one clock write drives two
+     * pistons that push in opposite directions. Both are sticky, so the retract pulls the column back and the
+     * unit returns to the state it was placed in: a window can run for any number of periods without walking
+     * the column out of its space.
+     *
+     * @param clock         position of the redstone block that clocks the unit
+     * @param westPiston    the piston that pushes its column west
+     * @param eastPiston    the piston that pushes its column east
+     * @param size          blocks in each of the two columns, 1..{@value #PISTON_MAX_SIZE}
+     * @param crossesBorder whether the west column of the unit reaches into the region before its own
+     */
+    private record PistonUnit(BlockPos clock, BlockPos westPiston, BlockPos eastPiston, int size, boolean crossesBorder) {}
+
+    /**
+     * {@return the piston clock units of the workload}
+     * <p>
+     * The layout depends on {@code origin} and the piston count, never on the installed region layout: every
+     * column starts on the same block of the 48-block region grid, so all measured profiles move the same
+     * pistons at the same absolute positions. The rows alternate between a unit on the first block of its
+     * region - whose west column crosses the border into the region before it - and a unit in the middle of its
+     * region, so half of the moves of the workload cross a border. The column size cycles through 1..12 over the
+     * units, so one window covers every move size a piston can have.
+     */
+    private static List<PistonUnit> pistonUnits(BlockPos origin) {
+        final int unitCount = (pistonCount() + 1) / 2;
+        final int baseX = pistonBaseX(origin);
+        final int baseZ = (Math.floorDiv(origin.getZ(), 16) - GRID_CHUNKS / 2) * 16 + 8;
+        final List<PistonUnit> units = new ArrayList<>(unitCount);
+        for (int index = 0; index < unitCount; index++) {
+            final int row = index / PISTON_UNITS_PER_ROW;
+            final int column = index % PISTON_UNITS_PER_ROW;
+            final boolean crossesBorder = pistonBorderRowPeriod() > 0 && row % pistonBorderRowPeriod() == 0;
+            final int clockX = baseX + column * PISTON_COLUMN_SPACING + (crossesBorder ? 1 : PISTON_COLUMN_SPACING / 2);
+            final int z = baseZ + row * PISTON_ROW_SPACING;
+            units.add(new PistonUnit(
+                    new BlockPos(clockX, PISTON_HEIGHT, z),
+                    new BlockPos(clockX - 1, PISTON_HEIGHT, z),
+                    new BlockPos(clockX + 1, PISTON_HEIGHT, z),
+                    pistonSize(index),
+                    crossesBorder));
+        }
+        return units;
+    }
+
+    /**
+     * {@return the x of the first piston column of the workload, on the region grid}
+     * <p>
+     * A 3x3-chunk region is {@value #PISTON_COLUMN_SPACING} blocks wide, so a multiple of that spacing is the
+     * first block of a region for every fixed region size the benchmark measures. The value is the first such
+     * block that leaves a whole unit - a column of at most {@value #PISTON_MAX_SIZE} blocks on each side of its
+     * clock - inside the force-loaded grid.
+     */
+    private static int pistonBaseX(BlockPos origin) {
+        final int gridFirstX = (Math.floorDiv(origin.getX(), 16) - GRID_CHUNKS / 2) * 16;
+        return Math.floorDiv(gridFirstX + 16 + PISTON_COLUMN_SPACING - 1, PISTON_COLUMN_SPACING) * PISTON_COLUMN_SPACING;
+    }
+
+    /**
+     * Places the clock units: the floor under the workload, the two sticky pistons, their stone columns and the
+     * air the redstone block clock is written into by {@link PistonClock}.
+     * <p>
+     * The floor is what makes the measurement a measurement of the move: the level's heightmaps are recomputed
+     * for every block a piston writes, and a column that stands in open sky makes a removal scan down to the
+     * terrain under it. With a floor one block under the workload the scan stops immediately, which is the cost
+     * a piston of a real build pays as well.
+     */
+    private static void placePistonUnits(ServerLevel level, List<PistonUnit> units, ExtendedGameTestHelper helper) {
+        final BlockState westPiston = Blocks.STICKY_PISTON.defaultBlockState()
+                .setValue(BlockStateProperties.FACING, Direction.WEST)
+                .setValue(BlockStateProperties.EXTENDED, false);
+        final BlockState eastPiston = Blocks.STICKY_PISTON.defaultBlockState()
+                .setValue(BlockStateProperties.FACING, Direction.EAST)
+                .setValue(BlockStateProperties.EXTENDED, false);
+        for (PistonUnit unit : units) {
+            for (int x = unit.westPiston().getX() - unit.size() - 1; x <= unit.eastPiston().getX() + unit.size() + 1; x++) {
+                level.setBlock(new BlockPos(x, PISTON_HEIGHT - 1, unit.clock().getZ()), Blocks.STONE.defaultBlockState(), 3);
+            }
+            level.setBlock(unit.clock(), Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(unit.westPiston(), westPiston, 3);
+            level.setBlock(unit.eastPiston(), eastPiston, 3);
+            for (int index = 1; index <= unit.size(); index++) {
+                level.setBlock(unit.westPiston().west(index), Blocks.STONE.defaultBlockState(), 3);
+                level.setBlock(unit.eastPiston().east(index), Blocks.STONE.defaultBlockState(), 3);
+            }
+        }
+        int placed = 0;
+        for (PistonUnit unit : units) {
+            final boolean pistons = level.getBlockState(unit.westPiston()).is(Blocks.STICKY_PISTON)
+                    && level.getBlockState(unit.eastPiston()).is(Blocks.STICKY_PISTON);
+            final boolean westColumn = level.getBlockState(unit.westPiston().west(unit.size())).is(Blocks.STONE);
+            final boolean eastColumn = level.getBlockState(unit.eastPiston().east(unit.size())).is(Blocks.STONE);
+            if (pistons && westColumn && eastColumn) {
+                placed++;
+            }
+        }
+        helper.assertTrue(placed == units.size(),
+                "only " + placed + " of " + units.size() + " benchmark piston clock units were created");
+    }
+
+    private static void removePistonUnits(ServerLevel level, List<PistonUnit> units) {
+        for (PistonUnit unit : units) {
+            for (int x = unit.westPiston().getX() - unit.size() - 1; x <= unit.eastPiston().getX() + unit.size() + 1; x++) {
+                level.setBlock(new BlockPos(x, PISTON_HEIGHT - 1, unit.clock().getZ()), Blocks.AIR.defaultBlockState(), 3);
+            }
+            level.setBlock(unit.clock(), Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(unit.westPiston(), Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(unit.eastPiston(), Blocks.AIR.defaultBlockState(), 3);
+            for (int index = 1; index <= PISTON_MAX_SIZE; index++) {
+                level.setBlock(unit.westPiston().west(index), Blocks.AIR.defaultBlockState(), 3);
+                level.setBlock(unit.eastPiston().east(index), Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+    }
+
+    /**
+     * Drives the redstone block of every piston clock unit.
+     * <p>
+     * The block is placed for the first half of the clock period and removed for the second half, so every
+     * piston of the workload extends on the rising edge and retracts on the falling edge. The write runs at
+     * {@link ServerTickEvent.Pre}, before the level of the tick ticks, so it never races a region worker batch;
+     * it is the only server-thread write the workload itself performs and it is reported as its own count.
+     */
+    private static final class PistonClock implements Runnable {
+        private final ServerLevel level;
+        private final List<PistonUnit> units;
+        private final int period;
+        private boolean powered;
+        private long writes;
+
+        private PistonClock(ServerLevel level, List<PistonUnit> units, int period) {
+            this.level = level;
+            this.units = units;
+            this.period = period;
+        }
+
+        @Override
+        public void run() {
+            final boolean next = this.level.getGameTime() % this.period < this.period / 2;
+            if (next == this.powered) {
+                return;
+            }
+            this.powered = next;
+            final BlockState state = next ? Blocks.REDSTONE_BLOCK.defaultBlockState() : Blocks.AIR.defaultBlockState();
+            for (PistonUnit unit : this.units) {
+                this.level.setBlock(unit.clock(), state, 3);
+                this.writes++;
+            }
+        }
+
+        /** {@return the clock block writes the driver performed} */
+        private long writes() {
+            return this.writes;
+        }
+    }
+
+    /**
+     * Prints the measurement of the piston workload: the server tick distribution, the wall time of the block
+     * event phase and of one event, and the load that produced them.
+     * <p>
+     * A piston move runs inside the block event phase, so {@code blockEventMsPerTick} is the server-thread time
+     * the moves of the workload serialized, and {@code blockEventMicrosPerMove} is the cost of one move of the
+     * size class the workload mixes. {@code movesPerTick} is the number of moves the window produced per tick,
+     * so a reader can scale the phase to a different piston count without re-running the benchmark.
+     */
+    private static void reportPistons(ExtendedGameTestHelper helper, ServerLevel level, TickSampler sampler,
+            Optional<RegionThreadingDiagnostics> before, RegionBlockEventAttribution.Snapshot attribution,
+            List<PistonUnit> units, int clockTicks, long clockWrites) {
+        final long[] sorted = sampler.sortedSamples();
+        helper.assertTrue(sorted.length > 0, "the tick sampler recorded no server tick");
+        final Optional<RegionThreadingDiagnostics> after = RegionThreadingHooks.diagnostics();
+        final String profile = profileName(after);
+        final long phases = attribution.phaseCount();
+        final long events = attribution.eventCount();
+        final long borderUnits = units.stream().filter(PistonUnit::crossesBorder).count();
+        final int pistons = units.size() * 2;
+        final double movesPerTick = events / (double) phases;
+        final double phaseMillisPerTick = attribution.phaseNanos() / 1_000_000.0 / phases;
+        final double microsPerMove = attribution.eventNanos() / 1_000.0 / events;
+        System.out.println(sampler.note(profile, after)
+                + " pistonCount=" + pistons
+                + " pistonUnits=" + units.size()
+                + " pistonBorderUnits=" + borderUnits
+                + " pistonSizes=" + pistonSizeLabel()
+                + " pistonClockTicks=" + clockTicks
+                + " pistonClockWrites=" + clockWrites
+                + " pistonExtended=" + countExtendedPistons(level, units)
+                + " pistonColumnStones=" + countColumnStones(level, units)
+                + " pistonExpectedStones=" + expectedColumnStones(units)
+                + " pistonHeads=" + countPistonHeads(level, units)
+                + " writeMicros=" + String.format(Locale.ROOT, "%.3f", measureWriteMicros(level, units.get(0)))
+                + " readMicros=" + String.format(Locale.ROOT, "%.3f", measureReadMicros(level, units.get(0)))
+                + " pendingBlockEvents=" + pendingBlockEvents(level)
+                + " blockEventPhaseMaxMs=" + String.format(Locale.ROOT, "%.3f", attribution.phaseMaxNanos() / 1_000_000.0)
+                + " blockEventPhases=" + phases
+                + " blockEvents=" + events);
+        helper.assertTrue(events > 0,
+                "the piston workload produced no block event, so no piston moved: clockWrites=" + clockWrites
+                        + " phases=" + phases);
+        System.out.println("SERVER_BENCH_PISTON_HEADER " + PISTON_CSV_HEADER);
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_PISTON_ROW %s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n",
+                profile,
+                after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
+                after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
+                pistons,
+                units.size(),
+                borderUnits,
+                clockTicks,
+                averageMillis(sorted),
+                percentileMillis(sorted, 0.50),
+                percentileMillis(sorted, 0.95),
+                percentileMillis(sorted, 0.99),
+                phases,
+                events,
+                movesPerTick,
+                phaseMillisPerTick,
+                microsPerMove,
+                attribution.latency().percentileNanos(0.50) / 1_000.0,
+                attribution.latency().percentileNanos(0.95) / 1_000.0,
+                attribution.latency().percentileNanos(0.99) / 1_000.0,
+                attribution.phaseMaxNanos() / 1_000_000.0,
+                delta(before, after, RegionThreadingDiagnostics::ownershipViolationCount));
+    }
+
+    /**
+     * {@return the row period of the clock units that push across a region border, {@code 0} for a workload
+     * that stays inside its region}
+     */
+    private static int pistonBorderRowPeriod() {
+        return intProperty(PISTON_BORDER_PERIOD_PROPERTY, PISTON_BORDER_ROW_PERIOD);
+    }
+
+    /** {@return the size classes the piston workload moves, for the note line of a row} */
+    private static String pistonSizeLabel() {
+        final int configured = intProperty(PISTON_SIZE_PROPERTY, PISTON_SIZE_MIXED);
+        return configured == PISTON_SIZE_MIXED ? "1.." + PISTON_MAX_SIZE : Integer.toString(configured);
+    }
+
+    /**
+     * {@return the wall time of one block write of the workload, in microseconds}
+     * <p>
+     * The calibration writes and clears the same position above the floor of the workload's own chunk, so it
+     * pays the same heightmap, light and neighbour work a piston write pays. It is the denominator of the move
+     * cost: a move of a column of {@code n} blocks writes {@code 2n + 2} positions.
+     */
+    private static double measureWriteMicros(ServerLevel level, PistonUnit unit) {
+        final BlockPos pos = new BlockPos(unit.westPiston().getX() - unit.size() - 1, PISTON_HEIGHT, unit.clock().getZ());
+        return timeMicros(32, 512, index -> level.setBlock(pos,
+                index % 2 == 0 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), 3));
+    }
+
+    /** {@return the wall time of one block state read of the workload, in microseconds} */
+    private static double measureReadMicros(ServerLevel level, PistonUnit unit) {
+        final BlockPos pos = new BlockPos(unit.westPiston().getX() - unit.size() - 1, PISTON_HEIGHT, unit.clock().getZ());
+        return timeMicros(32, 512, index -> level.getBlockState(pos));
+    }
+
+    private static double timeMicros(int warmup, int repetitions, java.util.function.IntConsumer action) {
+        for (int index = 0; index < warmup; index++) {
+            action.accept(index);
+        }
+        final long start = System.nanoTime();
+        for (int index = 0; index < repetitions; index++) {
+            action.accept(index);
+        }
+        return (System.nanoTime() - start) / 1000.0 / repetitions;
+    }
+
+    /** {@return the column blocks of the workload that are still where the unit was placed} */
+    private static long countColumnStones(ServerLevel level, List<PistonUnit> units) {
+        long stones = 0L;
+        for (PistonUnit unit : units) {
+            for (int index = 1; index <= unit.size(); index++) {
+                if (level.getBlockState(unit.westPiston().west(index)).is(Blocks.STONE)) {
+                    stones++;
+                }
+                if (level.getBlockState(unit.eastPiston().east(index)).is(Blocks.STONE)) {
+                    stones++;
+                }
+            }
+        }
+        return stones;
+    }
+
+    /** {@return the column blocks the workload placed} */
+    private static long expectedColumnStones(List<PistonUnit> units) {
+        long stones = 0L;
+        for (PistonUnit unit : units) {
+            stones += 2L * unit.size();
+        }
+        return stones;
+    }
+
+    /** {@return the piston heads or moving pistons in front of the pistons of the workload} */
+    private static long countPistonHeads(ServerLevel level, List<PistonUnit> units) {
+        long heads = 0L;
+        for (PistonUnit unit : units) {
+            if (level.getBlockState(unit.westPiston().west(1)).is(Blocks.PISTON_HEAD)) {
+                heads++;
+            }
+            if (level.getBlockState(unit.eastPiston().east(1)).is(Blocks.PISTON_HEAD)) {
+                heads++;
+            }
+        }
+        return heads;
+    }
+
+    /** {@return the sticky pistons of the workload that are in their extended state} */
+    private static long countExtendedPistons(ServerLevel level, List<PistonUnit> units) {
+        long extended = 0L;
+        for (PistonUnit unit : units) {
+            final BlockState state = level.getBlockState(unit.westPiston());
+            if (state.is(Blocks.STICKY_PISTON) && state.getValue(BlockStateProperties.EXTENDED)) {
+                extended++;
+            }
+        }
+        return extended;
+    }
+
+    /** {@return the block events the level still has queued or rescheduled} */
+    private static int pendingBlockEvents(ServerLevel level) {
+        return ((Collection<?>) storageField(level, "blockEvents")).size()
+                + ((Collection<?>) storageField(level, "blockEventsToReschedule")).size();
+    }
+
+    /** {@return the configured piston count, rounded up to a whole clock unit} */
+    private static int pistonCount() {
+        final int configured = intProperty(PISTON_COUNT_PROPERTY, PISTON_COUNT);
+        if (configured <= 0) {
+            throw new IllegalArgumentException(PISTON_COUNT_PROPERTY + " must be positive: " + configured);
+        }
+        return configured + (configured & 1);
+    }
+
+    /**
+     * {@return the column size of the clock unit at {@code index}: the configured size, or the size class of
+     * the unit when the workload mixes all of them}
+     */
+    private static int pistonSize(int index) {
+        final int configured = intProperty(PISTON_SIZE_PROPERTY, PISTON_SIZE_MIXED);
+        if (configured == PISTON_SIZE_MIXED) {
+            return 1 + index % PISTON_MAX_SIZE;
+        }
+        if (configured > PISTON_MAX_SIZE) {
+            throw new IllegalArgumentException(PISTON_SIZE_PROPERTY + " must not exceed " + PISTON_MAX_SIZE + ": " + configured);
+        }
+        return configured;
+    }
+
+    /** {@return the configured clock period, which has to leave room for the two-tick move animation} */
+    private static int pistonClockTicks() {
+        final int configured = intProperty(PISTON_CLOCK_PROPERTY, PISTON_CLOCK_TICKS);
+        if (configured < 4) {
+            throw new IllegalArgumentException(PISTON_CLOCK_PROPERTY + " must be at least 4 ticks: " + configured);
+        }
+        return configured;
     }
 
     /**
