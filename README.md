@@ -23,10 +23,10 @@ counted.
 | Area | What it does | Measured |
 |---|---|---|
 | **Entity ticks** | Regions tick their own entities; the server thread no longer walks the entity list | **2.5–4.5×** on 1024 mobs (4 workers) |
-| **Chunk ticks** | Random ticks, ice/snow, thunder on the region that owns the chunk | 1.15–1.27× with 9-chunk regions |
+| **Chunk ticks** | Random ticks, ice/snow, thunder on the region that owns the chunk, including chunks on a region border | 1.24–1.27× (100 % of dispatched chunks on workers) |
 | **Natural spawning** | Per-region spawn bodies against the vanilla level-wide mob cap | spawn slice 4.6 → 2.8–3.9 ms |
 | **Points of interest** | Region-partitioned storage with published snapshots; queries identical to vanilla | villagers **2.1–2.4×**, zombies **3.4×** |
-| **Block entities** | Furnace/hopper family admitted on workers with a per-chunk admission cache | at parity |
+| **Block entities** | Furnace/hopper family admitted on workers with a per-chunk admission cache | at parity; interior-only (a hopper reads its neighbour) |
 | **Redstone** | Cross-region updates converge in the **same tick** through a fixpoint | 98 layouts, 5 880 tick comparisons, identical to vanilla |
 | **Cross-region reads** | Seqlock chunk versions; a stale read re-runs the region that made it | 0 torn reads, 0 stale takes |
 | **Global state** | Explicit global phase + bounded cross-region mailbox | weather/time writes from a region fail closed |
@@ -39,11 +39,15 @@ random tick are compared against **real vanilla implementations**, tick by tick,
 
 Forgia is not a finished Folia replacement. The honest list:
 
-- **Light loads do not win yet.** A 2048-hopper line is at parity, 4096 furnaces are slower. The per-tick
-  barrier costs 0.4–0.8 ms while the work is 1–2 ms.
-- **The production soak shows no speedup at 3-chunk regions.** Only the centre chunk of a 3×3 region has all
-  eight neighbours inside it, so 89 % of chunk ticks and 94 % of block-entity ticks still fall back. The fix
-  (deferred cross-region block writes, then relaxing the interior rule) is the milestone in progress.
+- **Light loads do not win yet.** A 2048-hopper line runs at 3.7–4.0 ms against 3.3 ms inline and 4096
+  furnaces at 2.7–3.3 ms against 2.6 ms. The worker body itself costs about 2.5× the inline cost per ticker,
+  and the persistent-pool work that removes the submission cost is off by default because it costs the
+  entity slice its dynamic balancing; the fix is a work-stealing dispatcher, not a global switch.
+- **The production soak is at parity, not ahead.** With everything on it lands at or below the inline mspt
+  (median ratio 0.983, p50 5.60 ms against 6.22 ms), but a realistic world does not have enough parallel work
+  to gain more than that at 3-chunk regions.
+- **Block entities still require the interior rule**, so ~92 % of their ticks stay on the server thread: a
+  hopper reads the container one block away and a foreign block-entity read answers null.
 - **Structures are not region-aware.** A piston that moves blocks across a border, and Create-style
   contraptions, still run on the server thread.
 - **Cross-region game events (sculk) are not regionized.**
