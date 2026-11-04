@@ -54,6 +54,10 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingBorderUpdates;
 
+        public final BooleanValue enableRegionThreadingPersistentWorkers;
+
+        public final BooleanValue enableRegionThreadingPackedRegionLeases;
+
         public final IntValue regionThreadingWorkerThreads;
 
         public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
@@ -162,6 +166,20 @@ public class NeoForgeConfig {
                     .translation("neoforge.configgui.enableRegionThreadingBorderUpdates")
                     .worldRestart()
                     .define("enableRegionThreadingBorderUpdates", false);
+
+            enableRegionThreadingPersistentWorkers = builder
+                    .comment(
+                            "EXPERIMENTAL: Dispatches region worker work through one persistent worker per thread instead of a shared executor queue. The submitting thread hands the task to the slot of one worker and unparks it; the worker runs the task and spins a bounded number of iterations before it parks again. This removes the queue lock and most of the per-tick wake-up latency of a light workload. Requires enableRegionThreadingBridge. With the switch off, the worker pool hands its tasks to a fixed thread pool exactly like before.")
+                    .translation("neoforge.configgui.enableRegionThreadingPersistentWorkers")
+                    .worldRestart()
+                    .define("enableRegionThreadingPersistentWorkers", false);
+
+            enableRegionThreadingPackedRegionLeases = builder
+                    .comment(
+                            "EXPERIMENTAL: Lets one worker task of a tick slice hold several regions of that slice, so a tick submits about one task per worker instead of one task per region. A pack leases its regions in one canonical order, all or nothing: a pack that cannot lease every region releases the ones it took and the regions are leased one by one instead, which is counted. Exclusivity is unchanged - each region is still held by exactly one worker for the whole task, with its own lease, group random and ownership lease. Requires enableRegionThreadingBridge. With the switch off, every slice submits one task per region exactly like before.")
+                    .translation("neoforge.configgui.enableRegionThreadingPackedRegionLeases")
+                    .worldRestart()
+                    .define("enableRegionThreadingPackedRegionLeases", false);
 
             regionThreadingWorkerThreads = builder
                     .comment("EXPERIMENTAL: Number of native region worker threads reserved for the future region scheduler. A value of 0 uses max(1, available processors - 1).")

@@ -88,13 +88,30 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
      * @param workFactory builds the worker task; it receives the group so later retries can extend it
      */
     Group addGroup(RegionState region, List<RegionBlockEntityTickChunk> chunks, Function<Group, Runnable> workFactory) {
+        final Group group = this.registerGroup(region, chunks);
+        this.addTask("block entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
+        return group;
+    }
+
+    /**
+     * Registers one region group of this batch without submitting it.
+     * <p>
+     * The caller leases the region, registers every group of the pack and then submits them together through
+     * {@link RegionTickBatch#addPackedTask(String, List)}. The group holds the region from the lease to the end
+     * of its own body exactly like an unpacked group; only the submission is shared.
+     */
+    Group registerGroup(RegionState region, List<RegionBlockEntityTickChunk> chunks) {
         this.leasedRegions.add(region);
         // The random source is created here, inside the lease release path of the caller, so a failure
         // while building it cannot leave the region TICKING without a worker that releases it.
         final Group group = new Group(this, region, chunks, this.groupRandomSeed(region.coordinate()));
         this.groups.add(group);
-        this.addTask("block entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
+    }
+
+    /** {@return the wrapped worker work of one registered group} */
+    Runnable packedWork(Group group, Function<Group, Runnable> workFactory) {
+        return this.groupWork(workFactory.apply(group));
     }
 
     /**

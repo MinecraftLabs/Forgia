@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.unittest;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -12,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -181,6 +183,88 @@ class RegionTaskBatchTest {
 
         assertTrue(Thread.interrupted(), "the interrupt status must be preserved");
         assertTrue(barrier.isComplete());
+    }
+
+    @Test
+    void packedGroupsRunExactlyOnceAndTheBarrierWaitsForEveryGroup() {
+        final int groupCount = 6;
+        final int[] runs = new int[groupCount];
+        final CountDownLatch release = new CountDownLatch(1);
+        final RegionTaskBatch batch = new RegionTaskBatch();
+        final List<Runnable> works = new java.util.ArrayList<>(groupCount);
+        for (int index = 0; index < groupCount; ++index) {
+            final int group = index;
+            works.add(() -> {
+                awaitUnchecked(release);
+                ++runs[group];
+            });
+        }
+        batch.addPacked("pack", works);
+        assertEquals(groupCount, batch.groupCount());
+        assertEquals(1, batch.taskCount());
+
+        final RegionTaskBatch.Barrier barrier = batch.submit(this.workerExecutor());
+        release.countDown();
+        barrier.awaitCompletion();
+
+        assertTrue(barrier.isComplete());
+        assertNull(barrier.failure());
+        for (int index = 0; index < groupCount; ++index) {
+            assertEquals(1, runs[index], "group " + index + " ran " + runs[index] + " times");
+        }
+    }
+
+    @Test
+    void aFailingGroupOfAPackDoesNotStopTheGroupsPackedWithIt() {
+        final IllegalStateException failure = new IllegalStateException("boom");
+        final int[] runs = new int[3];
+        final RegionTaskBatch batch = new RegionTaskBatch();
+        batch.addPacked("pack", List.of(
+                () -> ++runs[0],
+                () -> {
+                    ++runs[1];
+                    throw failure;
+                },
+                () -> ++runs[2]));
+
+        final RegionTaskBatch.Barrier barrier = batch.submit(this.workerExecutor());
+        barrier.awaitCompletion();
+
+        assertTrue(barrier.isComplete());
+        assertArrayEquals(new int[] { 1, 1, 1 }, runs, "every group of the pack must run exactly once");
+        assertSame(failure, barrier.failure());
+        assertSame(failure, assertThrows(IllegalStateException.class, barrier::throwIfFailed));
+    }
+
+    @Test
+    void packedGroupsRunOnOneWorker() {
+        final Set<String> threads = ConcurrentHashMap.newKeySet();
+        final RegionTaskBatch batch = new RegionTaskBatch();
+        batch.addPacked("pack", List.of(
+                () -> threads.add(Thread.currentThread().getName()),
+                () -> threads.add(Thread.currentThread().getName()),
+                () -> threads.add(Thread.currentThread().getName())));
+
+        batch.submit(this.workerExecutor()).awaitCompletion();
+
+        assertEquals(1, threads.size(), "a packed task must run all of its groups on one worker");
+        assertTrue(threads.iterator().next().startsWith("test-region-worker-"), threads.toString());
+    }
+
+    @Test
+    void aRejectedPackedTaskRunsAllOfItsGroupsOnTheSubmittingThread() {
+        final Set<String> threads = ConcurrentHashMap.newKeySet();
+        final RegionTaskBatch batch = new RegionTaskBatch();
+        batch.addPacked("pack", List.of(
+                () -> threads.add(Thread.currentThread().getName()),
+                () -> threads.add(Thread.currentThread().getName())));
+
+        final RegionTaskBatch.Barrier barrier = batch.submit((description, task) -> false);
+
+        assertEquals(1, barrier.rejectedCount());
+        assertEquals(2, barrier.groupCount());
+        assertTrue(barrier.isComplete());
+        assertEquals(Set.of(Thread.currentThread().getName()), threads);
     }
 
     @Test

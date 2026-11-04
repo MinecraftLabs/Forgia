@@ -143,6 +143,21 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final boolean scheduledTickWorkerExecutionEnabled;
     private final boolean chunkTickWorkerExecutionEnabled;
     private final boolean spawnWorkerExecutionEnabled;
+    /**
+     * Whether a slice leases several regions into one worker task. Off means one task per region, exactly like
+     * before packing existed.
+     */
+    private final boolean packedRegionLeasesEnabled;
+    /** Packed worker tasks this engine submitted. */
+    private final AtomicLong packedTasks = new AtomicLong();
+    /** Regions the packed tasks of this engine hold; divided by {@link #packedTasks} it is the regions per task. */
+    private final AtomicLong packedRegions = new AtomicLong();
+    /**
+     * Packed acquisitions that could not take every region of their pack and released what they took. The
+     * affected regions were leased one by one instead; a growing count means the pool and the region work of the
+     * previous tick overlap, not that a region was skipped.
+     */
+    private final AtomicLong packedLeaseFallbacks = new AtomicLong();
     private final AtomicLong rejectedWorkerTaskCount = new AtomicLong();
     private final AtomicLong failedQueuedTaskCount = new AtomicLong();
     private final AtomicLong entityTicksOnWorkers = new AtomicLong();
@@ -733,9 +748,20 @@ public final class RegionThreadingEngine implements RegionThreading {
      * vanilla picks a spawn position without regard to the region border; see {@link RegionSpawnPlan}.
      */
     public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, boolean spawnWorkerExecutionEnabled, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
+        this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, spawnWorkerExecutionEnabled, false, false, layout, entityStorageMode);
+    }
+
+    /**
+     * Creates an engine with the light-load dispatch of the worker pool and of the region leases selected.
+     * <p>
+     * {@code persistentWorkers} hands a task to the slot of one persistent worker instead of a shared executor
+     * queue, and {@code packedRegionLeases} lets one task tick several regions of the same slice. Both are off by
+     * default, and off means the unchanged behaviour of every slice.
+     */
+    public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, boolean spawnWorkerExecutionEnabled, boolean persistentWorkers, boolean packedRegionLeases, RegionLayout layout, RegionEntityStorageMode entityStorageMode) {
         this.layout = layout;
         this.regionizer = new ThreadedRegionizer(this.layout);
-        this.workerPool = new RegionWorkerPool(workerThreads > 0 ? workerThreads : Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
+        this.workerPool = new RegionWorkerPool(workerThreads > 0 ? workerThreads : Math.max(1, Runtime.getRuntime().availableProcessors() - 1), persistentWorkers);
         this.workerExecutionEnabled = workerExecutionEnabled;
         this.globalWorkerExecutionEnabled = globalWorkerExecutionEnabled;
         this.entityTickWorkerExecutionEnabled = entityTickWorkerExecutionEnabled;
@@ -743,6 +769,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.scheduledTickWorkerExecutionEnabled = scheduledTickWorkerExecutionEnabled;
         this.chunkTickWorkerExecutionEnabled = chunkTickWorkerExecutionEnabled;
         this.spawnWorkerExecutionEnabled = spawnWorkerExecutionEnabled;
+        this.packedRegionLeasesEnabled = packedRegionLeases;
         this.entityStorageMode = entityStorageMode;
         this.declareVanillaServerThreadOnlyEntities();
         RegionOwnershipViolationHandler.reset();
@@ -3441,21 +3468,49 @@ public final class RegionThreadingEngine implements RegionThreading {
 
             final List<Entity> next = new ArrayList<>(retry);
             boolean leasedAny = false;
-            for (final RegionState region : grouping.regions()) {
-                if (batch.leases(region)) {
-                    // An earlier group of this same batch already owns the lease. It cannot be
-                    // acquired again and must never be awaited on this thread.
-                    batch.group(region).ifPresent(group -> group.addEntities(grouping.items(region)));
+            // The regions are leased in one canonical order and split into balanced packs, so one task of this
+            // slice can hold several regions. A slice with fewer regions than workers is not packed and keeps the
+            // unpacked submission of one task per region.
+            for (final List<RegionState> pack : this.regionPacks(grouping.regions())) {
+                final List<RegionState> toLease = new ArrayList<>(pack.size());
+                for (final RegionState region : pack) {
+                    if (batch.leases(region)) {
+                        // An earlier group of this same batch already owns the lease. It cannot be
+                        // acquired again and must never be awaited on this thread.
+                        batch.group(region).ifPresent(group -> group.addEntities(grouping.items(region)));
+                        continue;
+                    }
+                    toLease.add(region);
+                }
+                if (toLease.isEmpty()) {
                     continue;
                 }
-                if (!this.acquireRegionLease(region, barrier)) {
-                    next.addAll(grouping.items(region));
+                if (toLease.size() == 1) {
+                    if (this.leaseEntityGroup(batch, grouping, toLease.get(0), barrier, next)) {
+                        leasedAny = true;
+                        batchedEntities += grouping.size(toLease.get(0));
+                    }
+                    continue;
+                }
+                final List<RegionState> leased = RegionLeasePack.tryAcquireAll(toLease, this::releaseRegionLease);
+                if (leased == null) {
+                    // The pack could not take every region: it released the ones it took again, and every
+                    // region of the pack is leased through the unpacked path, which waits for a region a worker
+                    // still holds instead of failing on it. The fallback is counted.
+                    this.packedLeaseFallbacks.incrementAndGet();
+                    for (final RegionState region : toLease) {
+                        if (this.leaseEntityGroup(batch, grouping, region, barrier, next)) {
+                            leasedAny = true;
+                            batchedEntities += grouping.size(region);
+                        }
+                    }
                     continue;
                 }
                 leasedAny = true;
-                batchedEntities += grouping.size(region);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region),
-                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.entityTickGroup(group))));
+                for (final RegionState region : leased) {
+                    batchedEntities += grouping.size(region);
+                }
+                this.addPackedEntityGroups(batch, grouping, leased);
             }
             remaining = next;
             if (!leasedAny) {
@@ -3474,6 +3529,47 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (batchedEntities > 0 && this.entityTickWorkersNoticeLogged.compareAndSet(false, true)) {
             LOGGER.info("Region entity ticks are now executing on region workers: {} entities", batchedEntities);
         }
+    }
+
+    /**
+     * Leases one region of an entity batch and submits its group as its own task.
+     *
+     * @return {@code true} when the region was leased and its group submitted, {@code false} when its entities
+     *         were recorded for the next attempt
+     * @see #leaseBlockEntityGroup the same unpacked path of the block-entity slice
+     */
+    private boolean leaseEntityGroup(RegionEntityTickBatch batch, RegionTickGrouping<RegionState, Entity> grouping, RegionState region, RegionTickBarrier barrier, List<Entity> retry) {
+        if (!this.acquireRegionLease(region, barrier)) {
+            retry.addAll(grouping.items(region));
+            return false;
+        }
+        this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region),
+                group -> this.withRegionMailboxDelivery(batch.level(), region, this.entityTickGroup(group))));
+        return true;
+    }
+
+    /**
+     * Registers the groups of one leased pack and submits them as one worker task.
+     * <p>
+     * A failure while a group is built releases every lease of the pack, exactly like the block-entity pack: a
+     * region must never stay TICKING behind a group no worker will run.
+     */
+    private void addPackedEntityGroups(RegionEntityTickBatch batch, RegionTickGrouping<RegionState, Entity> grouping, List<RegionState> pack) {
+        final List<Runnable> works = new ArrayList<>(pack.size());
+        try {
+            for (final RegionState region : pack) {
+                final RegionEntityTickBatch.Group group = batch.registerGroup(region, grouping.items(region));
+                works.add(batch.packedWork(group, leased -> this.withRegionMailboxDelivery(batch.level(), region, this.entityTickGroup(leased))));
+            }
+        } catch (Throwable throwable) {
+            for (final RegionState region : pack) {
+                this.releaseRegionLease(region);
+            }
+            throw throwable;
+        }
+        this.packedTasks.incrementAndGet();
+        this.packedRegions.addAndGet(pack.size());
+        batch.addPackedTask("entity tick pack of " + pack.size(), works);
     }
 
     /**
@@ -3607,10 +3703,42 @@ public final class RegionThreadingEngine implements RegionThreading {
         try {
             registration.run();
         } catch (Throwable throwable) {
-            region.clearRunning();
-            this.regionizer.removeIfEmpty(region);
+            this.releaseRegionLease(region);
             throw throwable;
         }
+    }
+
+    /**
+     * Releases a lease this thread took and never handed to a worker.
+     * <p>
+     * Retiring an empty region is part of the release: the lease is what kept the region alive, and a region that
+     * is retired after its last group is the same cleanup a finished group runs.
+     */
+    private void releaseRegionLease(RegionState region) {
+        region.clearRunning();
+        this.regionizer.removeIfEmpty(region);
+    }
+
+    /**
+     * {@return the packs of one slice's regions, each in the canonical lease order}
+     * <p>
+     * With packing enabled the regions are split into balanced packs of about {@code regionCount / workerCount}
+     * regions; with it disabled every pack holds one region, which is the unpacked submission of one task per
+     * region.
+     *
+     * @see RegionLeasePack#split(List, int)
+     */
+    private List<List<RegionState>> regionPacks(Collection<RegionState> regions) {
+        if (!this.packedRegionLeasesEnabled) {
+            // The unpacked path keeps the order in which the regions were first seen, exactly like before
+            // packing existed: a pack is the only thing that needs a canonical order.
+            final List<List<RegionState>> single = new ArrayList<>(regions.size());
+            for (final RegionState region : regions) {
+                single.add(List.of(region));
+            }
+            return single;
+        }
+        return RegionLeasePack.split(RegionLeasePack.canonicalOrder(regions), this.workerPool.threadCount());
     }
 
     private Runnable entityTickGroup(RegionEntityTickBatch.Group group) {
@@ -4200,34 +4328,62 @@ public final class RegionThreadingEngine implements RegionThreading {
 
             final List<RegionBlockEntityTickChunk> next = new ArrayList<>(retry);
             boolean leasedAny = false;
-            for (final RegionState region : grouping.regions()) {
-                final List<RegionBlockEntityTickChunk> regionChunks = grouping.items(region);
-                if (!this.isRegionSafeBlockEntityGroup(regionChunks)) {
-                    // Conservative whole-region fallback: a region that contains at least one ticker whose
-                    // compatibility declaration does not prove region-local, storage-free work keeps all
-                    // of its tickers on the server thread after the batch. The order inside the region is
-                    // preserved and no query consumer ever runs on a worker.
-                    for (final RegionBlockEntityTickChunk chunk : regionChunks) {
-                        batch.addFallbackChunk(chunk);
-                        this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
-                        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION, chunk.admissions().size());
+            // The regions are leased in one canonical order and split into balanced packs, so one task of this
+            // slice can hold several regions. A slice with fewer regions than workers is not packed and keeps the
+            // unpacked submission of one task per region.
+            for (final List<RegionState> pack : this.regionPacks(grouping.regions())) {
+                final List<RegionState> toLease = new ArrayList<>(pack.size());
+                for (final RegionState region : pack) {
+                    final List<RegionBlockEntityTickChunk> regionChunks = grouping.items(region);
+                    if (!this.isRegionSafeBlockEntityGroup(regionChunks)) {
+                        // Conservative whole-region fallback: a region that contains at least one ticker whose
+                        // compatibility declaration does not prove region-local, storage-free work keeps all
+                        // of its tickers on the server thread after the batch. The order inside the region is
+                        // preserved and no query consumer ever runs on a worker.
+                        for (final RegionBlockEntityTickChunk chunk : regionChunks) {
+                            batch.addFallbackChunk(chunk);
+                            this.fallbackBlockEntityTicks.addAndGet(chunk.admissions().size());
+                            RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION, chunk.admissions().size());
+                        }
+                        continue;
+                    }
+                    if (batch.leases(region)) {
+                        // An earlier group of this same batch already owns the lease. It cannot be
+                        // acquired again and must never be awaited on this thread.
+                        batch.group(region).ifPresent(group -> group.addChunks(regionChunks));
+                        continue;
+                    }
+                    toLease.add(region);
+                }
+                if (toLease.isEmpty()) {
+                    continue;
+                }
+                if (toLease.size() == 1) {
+                    if (this.leaseBlockEntityGroup(batch, grouping, toLease.get(0), barrier, next)) {
+                        leasedAny = true;
+                        batchedTickers += this.countLeasedBlockEntityTickers(grouping, toLease.get(0));
                     }
                     continue;
                 }
-                if (batch.leases(region)) {
-                    // An earlier group of this same batch already owns the lease. It cannot be
-                    // acquired again and must never be awaited on this thread.
-                    batch.group(region).ifPresent(group -> group.addChunks(regionChunks));
-                    continue;
-                }
-                if (!this.acquireRegionLease(region, barrier)) {
-                    next.addAll(regionChunks);
+                final List<RegionState> leased = RegionLeasePack.tryAcquireAll(toLease, this::releaseRegionLease);
+                if (leased == null) {
+                    // The pack could not take every region: it released the ones it took again, and every
+                    // region of the pack is leased through the unpacked path, which waits for a region a worker
+                    // still holds instead of failing on it. The fallback is counted.
+                    this.packedLeaseFallbacks.incrementAndGet();
+                    for (final RegionState region : toLease) {
+                        if (this.leaseBlockEntityGroup(batch, grouping, region, barrier, next)) {
+                            leasedAny = true;
+                            batchedTickers += this.countLeasedBlockEntityTickers(grouping, region);
+                        }
+                    }
                     continue;
                 }
                 leasedAny = true;
-                batchedTickers += countBlockEntityTickers(regionChunks);
-                this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks,
-                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.blockEntityTickGroup(group))));
+                for (final RegionState region : leased) {
+                    batchedTickers += this.countLeasedBlockEntityTickers(grouping, region);
+                }
+                this.addPackedBlockEntityGroups(batch, grouping, leased);
             }
             remaining = next;
             if (!leasedAny) {
@@ -4244,6 +4400,56 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (batchedTickers > 0 && this.blockEntityTickWorkersNoticeLogged.compareAndSet(false, true)) {
             LOGGER.info("Region block entity ticks are now executing on region workers: {} block entities", batchedTickers);
         }
+    }
+
+    /**
+     * Leases one region of a block-entity batch and submits its group as its own task.
+     * <p>
+     * This is the unpacked path: it is used for a slice that is not packed, for a pack with one region and for
+     * the fallback of a pack that could not take every region it needs.
+     *
+     * @return {@code true} when the region was leased and its group submitted, {@code false} when its chunks were
+     *         recorded for the next attempt
+     */
+    private boolean leaseBlockEntityGroup(RegionBlockEntityTickBatch batch, RegionTickGrouping<RegionState, RegionBlockEntityTickChunk> grouping, RegionState region, RegionTickBarrier barrier, List<RegionBlockEntityTickChunk> retry) {
+        final List<RegionBlockEntityTickChunk> regionChunks = grouping.items(region);
+        if (!this.acquireRegionLease(region, barrier)) {
+            retry.addAll(regionChunks);
+            return false;
+        }
+        this.addLeasedGroup(region, () -> batch.addGroup(region, regionChunks,
+                group -> this.withRegionMailboxDelivery(batch.level(), region, this.blockEntityTickGroup(group))));
+        return true;
+    }
+
+    /** {@return the number of tickers one leased region of {@code grouping} hands to a worker} */
+    private int countLeasedBlockEntityTickers(RegionTickGrouping<RegionState, RegionBlockEntityTickChunk> grouping, RegionState region) {
+        return countBlockEntityTickers(grouping.items(region));
+    }
+
+    /**
+     * Registers the groups of one leased pack and submits them as one worker task.
+     * <p>
+     * The leases are already taken, so a failure while a group is built releases every lease of the pack
+     * instead of leaving a region TICKING behind a group no worker will run, which would block shutdown and
+     * level unload forever.
+     */
+    private void addPackedBlockEntityGroups(RegionBlockEntityTickBatch batch, RegionTickGrouping<RegionState, RegionBlockEntityTickChunk> grouping, List<RegionState> pack) {
+        final List<Runnable> works = new ArrayList<>(pack.size());
+        try {
+            for (final RegionState region : pack) {
+                final RegionBlockEntityTickBatch.Group group = batch.registerGroup(region, grouping.items(region));
+                works.add(batch.packedWork(group, leased -> this.withRegionMailboxDelivery(batch.level(), region, this.blockEntityTickGroup(leased))));
+            }
+        } catch (Throwable throwable) {
+            for (final RegionState region : pack) {
+                this.releaseRegionLease(region);
+            }
+            throw throwable;
+        }
+        this.packedTasks.incrementAndGet();
+        this.packedRegions.addAndGet(pack.size());
+        batch.addPackedTask("block entity tick pack of " + pack.size(), works);
     }
 
     private boolean isRegionSafeBlockEntityGroup(List<RegionBlockEntityTickChunk> chunks) {
@@ -5580,6 +5786,23 @@ public final class RegionThreadingEngine implements RegionThreading {
     /** {@return the per-slice worker tick failure counters of the diagnostics snapshot} */
     private RegionThreadingDiagnostics.TickFailureCounters tickFailureCounters() {
         return new RegionThreadingDiagnostics.TickFailureCounters(snapshot(this.workerTickFailures));
+    }
+
+    /** {@return the worker dispatch counters of the pool and of the packed region leases} */
+    private RegionThreadingDiagnostics.WorkerDispatchCounters workerDispatchCounters() {
+        final RegionWorkerPool.DispatchSnapshot dispatch = this.workerPool.dispatchSnapshot();
+        return new RegionThreadingDiagnostics.WorkerDispatchCounters(
+                dispatch.submissions(),
+                dispatch.submitNanos(),
+                dispatch.wakeNanos(),
+                dispatch.idleWakeUps(),
+                dispatch.spinWakeUps(),
+                dispatch.parkWakeUps(),
+                this.packedTasks.get(),
+                this.packedRegions.get(),
+                this.packedLeaseFallbacks.get(),
+                this.workerPool.isPersistent(),
+                this.packedRegionLeasesEnabled);
     }
 
     private static void throwUnchecked(Throwable throwable) {
@@ -7275,6 +7498,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.borderBlockWritesDropped.get(),
                         this.readAfterDeferredBlockWrite.get()),
                 RegionPoiCounters.snapshot(),
+                this.workerDispatchCounters(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
     }

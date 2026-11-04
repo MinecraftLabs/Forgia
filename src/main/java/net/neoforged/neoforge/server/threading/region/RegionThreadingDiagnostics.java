@@ -297,8 +297,38 @@ public record RegionThreadingDiagnostics(
         long mailboxDeliveryFailures,
         BorderUpdateCounters borderUpdates,
         PoiCounters poiCounters,
+        WorkerDispatchCounters workerDispatch,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
+    /**
+     * The counters of the worker dispatch path and of the packed region leases.
+     * <p>
+     * {@code submissions} counts the tasks the pool accepted, {@code submitNanos} the wall time the submitting
+     * threads spent handing them to the pool, and {@code wakeNanos} the wall time between a hand-off and the start
+     * of the task body for the tasks a submitter handed to an idle worker - the wake-up the pool controls.
+     * {@code idleWakeUps} counts those tasks; {@code wakeNanos / idleWakeUps} is the wake-up latency and a window
+     * without an idle hand-off reports zero for it. {@code spinWakeUps} and {@code parkWakeUps} split the
+     * wake-ups into the ones a spinning worker took and the ones a parked worker took, so their ratio is the
+     * spin-versus-park behaviour of the pool. {@code packedTasks} counts the worker tasks that hold several regions and
+     * {@code packedRegions} the regions they hold, so {@code packedRegions / packedTasks} is the regions per
+     * packed task. {@code partialPackFallbacks} counts the packs that could not lease every region they needed,
+     * released the ones they took and leased the affected regions one by one instead: a fallback is never a
+     * dropped region. {@code persistentWorkers} and {@code packedRegionLeases} report which of the two
+     * light-load changes is installed.
+     */
+    public record WorkerDispatchCounters(
+            long submissions,
+            long submitNanos,
+            long wakeNanos,
+            long idleWakeUps,
+            long spinWakeUps,
+            long parkWakeUps,
+            long packedTasks,
+            long packedRegions,
+            long partialPackFallbacks,
+            boolean persistentWorkers,
+            boolean packedRegionLeases) {}
+
     /**
      * The counters of the region-partitioned POI storage.
      * <p>

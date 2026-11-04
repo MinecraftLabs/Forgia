@@ -28,6 +28,11 @@ import org.jetbrains.annotations.Nullable;
  * so a closing pool can never strand the barrier. The first failure of any group is recorded and rethrown
  * by the submitting thread through {@link Barrier#throwIfFailed()} once the whole batch is complete; the
  * remaining failures are reported by the worker pool itself.
+ * <p>
+ * {@link #addPacked(String, List)} adds several groups as one task. The groups keep their own barrier
+ * permit, their own failure record and their own release of the state they acquired - packing only shares
+ * the submission and the completion of a task between them - so a packed group behaves exactly like a
+ * submitted one, and a failing group neither stops the groups packed with it nor completes their permits.
  */
 @ApiStatus.Internal
 public final class RegionTaskBatch {
@@ -42,14 +47,38 @@ public final class RegionTaskBatch {
      * @param work        the work of a single region; it must release any state it acquired even when it fails
      */
     public void add(String description, Runnable work) {
-        this.groups.add(new Group(description, work));
+        this.addPacked(description, List.of(work));
+    }
+
+    /**
+     * Adds one task that runs several groups of the same slice on one worker.
+     * <p>
+     * Every group of the task keeps its own barrier permit, so the barrier still completes only after every
+     * group of the batch finished, and the first failure still fails the batch. A failing group does not run
+     * the groups after it twice and does not stop them: the task runs the remaining groups exactly once.
+     */
+    public void addPacked(String description, List<Runnable> groupWorks) {
+        if (groupWorks.isEmpty()) {
+            throw new IllegalArgumentException("A packed task must hold at least one group");
+        }
+        this.groups.add(new Group(description, List.copyOf(groupWorks)));
     }
 
     public boolean isEmpty() {
         return this.groups.isEmpty();
     }
 
+    /** {@return the number of groups this batch waits for} */
     public int groupCount() {
+        int groups = 0;
+        for (final Group group : this.groups) {
+            groups += group.works().size();
+        }
+        return groups;
+    }
+
+    /** {@return the number of tasks this batch submits; a packed task carries several groups} */
+    public int taskCount() {
         return this.groups.size();
     }
 
@@ -71,7 +100,7 @@ public final class RegionTaskBatch {
      * batch that already holds region leases. Groups must not be added after this call.
      */
     public Barrier newBarrier() {
-        return new Barrier(this.groups.size());
+        return new Barrier(this.groupCount());
     }
 
     /**
@@ -79,8 +108,8 @@ public final class RegionTaskBatch {
      * {@link #newBarrier()} of this batch.
      */
     public void submit(RegionWorkerExecutor executor, Barrier barrier) {
-        if (barrier.groupCount() != this.groups.size()) {
-            throw new IllegalStateException("Batch barrier was created for " + barrier.groupCount() + " groups but " + this.groups.size() + " were added");
+        if (barrier.groupCount() != this.groupCount()) {
+            throw new IllegalStateException("Batch barrier was created for " + barrier.groupCount() + " groups but " + this.groupCount() + " were added");
         }
         this.submitGroups(executor, barrier);
     }
@@ -95,7 +124,7 @@ public final class RegionTaskBatch {
      */
     public void submitOpen(RegionWorkerExecutor executor, Barrier barrier) {
         for (final Group group : this.groups) {
-            barrier.registerGroup();
+            barrier.registerGroups(group.works().size());
             this.submitGroup(executor, barrier, group);
         }
     }
@@ -108,18 +137,39 @@ public final class RegionTaskBatch {
 
     private void submitGroup(RegionWorkerExecutor executor, Barrier barrier, Group group) {
         final Runnable task = () -> {
-            try {
-                group.work().run();
-            } catch (Throwable throwable) {
-                barrier.recordFailure(throwable);
-            } finally {
-                barrier.groupFinished();
+            Throwable failure = null;
+            for (final Runnable work : group.works()) {
+                try {
+                    work.run();
+                } catch (Throwable throwable) {
+                    barrier.recordFailure(throwable);
+                    if (failure == null) {
+                        failure = throwable;
+                    }
+                } finally {
+                    barrier.groupFinished();
+                }
+            }
+            if (failure != null) {
+                // The groups of this task are complete and recorded; the throwable is rethrown so the pool
+                // reports it like the failure of a single-group task, exactly as before packing existed.
+                throwUnchecked(failure);
             }
         };
         if (!trySubmit(executor, group.description(), task)) {
             barrier.recordRejected();
             task.run();
         }
+    }
+
+    private static void throwUnchecked(Throwable throwable) {
+        if (throwable instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        }
+        if (throwable instanceof Error error) {
+            throw error;
+        }
+        throw new IllegalStateException("Region worker group failed", throwable);
     }
 
     /**
@@ -137,7 +187,7 @@ public final class RegionTaskBatch {
         }
     }
 
-    private record Group(String description, Runnable work) {}
+    private record Group(String description, List<Runnable> works) {}
 
     /**
      * Completion barrier of one submitted batch.
@@ -213,6 +263,17 @@ public final class RegionTaskBatch {
          * Registers one more group against an open barrier.
          */
         void registerGroup() {
+            this.registerGroups(1);
+        }
+
+        /**
+         * Registers {@code groups} more groups against an open barrier; one packed task registers all of its
+         * groups before it is submitted, so it can never complete the barrier before its setup finished.
+         */
+        void registerGroups(int groups) {
+            if (groups <= 0) {
+                throw new IllegalArgumentException("groups must be > 0");
+            }
             synchronized (this) {
                 if (!this.open) {
                     throw new IllegalStateException("Barrier setup is already complete");
@@ -220,7 +281,7 @@ public final class RegionTaskBatch {
                 if (this.pendingGroups.get() <= 0) {
                     throw new IllegalStateException("Barrier is already complete");
                 }
-                this.pendingGroups.incrementAndGet();
+                this.pendingGroups.addAndGet(groups);
             }
         }
 

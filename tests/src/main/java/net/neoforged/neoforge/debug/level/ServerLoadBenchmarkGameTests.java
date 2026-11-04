@@ -348,7 +348,12 @@ public class ServerLoadBenchmarkGameTests {
      */
     private static final int SOAK_ZOMBIE_DEATHS = 1;
 
-    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples";
+    /**
+     * The worker dispatch columns of a window measured without an installed engine: every counter of the
+     * dispatch path is zero, so the columns keep their shape for a row without region workers.
+     */
+    private static final RegionThreadingDiagnostics.WorkerDispatchCounters NO_WORKER_DISPATCH = new RegionThreadingDiagnostics.WorkerDispatchCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
+    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
     /**
      * Columns of the random tick workload row: the profile and its load, the server tick distribution, the chunk
      * tick counters, the segments of the server-thread chunk tick slice and the block state fingerprint of the
@@ -356,9 +361,9 @@ public class ServerLoadBenchmarkGameTests {
      */
     static final String SPAWN_CSV_HEADER = "profile,workers,regionSize,chunks,spawnableChunks,msptAvg,msptP50,msptP95,msptP99,spawnChunksOnWorkers,gateRefusedSpawnChunks,unloadedNeighborhoodSpawnChunks,deferredUpdateBudgetSpawnChunks,lateSpawnChunks,unleasedSpawnChunks,truncatedSpawnChunks,skippedSpawnChunks,capRefusedSpawns,refusedSpawnAdditions,spawnedMonsters,spawnedCreatures,spawnedWaterCreatures,spawnedWaterAmbient,spawnedAmbient,spawnedAxolotls,spawnedUndergroundWaterCreatures,spawnedMisc,mobsInLevel,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples";
     static final String RANDOM_TICK_CSV_HEADER = "profile,workers,regionSize,chunks,blocks,msptAvg,msptP50,msptP95,msptP99,chunkTicksOnWorkers,fallbackChunkTicks,boundaryChunkTicks,unloadedNeighborhoodChunkTicks,truncatedChunkTicks,unleasedChunkTicks,chunkTickLightningStrikes,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples,blockStateFingerprint";
-    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache";
+    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
     static final String ENTITY_WORKER_BLOCKER_HEADER = "operation,count,firstFrame,entityTypes";
     static final String SOAK_MSPT_HEADER = "profile,zombies,measuredTicks,window,samples,msptAvg,msptP50,msptP95,msptP99";
     static final String SOAK_DRIFT_HEADER = "profile,firstHalfAvgMs,lastAvgMs,driftRatio,driftPercent,firstHalfP99Ms,lastP99Ms";
@@ -1983,7 +1988,7 @@ public class ServerLoadBenchmarkGameTests {
         final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
         System.out.println(sampler.note(profile, after) + " blockEntityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_FURNACE_HEADER " + FURNACE_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_FURNACE_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_FURNACE_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%s%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -2002,7 +2007,8 @@ public class ServerLoadBenchmarkGameTests {
                 millisPerSlice(attributionAfter.awaitNanos() - attributionBefore.awaitNanos(), slices),
                 millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
                 millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
-                slices);
+                slices,
+                workerDispatchColumns(before, after));
     }
 
     /**
@@ -2039,7 +2045,7 @@ public class ServerLoadBenchmarkGameTests {
                 + " hopperItemsConserved=" + conserved
                 + " blockEntityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_HOPPER_HEADER " + HOPPER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%b,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%b%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_HOPPER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%b,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%b,%s%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -2074,12 +2080,46 @@ public class ServerLoadBenchmarkGameTests {
                 millisPerSlice(attributionAfter.handoffNanos() - attributionBefore.handoffNanos(), slices),
                 millisPerSlice(attributionAfter.sliceNanos() - attributionBefore.sliceNanos(), slices),
                 slices,
-                admissionCache);
+                admissionCache,
+                workerDispatchColumns(before, after));
         printRegionMetrics(after);
         printHopperDiagnostics(profile, attributionAfter, after);
         helper.assertTrue(conserved,
                 "the hopper workload lost or duplicated items: start " + itemCountStart + ", dropped " + itemsDropped + ", end " + itemCountEnd);
         helper.assertTrue(delivered > 0L, "the hopper workload never moved an item");
+    }
+
+    /**
+     * {@return the worker dispatch columns of one measured window}
+     * <p>
+     * {@code tasksPerTick} is the number of tasks the worker pool accepted per measured tick - every slice,
+     * including the packed ones - and {@code regionsPerPackedTask} the number of regions a packed task held.
+     * {@code submissionNanosPerTask} is the wall time the submitting threads spent handing a task to the pool,
+     * averaged over the accepted submissions of the window, and {@code wakeUpNanosPerWakeUp} the wall time between
+     * a hand-off and the start of the task body, averaged over the hand-offs to a worker that had nothing pending
+     * - the wake-up the pool controls, not the wait behind a task the same worker is still running. {@code partialPackFallbacks} counts the packs that
+     * could not lease every region they needed and released what they took. A window without an installed engine
+     * reports zeros.
+     */
+    private static String workerDispatchColumns(Optional<RegionThreadingDiagnostics> before, Optional<RegionThreadingDiagnostics> after) {
+        final RegionThreadingDiagnostics.WorkerDispatchCounters first = before.map(RegionThreadingDiagnostics::workerDispatch).orElse(NO_WORKER_DISPATCH);
+        final RegionThreadingDiagnostics.WorkerDispatchCounters last = after.map(RegionThreadingDiagnostics::workerDispatch).orElse(NO_WORKER_DISPATCH);
+        final long submissions = last.submissions() - first.submissions();
+        final long packedTasks = last.packedTasks() - first.packedTasks();
+        final long packedRegions = last.packedRegions() - first.packedRegions();
+        final long submitNanos = last.submitNanos() - first.submitNanos();
+        final long wakeNanos = last.wakeNanos() - first.wakeNanos();
+        final long idleWakeUps = last.idleWakeUps() - first.idleWakeUps();
+        final long fallbacks = last.partialPackFallbacks() - first.partialPackFallbacks();
+        return String.format(Locale.ROOT, "%.2f,%.2f,%d,%d,%d,%.1f,%.1f,%d",
+                submissions / (double) MEASURED_TICKS,
+                packedTasks == 0L ? 0.0 : packedRegions / (double) packedTasks,
+                submissions,
+                packedTasks,
+                packedRegions,
+                submissions == 0L ? 0.0 : submitNanos / (double) submissions,
+                idleWakeUps == 0L ? 0.0 : wakeNanos / (double) idleWakeUps,
+                fallbacks);
     }
 
     /**
@@ -2608,6 +2648,9 @@ public class ServerLoadBenchmarkGameTests {
      */
     private record InstalledEngine(RegionThreadingDiagnostics flags, RegionLayout layout) {
         RegionThreadingEngine rebuild(boolean entityTickWorkers, RegionEntityStorageMode storageMode) {
+            // The light-load dispatch of the configured engine is part of what the diagnostic window measures, so
+            // the rebuilt engine keeps it instead of silently falling back to the shared executor and one task per
+            // region.
             return new RegionThreadingEngine(
                     this.flags.workerThreadCount(),
                     this.flags.workerExecutionEnabled(),
@@ -2616,6 +2659,9 @@ public class ServerLoadBenchmarkGameTests {
                     this.flags.blockEntityTickWorkerExecutionEnabled(),
                     this.flags.scheduledTickWorkerExecutionEnabled(),
                     this.flags.chunkTickWorkerExecutionEnabled(),
+                    this.flags.spawnWorkerExecutionEnabled(),
+                    this.flags.workerDispatch().persistentWorkers(),
+                    this.flags.workerDispatch().packedRegionLeases(),
                     this.layout,
                     storageMode);
         }
@@ -2682,7 +2728,7 @@ public class ServerLoadBenchmarkGameTests {
                 + " poiVillageDistanceQueries=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::villageDistanceQueries)
                 + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
-        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s%n",
                 profile,
                 after.map(RegionThreadingDiagnostics::workerThreadCount).orElse(0),
                 after.map(RegionThreadingDiagnostics::regionChunkSize).orElse(0),
@@ -2736,7 +2782,8 @@ public class ServerLoadBenchmarkGameTests {
                 delta(before, after, RegionThreadingDiagnostics::droppedDeferredEntityAdditions),
                 delta(before, after, RegionThreadingDiagnostics::entityAddRejectedOnWorker),
                 deathDriver.deathsInWindow(),
-                deathDriver.replacementsInWindow());
+                deathDriver.replacementsInWindow(),
+                workerDispatchColumns(before, after));
         System.out.println("SERVER_BENCH_ENTITY_WORKER_BLOCKER_HEADER " + ENTITY_WORKER_BLOCKER_HEADER);
         blockers.printBlockers();
     }

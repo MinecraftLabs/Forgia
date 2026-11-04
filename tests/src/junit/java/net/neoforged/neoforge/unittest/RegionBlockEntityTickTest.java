@@ -49,6 +49,9 @@ import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
+import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
+import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
 import net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException;
@@ -210,6 +213,36 @@ class RegionBlockEntityTickTest {
         verify(first, times(1)).tick();
         verify(second, times(1)).tick();
         assertEquals(2L, this.engine.diagnostics().blockEntityTicksOnWorkers());
+    }
+
+    @Test
+    void packedRegionLeasesTickEveryRegionOfAPackExactlyOnce() {
+        // Sixteen regions on four workers: every packed task holds two regions, and every region is leased once,
+        // ticked once and released again. The counters prove the packing happened and the tickers prove that no
+        // region of a pack was skipped, repeated or ticked while another task held it.
+        this.installEngine(true, 4, true, true);
+        final ServerLevel level = mockLevel();
+        final List<TickingBlockEntity> tickers = new ArrayList<>();
+        for (int index = 0; index < 16; ++index) {
+            tickers.add(mockTicker(new BlockPos(17 + index * 48, 64, 17)));
+        }
+
+        final RegionBlockEntityTickPlan plan = plan(level);
+        tickers.forEach(plan::accept);
+        plan.executeAndAwait();
+
+        for (final TickingBlockEntity ticker : tickers) {
+            verify(ticker, times(1)).tick();
+        }
+        final RegionThreadingDiagnostics.WorkerDispatchCounters dispatch = this.engine.diagnostics().workerDispatch();
+        assertEquals(16L, this.engine.diagnostics().blockEntityTicksOnWorkers());
+        assertEquals(8L, dispatch.packedTasks(), "sixteen regions on four workers must pack into eight tasks");
+        assertEquals(16L, dispatch.packedRegions(), "every region of the batch must be held by a packed task");
+        assertEquals(0L, dispatch.partialPackFallbacks());
+        assertTrue(dispatch.persistentWorkers());
+        assertTrue(dispatch.packedRegionLeases());
+        assertEquals(0L, dispatch.submissions() - dispatch.packedTasks());
+        assertEquals(0, this.engine.diagnostics().runningRegionCount(), "a packed task must release every lease it held");
     }
 
     @Test
@@ -918,6 +951,12 @@ class RegionBlockEntityTickTest {
 
     private void installEngine(boolean blockEntityTickWorkers) {
         final RegionThreadingEngine created = new RegionThreadingEngine(2, false, false, false, blockEntityTickWorkers);
+        RegionThreadingManager.install(created);
+        this.engine = created;
+    }
+
+    private void installEngine(boolean blockEntityTickWorkers, int workerThreads, boolean persistentWorkers, boolean packedRegionLeases) {
+        final RegionThreadingEngine created = new RegionThreadingEngine(workerThreads, false, false, false, blockEntityTickWorkers, false, false, false, persistentWorkers, packedRegionLeases, RegionLayout.FIXED_3X3, RegionEntityStorageMode.MAIN_THREAD_ONLY);
         RegionThreadingManager.install(created);
         this.engine = created;
     }

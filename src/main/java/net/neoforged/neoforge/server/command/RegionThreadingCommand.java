@@ -7,6 +7,7 @@ package net.neoforged.neoforge.server.command;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.builder.ArgumentBuilder;
+import java.util.Locale;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
@@ -180,6 +181,28 @@ final class RegionThreadingCommand {
                 + ", loadedColumns=" + poi.loadedColumns()
                 + ", savedColumns=" + poi.savedColumns()
                 + ", villageDistanceQueries=" + poi.villageDistanceQueries()), false);
+        // A fourth independent line for the worker dispatch path and the packed region leases, so the stable
+        // diagnostics line and the two lines above keep their shape for scripts that match them.
+        final RegionThreadingDiagnostics.WorkerDispatchCounters dispatch = diagnostics.workerDispatch();
+        source.sendSuccess(() -> Component.literal("Region worker dispatch: persistentWorkers=" + dispatch.persistentWorkers()
+                + ", packedRegionLeases=" + dispatch.packedRegionLeases()
+                + ", taskSubmissions=" + dispatch.submissions()
+                + ", submissionNanos=" + dispatch.submitNanos()
+                + ", wakeUpNanos=" + dispatch.wakeNanos()
+                + ", spinWakeUps=" + dispatch.spinWakeUps()
+                + ", parkWakeUps=" + dispatch.parkWakeUps()
+                + ", packedTasks=" + dispatch.packedTasks()
+                + ", packedRegions=" + dispatch.packedRegions()
+                + ", regionsPerPackedTask=" + regionsPerPackedTask(dispatch)
+                + ", partialPackFallbacks=" + dispatch.partialPackFallbacks()), false);
+    }
+
+    /** {@return the average number of regions a packed task held, formatted for the diagnostics line} */
+    private static String regionsPerPackedTask(RegionThreadingDiagnostics.WorkerDispatchCounters dispatch) {
+        if (dispatch.packedTasks() == 0L) {
+            return "0.00";
+        }
+        return String.format(Locale.ROOT, "%.2f", dispatch.packedRegions() / (double) dispatch.packedTasks());
     }
 
     private static void sendNotInstalled(CommandSourceStack source) {

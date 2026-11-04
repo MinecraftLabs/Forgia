@@ -189,6 +189,22 @@ abstract class RegionTickBatch {
     }
 
     /**
+     * Adds one worker task that runs several region groups of this slice.
+     * <p>
+     * Packing only shares the submission and the completion of a task between the groups: each group keeps its
+     * own region lease, its own ownership lease, its own group random and its own barrier permit, so a region is
+     * still held by exactly one worker, and the barrier still completes only after every group finished. A
+     * failing group stops its own body exactly like an unpacked one and does not run or complete the groups
+     * packed with it a second time.
+     *
+     * @param description human readable description used by worker diagnostics
+     * @param works       the wrapped work of the groups, each one a group body of this batch
+     */
+    final void addPackedTask(String description, List<Runnable> works) {
+        this.tasks.addPacked(description, works);
+    }
+
+    /**
      * Wraps group work so it marks the executing thread as the owner of this batch and installs the deferred
      * block-write queue of the batch, which every slice defers into.
      */

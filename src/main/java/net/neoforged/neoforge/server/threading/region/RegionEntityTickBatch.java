@@ -178,6 +178,19 @@ final class RegionEntityTickBatch extends RegionTickBatch {
      *                    membership in the execution context
      */
     Group addGroup(RegionState region, List<Entity> entities, Function<Group, Runnable> workFactory) {
+        final Group group = this.registerGroup(region, entities);
+        this.addTask("entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
+        return group;
+    }
+
+    /**
+     * Registers one region group of this batch without submitting it.
+     * <p>
+     * The caller leases the region, registers every group of the pack and then submits them together through
+     * {@link RegionTickBatch#addPackedTask(String, List)}. The group holds the region from the lease to the end
+     * of its own body exactly like an unpacked group; only the submission is shared.
+     */
+    Group registerGroup(RegionState region, List<Entity> entities) {
         this.leasedRegions.add(region);
         final Set<Entity> members = Collections.newSetFromMap(new IdentityHashMap<>());
         for (final Entity entity : entities) {
@@ -187,8 +200,12 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         // while building it cannot leave the region TICKING without a worker that releases it.
         final Group group = new Group(this, region, entities, members, this.groupRandomSeed(region.coordinate()));
         this.groups.add(group);
-        this.addTask("entity tick " + region.coordinate(), this.groupWork(workFactory.apply(group)));
         return group;
+    }
+
+    /** {@return the wrapped worker work of one registered group} */
+    Runnable packedWork(Group group, Function<Group, Runnable> workFactory) {
+        return this.groupWork(workFactory.apply(group));
     }
 
     /**
