@@ -610,6 +610,24 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
         return REJECTED_QUERY_COUNT.get();
     }
 
+    /**
+     * {@return the region the current thread leases in {@code level}, or {@code null} when the current thread
+     * is not a native worker or holds no active lease of that level}
+     * <p>
+     * The regionized POI storage reads it to decide which region's sections the current thread may read live
+     * and which it has to read from the published snapshots. The server thread and every ordinary thread
+     * answer {@code null} and read every region live; a worker answers the region it ticks, so a query of a
+     * worker is answered from that region's live sections plus the published snapshots of the others.
+     */
+    @Nullable
+    static RegionCoordinate currentLeaseCoordinate(ServerLevel level) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        if (scope == null || !scope.isActive() || !RegionWorkerScope.isNativeWorkerThread()) {
+            return null;
+        }
+        return scope.coordinate.level() == level ? scope.coordinate : null;
+    }
+
     static void resetCounters() {
         ALLOWED_MUTATION_COUNT.set(0L);
         REJECTED_MUTATION_COUNT.set(0L);

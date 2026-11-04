@@ -165,6 +165,18 @@ final class RegionThreadingCommand {
         // Added, never merged into the line above: the region metrics are a second, independent line so the
         // existing diagnostics line stays stable for scripts that match it.
         source.sendSuccess(() -> Component.literal(RegionMetricsReport.summaryLine(diagnostics.regionMetrics())), false);
+        // A third independent line for the regionized POI storage, so the stable diagnostics line and the
+        // region metrics line keep their shape for scripts that match them.
+        final RegionThreadingDiagnostics.PoiCounters poi = diagnostics.poiCounters();
+        source.sendSuccess(() -> Component.literal("Region POI: localQueries=" + poi.localQueries()
+                + ", publishedQueries=" + poi.publishedQueries()
+                + ", fallbackQueries=" + poi.fallbackQueries()
+                + ", staleTakes=" + poi.staleTakes()
+                + ", deferredWrites=" + poi.deferredWrites()
+                + ", publishes=" + poi.publishes()
+                + ", loadedColumns=" + poi.loadedColumns()
+                + ", savedColumns=" + poi.savedColumns()
+                + ", villageDistanceQueries=" + poi.villageDistanceQueries()), false);
     }
 
     private static void sendNotInstalled(CommandSourceStack source) {

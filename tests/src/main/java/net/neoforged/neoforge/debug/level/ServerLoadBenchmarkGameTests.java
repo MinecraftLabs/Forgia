@@ -2577,9 +2577,8 @@ public class ServerLoadBenchmarkGameTests {
         final InstalledEngine replaced = new InstalledEngine(configured.diagnostics(), configured.regionLayout());
         RegionThreadingManager.clear();
         final RegionThreadingEngine diagnostic = replaced.rebuild(entityTickWorkers, RegionEntityStorageMode.REGION_OWNED);
-        // The measured engine carries the same per-type entity policy as the production install, so a pinned
-        // type is measured on the server-thread path it is pinned to.
-        diagnostic.installVanillaEntityPolicy();
+        // The production install declares no per-type entity policy: the POI storage is partitioned per
+        // region, so every measured type runs on its region worker.
         diagnostic.setEntityTickFailureObserverForTesting(blockers::record);
         RegionThreadingManager.install(diagnostic);
         return Optional.of(replaced);
@@ -2600,7 +2599,6 @@ public class ServerLoadBenchmarkGameTests {
         RegionThreadingManager.clear();
         final RegionThreadingDiagnostics flags = replaced.flags();
         final RegionThreadingEngine restored = replaced.rebuild(flags.entityTickWorkerExecutionEnabled(), flags.entityStorageMode());
-        restored.installVanillaEntityPolicy();
         RegionThreadingManager.install(restored);
     }
 
@@ -2646,9 +2644,9 @@ public class ServerLoadBenchmarkGameTests {
         }
         final int villagersWithPoi = villagersWithBedAndWorkstation(mobs);
         if (villagerWorkload()) {
-            // The villager workload exists to show that the POI path the per-type policy pins keeps working
-            // while its ticks run on the server thread, so a window without a single claimed POI pair proves
-            // nothing and fails instead of reporting an idle population.
+            // The villager workload exists to show that the POI path works while the villager ticks on its
+            // region worker, so a window without a single claimed POI pair proves nothing and fails instead of
+            // reporting an idle population.
             helper.assertTrue(villagersWithPoi > 0, "no villager of the workload claimed its bed and workstation");
         }
         System.out.println(sampler.note(profile, after)
@@ -2676,6 +2674,12 @@ public class ServerLoadBenchmarkGameTests {
                 + " regionMismatches=" + mismatches
                 + " entityTickFailures=" + blockers.failureCount()
                 + " distinctBlockers=" + blockers.blockerCount()
+                + " poiLocalQueries=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::localQueries)
+                + " poiPublishedQueries=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::publishedQueries)
+                + " poiFallbackQueries=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::fallbackQueries)
+                + " poiStaleTakes=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::staleTakes)
+                + " poiPublishes=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::publishes)
+                + " poiVillageDistanceQueries=" + poiDelta(before, after, RegionThreadingDiagnostics.PoiCounters::villageDistanceQueries)
                 + " entityAttributionSlices=" + slices);
         System.out.println("SERVER_BENCH_ENTITY_WORKER_HEADER " + ENTITY_WORKER_CSV_HEADER);
         System.out.printf(Locale.ROOT, "SERVER_BENCH_ENTITY_WORKER_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
@@ -3337,6 +3341,19 @@ public class ServerLoadBenchmarkGameTests {
             total += sample;
         }
         return total / (double) sorted.length / 1_000_000.0;
+    }
+
+    /**
+     * {@return the growth of one regionized POI counter over the measured window}
+     */
+    private static long poiDelta(Optional<RegionThreadingDiagnostics> before, Optional<RegionThreadingDiagnostics> after,
+            ToLongFunction<RegionThreadingDiagnostics.PoiCounters> counter) {
+        if (after.isEmpty()) {
+            return 0L;
+        }
+        final long afterValue = counter.applyAsLong(after.get().poiCounters());
+        final long beforeValue = before.map(diagnostics -> counter.applyAsLong(diagnostics.poiCounters())).orElse(0L);
+        return afterValue - beforeValue;
     }
 
     private static long delta(Optional<RegionThreadingDiagnostics> before, Optional<RegionThreadingDiagnostics> after, ToLongFunction<RegionThreadingDiagnostics> counter) {

@@ -6,19 +6,12 @@
 package net.neoforged.neoforge.server.threading.region;
 
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.animal.Bee;
-import net.minecraft.world.entity.animal.Fox;
-import net.minecraft.world.entity.animal.IronGolem;
-import net.minecraft.world.entity.monster.Zombie;
-import net.minecraft.world.entity.npc.Villager;
-import net.minecraft.world.entity.raid.Raider;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -38,50 +31,14 @@ import org.jetbrains.annotations.Nullable;
  * {@link RegionThreadingEngine#serverThreadOnlyEntity(Class, String)} instead of being refused a worker
  * wholesale.
  * <p>
- * The vanilla declarations are the audit of the level's {@code PoiManager}. It is one storage per level, it
- * is partitioned per region only in a later milestone, and nothing in this engine guards it: deliberately
- * reading and writing it from a worker races the server thread and the other workers of the level, and even
- * a read mutates it ({@code SectionStorage#getOrLoad} inserts the loaded column into the section map and may
- * join a column read, and {@code PoiManager#sectionsToVillage} drains a level-wide distance tracker). The
- * audit found the goal and brain paths below plus the portal search; the portal search is not a type
- * property (every entity can enter a portal) and is deferred to the batch barrier by the engine instead of
- * being pinned here. A later milestone that shards the POI storage per region is expected to remove these
- * declarations again; until then they are the difference between a declarative refusal and a data race.
+ * The registry is empty by default and the vanilla declarations are gone: the level's {@code PoiManager} is
+ * partitioned per region ({@code enableRegionThreadingPoi}), so a villager, iron golem, raider, bee, zombie or
+ * fox tick reads region-owned sections and no longer needs to be handed back to the server thread. The portal
+ * search is not a type property (every entity can enter a portal) and is deferred to the batch barrier by the
+ * engine instead of being declared here.
  */
 @ApiStatus.Internal
 final class RegionEntityTickPolicy {
-    /** Reason prefix of the vanilla declarations: the tick of the type reaches the level's {@code PoiManager}. */
-    private static final String POI = "poi: ";
-
-    /**
-     * One vanilla declaration: the type whose tick reaches the POI storage and the path it reaches it with.
-     */
-    private record Declaration(Class<? extends Entity> type, String reason) {}
-
-    /**
-     * The POI declarations of the audit, keyed one per audited tick path.
-     * <p>
-     * {@code Villager}: the brain behaviors of {@code VillagerGoalPackages} ({@code AcquirePoi},
-     * {@code ValidateNearbyPoi}, {@code PoiCompetitorScan}, {@code YieldJobSite}, {@code GoToPotentialJobSite},
-     * {@code AssignProfessionFromJobSite}, {@code SetClosestHomeAsWalkTarget}, {@code GoToClosestVillage},
-     * {@code VillageBoundRandomStroll}, {@code PlayTagWithOtherKids}, {@code LocateHidingPlace},
-     * {@code VillagerMakeLove}) and {@code NearestBedSensor} read and write it every tick, and
-     * {@code Villager#releaseAllPois} does on death. {@code IronGolem}: {@code MoveBackToVillageGoal} and
-     * {@code GolemRandomStrollInVillageGoal}. {@code Raider} (and with it the pillager, vindicator, evoker,
-     * illusioner, witch and ravager): {@code PathfindToRaidGoal} and
-     * {@code Raider.RaiderMoveThroughVillageGoal}. {@code Bee}: {@code Bee.BeeLocateHiveGoal}. {@code Zombie}
-     * (and with it the husk, drowned, zombie villager and zombified piglin): {@code MoveThroughVillageGoal},
-     * which checks the village distance of the level at night. {@code Fox}: {@code Fox.SeekShelterGoal} and
-     * {@code Fox.FoxStrollThroughVillageGoal}.
-     */
-    private static final List<Declaration> VANILLA_POI_DECLARATIONS = List.of(
-            new Declaration(Villager.class, POI + "villager brain and releasePoi on death"),
-            new Declaration(IronGolem.class, POI + "IronGolem village goals"),
-            new Declaration(Raider.class, POI + "raider village goals"),
-            new Declaration(Bee.class, POI + "bee hive search"),
-            new Declaration(Zombie.class, POI + "MoveThroughVillageGoal village check"),
-            new Declaration(Fox.class, POI + "Fox village goals"));
-
     private final Map<Class<? extends Entity>, String> declarations = new ConcurrentHashMap<>();
     /**
      * Resolved answers per runtime class, tagged with the declaration version they were computed at.
@@ -168,15 +125,6 @@ final class RegionEntityTickPolicy {
         final TreeMap<String, Long> ordered = new TreeMap<>();
         this.serverThreadOnlyTicks.forEach((reason, count) -> ordered.put(reason, count.get()));
         return new LinkedHashMap<>(ordered);
-    }
-
-    /**
-     * Installs the vanilla POI declarations of the audit into {@code policy}.
-     */
-    static void installVanillaPoiDeclarations(RegionEntityTickPolicy policy) {
-        for (final Declaration declaration : VANILLA_POI_DECLARATIONS) {
-            policy.serverThreadOnly(declaration.type(), declaration.reason());
-        }
     }
 
     @Nullable

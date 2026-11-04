@@ -31,6 +31,22 @@ final class RegionThreadingConfig {
                 : NeoForgeConfig.SERVER.regionThreadingLongTickWarningNanos.getDefault();
     }
 
+    /**
+     * {@return true when a level created now partitions its POI storage per region}
+     * <p>
+     * The dedicated switch is off by default, and enabling the entity worker slice implies the storage: a
+     * worker tick of a villager, iron golem, raider, bee, zombie or fox reaches the level's POI manager, and
+     * the regionized storage is what makes that tick safe next to the server thread. A configuration that
+     * enables entity worker ticks therefore gets the storage even with the dedicated switch off, instead of
+     * silently running those ticks against the one shared vanilla manager.
+     */
+    static boolean poiStorageEnabled() {
+        if (!NeoForgeConfig.isServerConfigLoaded()) {
+            return false;
+        }
+        return NeoForgeConfig.SERVER.enableRegionThreadingPoi.get() || NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get();
+    }
+
     static NeoForgeConfig.RegionThreadingOwnershipViolationMode ownershipViolationMode() {
         return NeoForgeConfig.isServerConfigLoaded()
                 ? NeoForgeConfig.SERVER.regionThreadingOwnershipViolationMode.get()

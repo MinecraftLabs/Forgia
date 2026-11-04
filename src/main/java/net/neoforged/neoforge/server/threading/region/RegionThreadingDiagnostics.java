@@ -291,8 +291,34 @@ public record RegionThreadingDiagnostics(
         long mailboxDroppedRetiredMessages,
         long mailboxDroppedOnCloseMessages,
         long mailboxDeliveryFailures,
+        PoiCounters poiCounters,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
+    /**
+     * The counters of the region-partitioned POI storage.
+     * <p>
+     * {@code localQueries} counts the chunk reads a worker answered from the live sections of its own region,
+     * {@code publishedQueries} the chunk and position reads it answered from another region's published
+     * snapshot - those are the answers that can be one publish old - and {@code fallbackQueries} the reads it
+     * could not answer at all because the column was not loaded, which ran on the server thread instead.
+     * {@code staleTakes} counts a take whose candidate the owning region no longer holds, refused instead of
+     * booking a ticket on a removed POI; {@code deferredWrites} counts a worker write of a foreign region that
+     * the server thread applied instead. {@code publishes} counts the published snapshots, {@code loadedColumns}
+     * and {@code savedColumns} the columns the regionized storage read from and wrote to disk, and
+     * {@code villageDistanceQueries} the village distance answers that were not served from the per-section
+     * memo. The counters are process-wide, so a server with several regionized levels reports their sum.
+     */
+    public record PoiCounters(
+            long localQueries,
+            long publishedQueries,
+            long fallbackQueries,
+            long staleTakes,
+            long deferredWrites,
+            long publishes,
+            long loadedColumns,
+            long savedColumns,
+            long villageDistanceQueries) {}
+
     /**
      * The light rechecks and block update publications the batches of the level deferred, counted per slice.
      * <p>

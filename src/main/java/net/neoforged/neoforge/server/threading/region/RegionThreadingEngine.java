@@ -330,8 +330,8 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * The per-type declarations of the entity tick, consulted before an entity body starts.
      * <p>
-     * The registry starts empty, so every type keeps the worker this engine admitted before the policy
-     * existed; {@link #installVanillaEntityPolicy()} adds the vanilla declarations of the POI audit and
+     * The registry starts empty, so every type keeps the worker: the vanilla POI declarations are gone
+     * because the level's POI storage is partitioned per region, and
      * {@link #serverThreadOnlyEntity(Class, String)} is the hook of the mod compatibility layer.
      */
     private final RegionEntityTickPolicy entityTickPolicy = new RegionEntityTickPolicy();
@@ -710,17 +710,6 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Installs the vanilla declarations of the POI audit into this engine's entity tick policy.
-     * <p>
-     * The engine starts with an empty registry, so a caller that wants the vanilla policy has to install it:
-     * the production install path does, and a level whose engine does not install it keeps every entity tick
-     * on the worker. See {@link RegionEntityTickPolicy} for the audit behind the declarations.
-     */
-    public void installVanillaEntityPolicy() {
-        RegionEntityTickPolicy.installVanillaPoiDeclarations(this.entityTickPolicy);
-    }
-
-    /**
      * {@return the per-type entity tick policy of this engine}
      */
     RegionEntityTickPolicy entityTickPolicy() {
@@ -1025,6 +1014,9 @@ public final class RegionThreadingEngine implements RegionThreading {
         state.endRegionPhase();
         if (!state.isRegionPhase()) {
             this.drainGlobalMessages(level);
+            // The outermost region phase of the level is over and no worker is running, so the POI storage can
+            // publish what its regions wrote during the phase without racing a reader of the live sections.
+            RegionPoiStorages.publishLevel(level);
         }
     }
 
@@ -6126,6 +6118,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.mailboxDroppedRetiredMessages.get(),
                 this.mailboxDroppedOnCloseMessages.get(),
                 this.mailboxDeliveryFailures.get(),
+                RegionPoiCounters.snapshot(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
     }

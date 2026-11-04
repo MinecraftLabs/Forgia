@@ -1,0 +1,11 @@
+--- a/net/minecraft/world/entity/ai/village/poi/PoiRecord.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiRecord.java
+@@ -45,6 +_,8 @@
+         return this.freeTickets;
+     }
+ 
++    // Neo: the regionized POI storage acquires a ticket from outside the package, under the lock of the region
++    // that owns the record; the access transformer widens this method, not a patch.
+     public boolean acquireTicket() {
+         if (this.freeTickets <= 0) {
+             return false;

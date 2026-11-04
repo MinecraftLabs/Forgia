@@ -247,62 +247,61 @@ class RegionEntityTickPolicyTest {
         // slices plan nothing at all, so no declaration can move a tick anywhere.
         RegionThreadingManager.clear();
         this.installEngine(false);
-        this.engine.installVanillaEntityPolicy();
         assertNull(this.engine.beginEntityTickPlan(level, entity -> true, PARKING_BARRIER),
                 "a switched-off entity slice plans nothing, with or without a policy");
         assertFalse(this.engine.isEntityTickWorkerExecutionEnabled());
     }
 
+    /**
+     * The former POI pins are gone: the types the POI audit used to hand back to the server thread keep their
+     * region worker, because the level's POI storage is partitioned per region now. The registry stays for the
+     * mod compatibility layer, and a type that is not declared never appears in the per-reason counters.
+     */
     @Test
-    void vanillaPolicyDeclaresTheAuditedPoiTypesAndNothingElse() {
+    void formerPoiTypesKeepTheWorkerBecauseThePoiStorageIsRegionized() {
         this.installEngine();
-        this.engine.installVanillaEntityPolicy();
         final ServerLevel level = this.mockLevel();
         this.engine.addRegionSection(level, 0, 0);
-        final List<Entity> declared = List.of(
+        final List<Entity> formerPins = List.of(
                 this.entity(Villager.class, level, new BlockPos(1, 64, 1)),
                 this.entity(IronGolem.class, level, new BlockPos(2, 64, 1)),
                 this.entity(Raider.class, level, new BlockPos(3, 64, 1)),
                 this.entity(Bee.class, level, new BlockPos(4, 64, 1)),
                 this.entity(Zombie.class, level, new BlockPos(5, 64, 1)),
                 this.entity(Fox.class, level, new BlockPos(6, 64, 1)));
-        this.tickList.addAll(declared);
+        this.tickList.addAll(formerPins);
         final Cow cow = this.entity(Cow.class, level, new BlockPos(7, 64, 1));
         this.tickList.add(cow);
-        final List<String> declaredTickThreads = new CopyOnWriteArrayList<>();
-        for (final Entity entity : declared) {
+        final List<String> tickThreads = new CopyOnWriteArrayList<>();
+        for (final Entity entity : formerPins) {
             doAnswer(invocation -> {
-                declaredTickThreads.add(Thread.currentThread().getName());
+                tickThreads.add(Thread.currentThread().getName());
                 return null;
             }).when(entity).tick();
         }
-        final List<String> controlTickThreads = new CopyOnWriteArrayList<>();
+        final List<String> cowThreads = new CopyOnWriteArrayList<>();
         doAnswer(invocation -> {
-            controlTickThreads.add(Thread.currentThread().getName());
+            cowThreads.add(Thread.currentThread().getName());
             return null;
         }).when(cow).tick();
 
         this.plan(level).executeAndAwait();
 
-        for (final Entity entity : declared) {
+        for (final Entity entity : formerPins) {
             verify(entity, times(1)).tick();
         }
-        final RegionThreadingDiagnostics diagnostics = this.engine.diagnostics();
-        assertEquals(6, diagnostics.serverThreadOnlyEntityTicksByReason().size(),
-                "one counter per audited tick path: " + diagnostics.serverThreadOnlyEntityTicksByReason());
-        for (final Map.Entry<String, Long> entry : diagnostics.serverThreadOnlyEntityTicksByReason().entrySet()) {
-            assertTrue(entry.getKey().startsWith("poi: "), "every vanilla reason names the POI path: " + entry.getKey());
-            assertEquals(1L, entry.getValue(), "each audited type was handed back once: " + entry.getKey());
-        }
-        assertEquals(6, declaredTickThreads.size(), "every audited type ticked once");
-        for (final String thread : declaredTickThreads) {
-            assertFalse(thread.startsWith("NeoForge Region Worker"), "an audited POI type ticked on a worker: " + thread);
-        }
-        // The unpinned control entity is the only one left on the worker.
         verify(cow, times(1)).tick();
-        assertEquals(1, diagnostics.entityTicksOnWorkers(), "the undeclared control type keeps the worker");
-        assertEquals(1, controlTickThreads.size());
-        assertTrue(controlTickThreads.get(0).startsWith("NeoForge Region Worker"));
+        final RegionThreadingDiagnostics diagnostics = this.engine.diagnostics();
+        assertTrue(diagnostics.serverThreadOnlyEntityTicksByReason().isEmpty(),
+                "no vanilla declaration is installed any more: " + diagnostics.serverThreadOnlyEntityTicksByReason());
+        assertEquals(0L, diagnostics.serverThreadOnlyEntityTicks());
+        assertEquals(formerPins.size() + 1, diagnostics.entityTicksOnWorkers(), "every type keeps the worker");
+        assertEquals(formerPins.size(), tickThreads.size(), "every former pin ticked once");
+        for (final String thread : tickThreads) {
+            assertTrue(thread.startsWith("NeoForge Region Worker"), "a former POI pin stayed on the server thread: " + thread);
+        }
+        assertEquals(1, cowThreads.size());
+        assertTrue(cowThreads.get(0).startsWith("NeoForge Region Worker"));
     }
 
     private RegionEntityTickPlan plan(ServerLevel level) {

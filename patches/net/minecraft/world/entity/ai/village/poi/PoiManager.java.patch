@@ -1,0 +1,210 @@
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -43,6 +_,11 @@
+     public static final int VILLAGE_SECTION_SIZE = 1;
+     private final PoiManager.DistanceTracker distanceTracker;
+     private final LongSet loadedChunks = new LongOpenHashSet();
++    // Neo: the region-partitioned storage of this level, or null while the POI switch is off. It is created
++    // when the owning ChunkMap attaches the level, which is before any chunk or POI data is loaded.
++    private final SimpleRegionStorage poiStorage;
++    private final RegistryAccess registryAccess;
++    private net.neoforged.neoforge.server.threading.region.RegionPoiStorage regionPoiStorage;
+ 
+     public PoiManager(
+         RegionStorageInfo p_325948_,
+@@ -53,8 +_,14 @@
+         ChunkIOErrorReporter p_352327_,
+         LevelHeightAccessor p_217873_
+     ) {
++        this(new SimpleRegionStorage(p_325948_, p_217869_, p_217870_, p_217871_, DataFixTypes.POI_CHUNK), p_217872_, p_352327_, p_217873_);
++    }
++
++    // Neo: the storage instance is kept so the regionized storage can read and write the same POI region files
++    // the vanilla section storage would have used.
++    private PoiManager(SimpleRegionStorage p_poiStorage, RegistryAccess p_217872_, ChunkIOErrorReporter p_352327_, LevelHeightAccessor p_217873_) {
+         super(
+-            new SimpleRegionStorage(p_325948_, p_217869_, p_217870_, p_217871_, DataFixTypes.POI_CHUNK),
++            p_poiStorage,
+             PoiSection::codec,
+             PoiSection::new,
+             p_217872_,
+@@ -62,13 +_,48 @@
+             p_217873_
+         );
+         this.distanceTracker = new PoiManager.DistanceTracker();
++        this.poiStorage = p_poiStorage;
++        this.registryAccess = p_217872_;
++    }
++
++    /**
++     * Neo: attaches the region-partitioned POI storage of this level.
++     * <p>
++     * The owning {@code ChunkMap} calls this once, right after construction, so a level created after the
++     * region threading engine was installed and with the POI switch on answers every query from the storage
++     * that partitions the POI sections per region. A level created without the switch, or with a dynamic
++     * region layout, keeps this manager's vanilla section storage untouched.
++     */
++    public void attachRegionPoiStorage(net.minecraft.server.level.ServerLevel p_level) {
++        this.attachRegionPoiStorage(net.neoforged.neoforge.server.threading.region.RegionPoiStorages.attach(p_level, this.poiStorage, this.registryAccess, this.levelHeightAccessor));
++    }
++
++    /**
++     * Neo: attaches an already created region-partitioned storage.
++     * <p>
++     * The equivalence test drives this manager against a storage it created itself, so the regionized query
++     * path is the production one while the reference manager next to it stays a plain single-threaded
++     * manager. A {@code null} storage keeps the vanilla path.
++     */
++    public void attachRegionPoiStorage(net.neoforged.neoforge.server.threading.region.RegionPoiStorage p_storage) {
++        this.regionPoiStorage = p_storage;
+     }
+ 
+     public void add(BlockPos p_217920_, Holder<PoiType> p_217921_) {
++        // Neo: the regionized storage owns the section of the position and applies the write under the lock of
++        // the region that owns it.
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.add(p_217920_, p_217921_);
++            return;
++        }
+         this.getOrCreate(SectionPos.asLong(p_217920_)).add(p_217920_, p_217921_);
+     }
+ 
+     public void remove(BlockPos p_27080_) {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.remove(p_27080_);
++            return;
++        }
+         this.getOrLoad(SectionPos.asLong(p_27080_)).ifPresent(p_148657_ -> p_148657_.remove(p_27080_));
+     }
+ 
+@@ -95,6 +_,12 @@
+ 
+     @VisibleForDebug
+     public Stream<PoiRecord> getInChunk(Predicate<Holder<PoiType>> p_27118_, ChunkPos p_27119_, PoiManager.Occupancy p_27120_) {
++        // Neo: the regionized storage answers one chunk from the querying region's live sections and the
++        // published snapshots of the other regions, in this method's exact section order. getInSquare and
++        // getInRange are built on it and keep their vanilla filters and their vanilla chunk order.
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.getInChunk(p_27118_, p_27119_, p_27120_);
++        }
+         return IntStream.range(this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection())
+             .boxed()
+             .map(p_217886_ -> this.getOrLoad(SectionPos.of(p_27119_, p_217886_).asLong()))
+@@ -153,6 +_,12 @@
+     }
+ 
+     public Optional<BlockPos> take(Predicate<Holder<PoiType>> p_217947_, BiPredicate<Holder<PoiType>, BlockPos> p_217948_, BlockPos p_217949_, int p_217950_) {
++        // Neo: the ticket is acquired on the live record of the region that owns the POI, under that region's
++        // lock, so a take from another region books the ticket immediately and two regions never take the same
++        // last ticket. A candidate whose live record is gone is skipped as stale.
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.take(p_217947_, p_217948_, p_217949_, p_217950_);
++        }
+         return this.getInRange(p_217947_, p_217949_, p_217950_, PoiManager.Occupancy.HAS_SPACE)
+             .filter(p_217934_ -> p_217948_.test(p_217934_.getPoiType(), p_217934_.getPos()))
+             .findFirst()
+@@ -175,26 +_,43 @@
+     }
+ 
+     public boolean release(BlockPos p_27155_) {
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.release(p_27155_);
++        }
+         return this.getOrLoad(SectionPos.asLong(p_27155_))
+             .map(p_217993_ -> p_217993_.release(p_27155_))
+             .orElseThrow(() -> Util.pauseInIde(new IllegalStateException("POI never registered at " + p_27155_)));
+     }
+ 
+     public boolean exists(BlockPos p_27092_, Predicate<Holder<PoiType>> p_27093_) {
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.exists(p_27092_, p_27093_);
++        }
+         return this.getOrLoad(SectionPos.asLong(p_27092_)).map(p_217925_ -> p_217925_.exists(p_27092_, p_27093_)).orElse(false);
+     }
+ 
+     public Optional<Holder<PoiType>> getType(BlockPos p_27178_) {
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.getType(p_27178_);
++        }
+         return this.getOrLoad(SectionPos.asLong(p_27178_)).flatMap(p_217974_ -> p_217974_.getType(p_27178_));
+     }
+ 
+     @Deprecated
+     @VisibleForDebug
+     public int getFreeTickets(BlockPos p_148654_) {
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.getFreeTickets(p_148654_);
++        }
+         return this.getOrLoad(SectionPos.asLong(p_148654_)).map(p_217912_ -> p_217912_.getFreeTickets(p_148654_)).orElse(0);
+     }
+ 
+     public int sectionsToVillage(SectionPos p_27099_) {
++        // Neo: the regionized storage answers the village distance from its published village-center index
++        // instead of draining this level-wide tracker from the calling thread.
++        if (this.regionPoiStorage != null) {
++            return this.regionPoiStorage.sectionsToVillage(p_27099_);
++        }
+         this.distanceTracker.runAllUpdates();
+         return this.distanceTracker.getLevel(p_27099_.asLong());
+     }
+@@ -211,10 +_,38 @@
+ 
+     @Override
+     public void tick(BooleanSupplier p_27105_) {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.tick(p_27105_);
++            return;
++        }
+         super.tick(p_27105_);
+         this.distanceTracker.runAllUpdates();
+     }
+ 
++    // Neo: the regionized storage writes its own dirty columns, so the section storage's dirty set is never
++    // used while the switch is on and the manager reports the storage's work instead.
++    @Override
++    public boolean hasWork() {
++        return this.regionPoiStorage != null ? this.regionPoiStorage.hasWork() : super.hasWork();
++    }
++
++    @Override
++    public void flush(ChunkPos p_63797_) {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.flush(p_63797_);
++            return;
++        }
++        super.flush(p_63797_);
++    }
++
++    @Override
++    public void close() throws java.io.IOException {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.close();
++        }
++        super.close();
++    }
++
+     @Override
+     protected void setDirty(long p_27036_) {
+         super.setDirty(p_27036_);
+@@ -227,6 +_,10 @@
+     }
+ 
+     public void checkConsistencyWithBlocks(SectionPos p_281731_, LevelChunkSection p_281893_) {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.checkConsistencyWithBlocks(p_281731_, p_281893_);
++            return;
++        }
+         Util.ifElse(this.getOrLoad(p_281731_.asLong()), p_217898_ -> p_217898_.refresh(p_217967_ -> {
+                 if (mayHavePoi(p_281893_)) {
+                     this.updateFromSection(p_281893_, p_281731_, p_217967_);
+@@ -258,6 +_,10 @@
+     }
+ 
+     public void ensureLoadedAndValid(LevelReader p_27057_, BlockPos p_27058_, int p_27059_) {
++        if (this.regionPoiStorage != null) {
++            this.regionPoiStorage.ensureLoadedAndValid(p_27057_, p_27058_, p_27059_);
++            return;
++        }
+         SectionPos.aroundChunk(
+                 new ChunkPos(p_27058_), Math.floorDiv(p_27059_, 16), this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection()
+             )

@@ -50,6 +50,8 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingSpawning;
 
+        public final BooleanValue enableRegionThreadingPoi;
+
         public final IntValue regionThreadingWorkerThreads;
 
         public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
@@ -143,6 +145,13 @@ public class NeoForgeConfig {
                     .translation("neoforge.configgui.enableRegionThreadingSpawning")
                     .worldRestart()
                     .define("enableRegionThreadingSpawning", false);
+
+            enableRegionThreadingPoi = builder
+                    .comment(
+                            "EXPERIMENTAL: Partitions the POI storage of a level per region so that the POI users (villagers, iron golems, raiders, bees, zombies and foxes) tick on their region worker again. A POI section belongs to the region that owns its chunk; each region publishes an immutable snapshot of the sections it wrote at the end of every region phase, and a query from a worker reads its own region's live sections plus the published snapshots of the regions its box overlaps, in vanilla's result order. A foreign answer is at most one publish old, free-ticket counts are live, and the village distance is answered from the published village-center index instead of draining the level-wide distance tracker. Requires enableRegionThreadingBridge and a fixed region policy (regionThreadingMode FIXED_3X3), because the storage maps a chunk to exactly one region coordinate. Enabling enableRegionThreadingEntityTicks implies this storage, because a worker tick of a POI user reaches the level's POI manager. With the switch off, and without entity worker ticks, the vanilla PoiManager storage is used unchanged.")
+                    .translation("neoforge.configgui.enableRegionThreadingPoi")
+                    .worldRestart()
+                    .define("enableRegionThreadingPoi", false);
 
             regionThreadingWorkerThreads = builder
                     .comment("EXPERIMENTAL: Number of native region worker threads reserved for the future region scheduler. A value of 0 uses max(1, available processors - 1).")
