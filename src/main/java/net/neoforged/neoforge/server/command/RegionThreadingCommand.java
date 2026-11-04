@@ -89,6 +89,7 @@ final class RegionThreadingCommand {
                 + ", entityQueriesRejected=" + diagnostics.entityQueriesRejected()
                 + ", deferredEntitySectionUpdatesApplied=" + diagnostics.deferredEntitySectionUpdatesApplied()
                 + ", droppedDeferredEntitySectionUpdates=" + diagnostics.droppedDeferredEntitySectionUpdates()
+                + ", droppedDeferredEntitySectionUpdatesForRemovedEntity=" + diagnostics.droppedDeferredEntitySectionUpdatesForRemovedEntity()
                 + ", deferredEntityRemovalsApplied=" + diagnostics.deferredEntityRemovalsApplied()
                 + ", droppedDeferredEntityRemovals=" + diagnostics.droppedDeferredEntityRemovals()
                 + ", repeatedDeferredEntityRemovals=" + diagnostics.repeatedDeferredEntityRemovals()

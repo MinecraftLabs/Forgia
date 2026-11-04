@@ -27,7 +27,10 @@ import java.util.Map;
  * (including the updates a shut-down batch releases without applying), the level identity closed, the
  * entity was removed or left the level, or the publication or the chunk acquisition threw. A dropped
  * update never leaves a section publication behind, and a failing update never costs the updates queued
- * behind it.
+ * behind it. {@link #droppedDeferredEntitySectionUpdatesForRemovedEntity()} is the subset of the dropped
+ * updates whose entity was removed, left the level or was never added to it between the move and the
+ * barrier: the removal already retired the section membership, so dropping the publication loses nothing.
+ * The rest of the dropped count is the update that really lost a move.
  * <p>
  * The three removal counters report the level callback of a worker entity removal that the batch barrier
  * applied, dropped or turned into a no-op. An applied count is one normal removal path on the server thread:
@@ -254,6 +257,7 @@ public record RegionThreadingDiagnostics(
         long retriedDeferredEntityMoveCount,
         long deferredEntitySectionUpdatesApplied,
         long droppedDeferredEntitySectionUpdates,
+        long droppedDeferredEntitySectionUpdatesForRemovedEntity,
         long deferredEntityRemovalsApplied,
         long droppedDeferredEntityRemovals,
         long repeatedDeferredEntityRemovals,

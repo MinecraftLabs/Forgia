@@ -165,6 +165,35 @@ runs {
             // benchmark batches run instead of the whole GameTest suite. Unset keeps every test.
             systemProperty("neoforge.gameTestServer.filter", providers.gradleProperty("gameTestFilter").getOrElse(""))
     }
+    // The production soak: the same generated world and the same window twice, once with the whole region
+    // threading combination enabled and once with region threading off. The two runs are the milestone's
+    // production measurement; the reference run also compares its redstone state series with the series the
+    // threading-on run wrote. Both runs start from a fresh world directory, because the GameTest server saves
+    // its world on shutdown and the fixed seed only reproduces the same terrain for a world that is generated
+    // again. The region threading switches are written into the run's server config before the server starts,
+    // so the engine is installed from the configuration the production server reads, not from a test seam.
+    soakGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.serverSoak", "true")
+            systemProperty("neoforge.gameTestServer.filter", "productionSoak")
+            systemProperty("neoforge.gameTestWorldPreset", providers.gradleProperty("soakWorldPreset").getOrElse("minecraft:normal"))
+            systemProperty("neoforge.gameTestWorldSeed", providers.gradleProperty("soakWorldSeed").getOrElse("4242424242"))
+            systemProperty("neoforge.soakTicks", providers.gradleProperty("soakTicks").getOrElse("6000"))
+            systemProperty("neoforge.soakRegionThreading", "true")
+            systemProperty("neoforge.soakReference", "")
+            systemProperty("neoforge.soakReport", "soak-report")
+    }
+    soakGameTestServerReference {
+            type = "gameTestServer"
+            systemProperty("neoforge.serverSoak", "true")
+            systemProperty("neoforge.gameTestServer.filter", "productionSoak")
+            systemProperty("neoforge.gameTestWorldPreset", providers.gradleProperty("soakWorldPreset").getOrElse("minecraft:normal"))
+            systemProperty("neoforge.gameTestWorldSeed", providers.gradleProperty("soakWorldSeed").getOrElse("4242424242"))
+            systemProperty("neoforge.soakTicks", providers.gradleProperty("soakTicks").getOrElse("6000"))
+            systemProperty("neoforge.soakRegionThreading", "false")
+            systemProperty("neoforge.soakReference", project.file("runs/soakGameTestServer/soak-report/redstone-on.csv").absolutePath)
+            systemProperty("neoforge.soakReport", "soak-report")
+    }
     data {
             data()
 
@@ -199,6 +228,49 @@ runs.configureEach {
 
 neoDevTest {
     loadedMods = [ project(":neoforge").neoDev.mods.minecraft, neoDev.mods.testframework, neoDev.mods.coremods, neoDev.mods.junit ]
+}
+
+// Region threading switches of the production soak. The threading-on run enables the whole combination the
+// milestone reports on; the reference run disables the bridge, which is what "region threading off" means.
+// The file is a partial server config: every key the run does not name keeps the default of NeoForgeConfig, so
+// the soak cannot silently drift from the shipped defaults of the other switches.
+def soakConfigText(boolean regionThreading) {
+    return """# Written by the production soak run of tests/build.gradle before the server starts.
+# Only the region threading switches are named; every other key keeps its NeoForgeConfig default.
+enableRegionThreadingBridge = ${regionThreading}
+enableRegionThreadingWorkers = ${regionThreading}
+enableGlobalRegionThreadingWorker = ${regionThreading}
+enableRegionThreadingEntityTicks = ${regionThreading}
+enableRegionThreadingBlockEntityTicks = ${regionThreading}
+enableRegionThreadingScheduledTicks = ${regionThreading}
+enableRegionThreadingRandomTicks = ${regionThreading}
+enableRegionThreadingSpawning = ${regionThreading}
+enableRegionThreadingPoi = ${regionThreading}
+enableRegionThreadingBorderUpdates = ${regionThreading}
+regionThreadingWorkerThreads = ${regionThreading ? 4 : 0}
+regionThreadingMode = "FIXED_3X3"
+regionThreadingFixedRegionChunks = 3
+regionThreadingOwnershipViolationMode = "WARN"
+"""
+}
+
+[
+    soakGameTestServer       : [regionThreading: true],
+    soakGameTestServerReference: [regionThreading: false]
+].each { String runName, Map options ->
+    def prepare = tasks.register("prepare${runName.capitalize()}") {
+        group = "runs"
+        description = "Starts the ${runName} soak from a fresh world and writes its region threading config."
+        def worldDirectory = layout.projectDirectory.dir("runs/${runName}/world").asFile
+        def configFile = layout.projectDirectory.file("runs/${runName}/config/neoforge-server.toml").asFile
+        def configText = soakConfigText(options.regionThreading)
+        doLast {
+            worldDirectory.deleteDir()
+            configFile.parentFile.mkdirs()
+            configFile.text = configText
+        }
+    }
+    tasks.named("run${runName.capitalize()}").configure { dependsOn prepare }
 }
 
 license {

@@ -31,9 +31,12 @@ import org.jetbrains.annotations.Nullable;
  * {@link RegionThreadingEngine#serverThreadOnlyEntity(Class, String)} instead of being refused a worker
  * wholesale.
  * <p>
- * The registry is empty by default and the vanilla declarations are gone: the level's {@code PoiManager} is
- * partitioned per region ({@code enableRegionThreadingPoi}), so a villager, iron golem, raider, bee, zombie or
- * fox tick reads region-owned sections and no longer needs to be handed back to the server thread. The portal
+ * The vanilla POI declarations are gone: the level's {@code PoiManager} is partitioned per region
+ * ({@code enableRegionThreadingPoi}), so a villager, iron golem, raider, bee, zombie or fox tick reads
+ * region-owned sections and no longer needs to be handed back to the server thread. What remains declared are
+ * the types whose own tick reaches a mutation the entity lease does not own - a slime that splits on removal
+ * and a fishing hook that discards itself - which
+ * {@link RegionThreadingEngine#declareVanillaServerThreadOnlyEntities()} declares for every engine. The portal
  * search is not a type property (every entity can enter a portal) and is deferred to the batch barrier by the
  * engine instead of being declared here.
  */

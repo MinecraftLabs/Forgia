@@ -53,6 +53,7 @@ import net.neoforged.neoforge.registries.NeoForgeRegistries.Keys;
 import net.neoforged.neoforge.server.permission.PermissionAPI;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import org.apache.logging.log4j.LogManager;
@@ -103,11 +104,19 @@ public class ServerLifecycleHooks {
             if (RegionThreadingCompatibility.canInstallBridge()) {
                 // The layout carries the fixed region edge length, so the engine, its regionizer and the
                 // physical section partitions of every level created afterwards share one region size.
-                final RegionThreadingEngine engine = new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(), RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get()));
-                // The policy starts empty: a type without a declaration ticks on its region worker. The
-                // vanilla POI declarations are gone because the level's POI storage is partitioned per region
-                // (enableRegionThreadingPoi), so a villager, golem, raider, bee, zombie or fox tick reaches
-                // region-owned sections instead of one shared manager.
+                final RegionLayout layout = RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get());
+                // Entity worker ticks need region-owned entity storage: the ticks of the leased entities mutate
+                // the level's entity storage, and only the region-owned guards let a worker run them while the
+                // server thread keeps the shared vanilla maps. A dynamic layout cannot partition the storage, so
+                // the entity slice stays on the server thread there.
+                final RegionEntityStorageMode entityStorageMode = RegionEntityStorageMode.forConfiguration(
+                        NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), layout);
+                final RegionThreadingEngine engine = new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(), layout, entityStorageMode);
+                // The engine ships the vanilla declarations of the types whose own tick reaches a mutation the
+                // lease does not own (a splitting slime, a discarding fishing hook); every other type ticks on
+                // its region worker. The vanilla POI declarations are gone because the level's POI storage is
+                // partitioned per region (enableRegionThreadingPoi), so a villager, golem, raider, bee, zombie
+                // or fox tick reaches region-owned sections instead of one shared manager.
                 RegionThreadingManager.install(engine);
             } else {
                 LOGGER.warn(SERVERHOOKS, "Region threading bridge is enabled but blocked by compatibility policy {}; unsupported mods: {}", RegionThreadingCompatibility.defaultSupport(), RegionThreadingCompatibility.unsupportedMods());

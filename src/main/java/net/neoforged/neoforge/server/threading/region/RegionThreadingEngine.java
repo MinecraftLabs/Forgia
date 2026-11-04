@@ -39,6 +39,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.monster.Slime;
+import net.minecraft.world.entity.projectile.FishingHook;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
@@ -81,6 +83,12 @@ import org.jetbrains.annotations.Nullable;
 public final class RegionThreadingEngine implements RegionThreading {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int MAX_REGION_LEASE_ATTEMPTS = 4;
+    /**
+     * Upper bound of the server thread's wait for a native global drain to release the global region. The
+     * drain itself is bounded by the per-drain task limits, so this only guards against a worker that never
+     * returns instead of letting the tick loop hang forever.
+     */
+    private static final long GLOBAL_REGION_WAIT_NANOS = 50_000_000L;
     /**
      * Number of entity batch barriers a deferred entity move waits for a busy region before it is published
      * through the legacy path. Every attempt happens at a barrier on the server thread, so the bound is
@@ -383,17 +391,21 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Declares who may touch the vanilla entity section/index storage while this engine's workers run.
      * <p>
      * Entity sections, their class index and the by-id/by-uuid lookup are still the single-threaded
-     * vanilla structures, so production uses {@link RegionEntityStorageMode#MAIN_THREAD_ONLY}: native
-     * workers are rejected from the legacy entity query surface and from every guarded storage mutation.
-     * Entity ticks therefore stay on the server thread; the block-entity slice only runs the types whose
-     * compatibility declaration proves that their tick does not touch storage.
+     * vanilla structures, so the server thread keeps them and a worker is rejected from the legacy entity
+     * query surface and from every guarded storage mutation. Entity ticks may only leave the server thread
+     * with {@link RegionEntityStorageMode#REGION_OWNED}, which is what the production configuration selects
+     * when the entity tick slice is enabled on a fixed layout
+     * ({@link RegionEntityStorageMode#forConfiguration(boolean, RegionLayout)}): the physical section
+     * partitions of that layout are then the region-private storage of a lease, and every storage effect of
+     * a worker tick is applied by the batch barrier on the server thread.
      */
     private final RegionEntityStorageMode entityStorageMode;
     /**
      * The per-type declarations of the entity tick, consulted before an entity body starts.
      * <p>
-     * The registry starts empty, so every type keeps the worker: the vanilla POI declarations are gone
-     * because the level's POI storage is partitioned per region, and
+     * The registry ships the vanilla declarations of {@link #declareVanillaServerThreadOnlyEntities()}: the
+     * types whose own tick reaches a mutation the entity lease does not own. The vanilla POI declarations are
+     * gone because the level's POI storage is partitioned per region, and
      * {@link #serverThreadOnlyEntity(Class, String)} is the hook of the mod compatibility layer.
      */
     private final RegionEntityTickPolicy entityTickPolicy = new RegionEntityTickPolicy();
@@ -551,6 +563,16 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong appliedDeferredSectionUpdateCount = new AtomicLong();
     private final AtomicLong droppedDeferredSectionUpdateCount = new AtomicLong();
     /**
+     * The part of {@link #droppedDeferredSectionUpdateCount} whose entity was removed, left the level or was
+     * never added to it between the move and the barrier.
+     * <p>
+     * Such an update has nothing left to publish: the removal retires the section membership of the entity
+     * before the barrier runs, so dropping the publication is the correct outcome and not a lost effect. The
+     * subset is counted on its own so a soak can tell the expected drops of a dying mob apart from a
+     * publication that failed, which is the drop that really loses a move.
+     */
+    private final AtomicLong droppedDeferredSectionUpdateForRemovedEntityCount = new AtomicLong();
+    /**
      * Deferred removals a barrier applied on the server thread. One applied removal is one level callback of
      * the removal: the section membership, the tracking and ticking callbacks, the identity ledger and the
      * region index of the entity are written exactly like a server-thread removal.
@@ -654,8 +676,9 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * Creates an engine with an explicit region layout policy and every bounded tick slice.
      * <p>
-     * Production uses {@link RegionEntityStorageMode#MAIN_THREAD_ONLY}; only the entity tick worker
-     * mechanics tests construct an engine with region-owned storage.
+     * This constructor keeps entity storage on the server thread. A production server passes the mode of
+     * {@link RegionEntityStorageMode#forConfiguration(boolean, RegionLayout)}, which selects region-owned
+     * storage when the entity tick slice is enabled.
      */
     public RegionThreadingEngine(int workerThreads, boolean workerExecutionEnabled, boolean globalWorkerExecutionEnabled, boolean entityTickWorkerExecutionEnabled, boolean blockEntityTickWorkerExecutionEnabled, boolean scheduledTickWorkerExecutionEnabled, boolean chunkTickWorkerExecutionEnabled, RegionPolicy regionPolicy) {
         this(workerThreads, workerExecutionEnabled, globalWorkerExecutionEnabled, entityTickWorkerExecutionEnabled, blockEntityTickWorkerExecutionEnabled, scheduledTickWorkerExecutionEnabled, chunkTickWorkerExecutionEnabled, regionPolicy, RegionEntityStorageMode.MAIN_THREAD_ONLY);
@@ -705,8 +728,36 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.chunkTickWorkerExecutionEnabled = chunkTickWorkerExecutionEnabled;
         this.spawnWorkerExecutionEnabled = spawnWorkerExecutionEnabled;
         this.entityStorageMode = entityStorageMode;
+        this.declareVanillaServerThreadOnlyEntities();
         RegionOwnershipViolationHandler.reset();
         RegionEntityOwnershipScope.resetCounters();
+    }
+
+    /**
+     * Declares the vanilla entity types whose tick reaches a mutation the entity lease does not own.
+     * <p>
+     * A declaration is a property of the type, not of a workload: the guard sites of the vanilla classes are
+     * audited against the tick of the class, and a type whose own tick can reach a rejected mutation keeps
+     * the server thread instead of failing the group of its region at the first such tick. The declarations
+     * are deliberately narrow - a type that only reaches the granted funnel stays on the worker:
+     * <ul>
+     * <li>{@code Slime} (and therefore {@code MagmaCube}): {@code Slime.remove} creates the child slimes of a
+     * dead slime <em>before</em> it reaches the removal funnel, so the split is an entity addition inside a
+     * removal callback the lease does not grant. A slime that dies in its own tick - fire, drowning, a fall,
+     * another mob's attack that the same worker resolves - would otherwise abort the group and crash the
+     * server.</li>
+     * <li>{@code FishingHook}: its tick discards the hook in five places (the owner is gone, the hook hits a
+     * block, the hook is in lava, the reel-in ends), and {@code discard} funnels into
+     * {@code FishingHook.remove}, which returns the caught item and the rod damage to the owner before it
+     * reaches the funnel.</li>
+     * </ul>
+     * A vehicle ({@code Boat}, {@code ChestBoat}, {@code AbstractMinecartContainer}) and a
+     * {@code BlockAttachedEntity} keep the worker: their own tick never removes or re-anchors them, so their
+     * guard sites are only reached from the server thread that destroys or moves them.
+     */
+    private void declareVanillaServerThreadOnlyEntities() {
+        this.entityTickPolicy.serverThreadOnly(Slime.class, "slime_split_on_removal");
+        this.entityTickPolicy.serverThreadOnly(FishingHook.class, "fishing_hook_remove");
     }
 
     /**
@@ -1092,14 +1143,45 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
         if (!this.globalRegion.tryMarkRunning()) {
-            RegionOwnershipViolationHandler.handle("Global region is already running on another thread");
-            return;
+            // The global region is owned by another thread for a bounded drain: the native global worker
+            // holds it while it runs the due global tasks. The server thread's global work - the server tick
+            // events, which must be posted every tick - is never dropped, so the server thread waits for that
+            // drain to finish instead of reporting a violation. A worker never waits: the server thread may
+            // be waiting for that worker's own batch, so waiting there would deadlock the tick, and the work
+            // is refused and counted instead.
+            if (RegionWorkerScope.isNativeWorkerThread() || !this.awaitGlobalRegionIdle()
+                    || !this.globalRegion.tryMarkRunning()) {
+                RegionOwnershipViolationHandler.handle("Global region is already running on another thread");
+                return;
+            }
         }
         try {
             this.runInGlobalRegionOwned(task);
         } finally {
             this.globalRegion.clearRunning();
         }
+    }
+
+    /**
+     * Waits for the bounded drain of the native global worker to release the global region.
+     * <p>
+     * The drain is bounded by {@code regionThreadingMaxImmediateTasksPerDrain} and
+     * {@code regionThreadingMaxScheduledTasksPerDrain}, and the worker that drains never waits for the server
+     * thread, so this wait is bounded by the drain itself. The bound exists only so a broken worker cannot
+     * hang the tick loop: a drain that does not finish inside it is reported as an ownership violation and the
+     * caller keeps its failure path.
+     *
+     * @return {@code true} when the global region became free
+     */
+    private boolean awaitGlobalRegionIdle() {
+        final long deadline = System.nanoTime() + GLOBAL_REGION_WAIT_NANOS;
+        while (this.globalRegion.isRunning()) {
+            if (System.nanoTime() >= deadline) {
+                return false;
+            }
+            Thread.onSpinWait();
+        }
+        return true;
     }
 
     private void runInGlobalRegionOwned(Runnable task) {
@@ -3760,6 +3842,40 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
         level.guardEntityTick(level::tickNonPassenger, entity);
+        this.republishServerThreadEntityMove(level, entity);
+    }
+
+    /**
+     * Republishes the region mapping of an entity the server thread just ticked, when its tick moved it out
+     * of the region it is mapped to.
+     * <p>
+     * A worker tick defers every position write and the batch barrier publishes the captured destination, so
+     * the mapping of a worker-ticked entity is maintained by the entity slice. A server-thread tick - the
+     * pre-load fallback, the chunk fallback, a declared server-thread-only type and the always-ticking player
+     * - runs the unmodified vanilla body, whose position write reaches the level callback directly and never
+     * the entity batch. Without this publication the mapping of such an entity keeps the region it started in
+     * while the entity walks away, and the region index would group and lease it by a region that no longer
+     * contains it.
+     * <p>
+     * The common case - the entity stayed inside its region - costs one read-lock lookup and one coordinate
+     * comparison and writes nothing. Only a move that really crosses a region border takes the write lock and
+     * notifies the entity's scheduled tasks, exactly like the deferred path does.
+     */
+    private void republishServerThreadEntityMove(ServerLevel level, Entity entity) {
+        if (this.shutdown || entity.isRemoved() || entity.level() != level) {
+            return;
+        }
+        final RegionState mapped = this.regionizer.regionFor(entity);
+        if (mapped == null) {
+            // The entity is not mapped at all (it never started ticking in a region); publish the first
+            // mapping so the index knows it.
+            this.publishEntityMove(entity);
+            return;
+        }
+        if (mapped.coordinate().equals(this.layout.regionAt(level, entity.blockPosition()))) {
+            return;
+        }
+        this.publishEntityMove(entity);
     }
 
     /** Records a chunk the plan did not hand over because it is not block-ticking this tick. */
@@ -5987,6 +6103,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             final Entity entity = update.entity();
             if (entity.isRemoved() || entity.level() != level || !entity.isAddedToLevel()) {
                 this.droppedDeferredSectionUpdateCount.incrementAndGet();
+                this.droppedDeferredSectionUpdateForRemovedEntityCount.incrementAndGet();
                 continue;
             }
             try {
@@ -6942,6 +7059,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.retriedDeferredEntityMoveCount.get(),
                 this.appliedDeferredSectionUpdateCount.get(),
                 this.droppedDeferredSectionUpdateCount.get(),
+                this.droppedDeferredSectionUpdateForRemovedEntityCount.get(),
                 this.appliedDeferredRemovalCount.get(),
                 this.droppedDeferredRemovalCount.get(),
                 this.repeatedDeferredRemovalCount.get(),

@@ -118,7 +118,7 @@ public class NeoForgeConfig {
                     .define("enableGlobalRegionThreadingWorker", false);
 
             enableRegionThreadingEntityTicks = builder
-                    .comment("EXPERIMENTAL: Ticks the real ServerLevel entities of a tick on their owning region worker thread while the server thread waits for the batch. Requires enableRegionThreadingBridge. Entity storage is single-threaded and owned by the server thread, so entity ticks currently fall back to the server thread. This is a bounded entity tick slice, not regionized world ticking.")
+                    .comment("EXPERIMENTAL: Ticks the real ServerLevel entities of a tick on their owning region worker thread while the server thread waits for the batch. Requires enableRegionThreadingBridge and a fixed region policy, because the region-owned entity storage this needs is the physical section partition of a fixed layout. Enabling it selects region-owned entity storage: a worker only reads the physical section bucket of the region it holds, every storage effect of its ticks - the position change's section publication and chunk acquisition, the removal's level callback and the admission of a spawned entity - is recorded and applied by the batch barrier on the server thread, and any other storage access from a worker is rejected and counted. With a dynamic layout, and with this switch off, the whole entity slice stays on the server thread.")
                     .translation("neoforge.configgui.enableRegionThreadingEntityTicks")
                     .worldRestart()
                     .define("enableRegionThreadingEntityTicks", false);
