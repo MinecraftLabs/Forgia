@@ -739,6 +739,58 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Defers one block write whose position belongs to another region.
+     * <p>
+     * Called by {@code Level.setBlock} after the chunk lookup and before the mutation guard. A region worker that
+     * writes outside its lease records the call here, and the target region runs the vanilla
+     * {@code Level.setBlock} on its own worker at the barrier of the same tick, so the block-entity lifecycle,
+     * the heightmaps, the light recheck and the neighbour propagation are the target's own. The recording
+     * worker does not mutate the target chunk.
+     * <p>
+     * A caller that receives {@code true} reports success: the write is accepted, not applied yet. A callback
+     * that reads the same position again in the same lease still observes the state before the write; the read
+     * is counted through {@link #observeReadAfterDeferredBlockWrite(BlockPos)}.
+     *
+     * @return {@code true} when the write was recorded and the caller has to skip the inline mutation
+     */
+    public static boolean deferBorderBlockWrite(net.minecraft.world.level.Level level, BlockPos pos,
+            net.minecraft.world.level.block.state.BlockState state, int flags, int recursionLeft) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.deferBorderBlockWrite(serverLevel, pos, state, flags, recursionLeft);
+    }
+
+    /**
+     * Counts one block state read of a position the current region wrote outside its lease during the current
+     * lease.
+     * <p>
+     * Called from the block state read of a chunk that is not owned by the current region, i.e. exactly where the
+     * deferred write would have been visible. The read itself is unaffected: this only makes the
+     * read-after-write approximation observable.
+     */
+    public static void observeReadAfterDeferredBlockWrite(BlockPos pos) {
+        observeReadAfterDeferredBlockWrite(pos.asLong());
+    }
+
+    /**
+     * Counts one fluid state read of a position the current region wrote outside its lease during the current
+     * lease, the packed-position form of {@link #observeReadAfterDeferredBlockWrite(BlockPos)}.
+     */
+    public static void observeReadAfterDeferredBlockWrite(int x, int y, int z) {
+        observeReadAfterDeferredBlockWrite(BlockPos.asLong(x, y, z));
+    }
+
+    private static void observeReadAfterDeferredBlockWrite(long packedPos) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.observeReadAfterDeferredBlockWrite(packedPos);
+        }
+    }
+
+    /**
      * Defers the light section status change of one block write of a region worker group to the server thread.
      * <p>
      * The light engine of a level is one engine with one set of queues and one light thread, so a region worker

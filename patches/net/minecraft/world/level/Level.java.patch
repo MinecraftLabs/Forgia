@@ -82,10 +82,16 @@
      @Nullable
      @Override
      public MinecraftServer getServer() {
-@@ -215,12 +_,44 @@
+@@ -215,12 +_,50 @@
              return false;
          } else {
              LevelChunk levelchunk = this.getChunkAt(p_46605_);
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderBlockWrite(this, p_46605_, p_46606_, p_46607_, p_46608_)) {
++                // Neo: the position belongs to another region. The write is recorded and the target region runs
++                // the vanilla setBlock on its own worker at the barrier of this tick; the accepted answer is the
++                // documented read-after-write approximation, because the write is not applied yet.
++                return true;
++            }
 +            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(levelchunk)) {
 +                return false;
 +            }

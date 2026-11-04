@@ -345,10 +345,21 @@ public record RegionThreadingDiagnostics(
      * re-run because of one, and {@code rerunSeedsDropped} the written positions the seed bound refused, which a
      * re-run of that region does not re-evaluate. {@code worstPasses} bounds the re-runs too, because a re-run
      * needs a pass of its own.
+     * <p>
+     * The block write counters report the deferred cross-region writes of a region worker. {@code
+     * blockWritesRecorded} counts the {@code Level.setBlock} calls a worker left to the region that owns the
+     * written position, {@code blockWritesApplied} the calls a propagation pass ran on that region's own worker
+     * with the vanilla body, and {@code blockWritesDropped} the writes whose target chunk was no longer loaded
+     * when the fixpoint grouped them. {@code blockWritesOverflowed} counts the writes the capture bound refused
+     * at the call site: the caller's write was not applied and was counted by the no-replay refusal instead,
+     * unlike every other kind of border update, which falls back to the next tick. {@code readAfterBlockWrite}
+     * counts the reads of a position the same region wrote outside its lease during the same lease: the write is
+     * applied by the target region at the barrier, so such a read observes the state before the write.
      */
     public record BorderUpdateCounters(long recorded, long applied, long delayed, long dropped, long passes,
             long regionsRerun, long worstPasses, long overflowed, long foreignReads, long readOfUnownedChunk, long readOfVersionlessChunk,
-            long invalidatedPasses, long regionsRerunByReads, long rerunSeedsDropped) {
+            long invalidatedPasses, long regionsRerunByReads, long rerunSeedsDropped, long blockWritesRecorded,
+            long blockWritesApplied, long blockWritesOverflowed, long blockWritesDropped, long readAfterBlockWrite) {
         @Override
         public String toString() {
             return "recorded=" + this.recorded
@@ -364,7 +375,12 @@ public record RegionThreadingDiagnostics(
                     + "/readOfVersionlessChunk=" + this.readOfVersionlessChunk
                     + "/invalidatedPasses=" + this.invalidatedPasses
                     + "/regionsRerunByReads=" + this.regionsRerunByReads
-                    + "/rerunSeedsDropped=" + this.rerunSeedsDropped;
+                    + "/rerunSeedsDropped=" + this.rerunSeedsDropped
+                    + "/blockWritesRecorded=" + this.blockWritesRecorded
+                    + "/blockWritesApplied=" + this.blockWritesApplied
+                    + "/blockWritesOverflowed=" + this.blockWritesOverflowed
+                    + "/blockWritesDropped=" + this.blockWritesDropped
+                    + "/readAfterBlockWrite=" + this.readAfterBlockWrite;
         }
     }
 

@@ -123,7 +123,7 @@ class RegionChunkTickTest {
     }
 
     @Test
-    void boundaryChunkStaysOnTheServerThreadAndIsCounted() {
+    void boundaryChunkRunsOnARegionWorkerAndIsCounted() {
         this.installEngine(true);
         final TickRecorder recorder = new TickRecorder();
         final ServerLevel level = mockLevel();
@@ -131,15 +131,17 @@ class RegionChunkTickTest {
         final RegionChunkTickPlan plan = this.beginPlan(level);
 
         plan.accept(chunk);
+        assertEquals(List.of(BOUNDARY_CHUNK), plan.collectedChunks().stream().map(RegionChunkTickEntry::chunkPos).toList(),
+                "a boundary chunk is handed to the batch");
         plan.executeAndAwait(PARKING_BARRIER);
 
         assertEquals(RANDOM_TICK_SPEED, recorder.ticks.size(), "the boundary chunk still ticks exactly once");
-        assertTrue(recorder.ticks.stream().allMatch(tick -> tick.thread().equals(Thread.currentThread().getName())),
-                () -> "a boundary chunk must keep the server-thread body: " + recorder.ticks);
-        assertEquals(1L, this.engine.diagnostics().boundaryChunkTicks());
-        assertEquals(1L, this.engine.diagnostics().fallbackChunkTicks());
-        assertEquals(0L, this.engine.diagnostics().chunkTicksOnWorkers());
-        assertTrue(plan.collectedChunks().isEmpty(), "a boundary chunk must not be handed to the batch");
+        assertTrue(recorder.ticks.stream().allMatch(tick -> tick.thread().startsWith("NeoForge Region Worker")),
+                () -> "a boundary chunk is dispatched and its cross-region writes are deferred: " + recorder.ticks);
+        assertEquals(1L, this.engine.diagnostics().boundaryChunkTicks(),
+                "the plan counts the boundary chunk it dispatched");
+        assertEquals(0L, this.engine.diagnostics().fallbackChunkTicks(), "the chunk did not fall back to the server thread");
+        assertEquals(1L, this.engine.diagnostics().chunkTicksOnWorkers());
     }
 
     @Test
@@ -199,8 +201,11 @@ class RegionChunkTickTest {
 
     /**
      * Property test of the enumeration: for randomized region layouts and randomized chunk sets, the chunks the
-     * plan hands to the batch are exactly the chunks the server thread would tick minus the ones it keeps for
-     * itself, and the executed tick of every handed-over chunk happens exactly once.
+     * plan hands to the batch are exactly the chunks the server thread would tick minus the ones whose
+     * neighbourhood is not loaded, and the executed tick of every handed-over chunk happens exactly once.
+     * <p>
+     * The interior-chunk rule is not part of the expectation any more: a boundary chunk is dispatched, because a
+     * write of its body that leaves the region is a border block write the target region applies in the same tick.
      */
     @Test
     void collectedChunksEqualTheServerThreadSetForRandomizedLayouts() {
@@ -231,7 +236,7 @@ class RegionChunkTickTest {
             final List<LevelChunk> chunks = new ArrayList<>();
             for (final ChunkPos candidate : candidates) {
                 chunks.add(chunk(candidate, recorder));
-                if (isInteriorChunk(candidate, layoutSize) && !hasUnloadedNeighbor(candidate, unloaded)) {
+                if (!hasUnloadedNeighbor(candidate, unloaded)) {
                     expected.add(candidate);
                 }
             }
@@ -285,7 +290,7 @@ class RegionChunkTickTest {
     }
 
     @Test
-    void randomTickOfABoundaryChunkAppliesItsWriteExactlyOnceOnTheServerThread() {
+    void randomTickOfABoundaryChunkAppliesItsWriteExactlyOnceOnItsWorker() {
         this.installEngine(true);
         final TickRecorder recorder = new TickRecorder();
         final ServerLevel level = mockLevel();
@@ -297,8 +302,8 @@ class RegionChunkTickTest {
 
         assertEquals(RANDOM_TICK_SPEED, recorder.positions().size(), "the effect has to happen exactly once");
         assertEquals(RANDOM_TICK_SPEED, new HashSet<>(recorder.positions()).size());
-        assertTrue(recorder.ticks.stream().allMatch(tick -> tick.thread().equals(Thread.currentThread().getName())),
-                () -> "the boundary chunk keeps the server-thread body: " + recorder.ticks);
+        assertTrue(recorder.ticks.stream().allMatch(tick -> tick.thread().startsWith("NeoForge Region Worker")),
+                () -> "the boundary chunk ticks on its region worker: " + recorder.ticks);
         assertEquals(1L, this.engine.diagnostics().boundaryChunkTicks());
     }
 

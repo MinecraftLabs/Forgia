@@ -26,17 +26,23 @@ import org.jetbrains.annotations.VisibleForTesting;
  * <p>
  * A chunk is handed over when
  * <ul>
- * <li>it is an interior chunk of its region, i.e. all eight neighboring chunks belong to the same region, so a
- * random tick that writes into a neighboring chunk writes into the lease the worker holds, and</li>
- * <li>those eight neighbors are loaded, so a random tick cannot force-load a chunk from a worker - the worker
- * chunk source refuses a load instead of waiting for the server thread that is waiting for the worker.</li>
+ * <li>its own chunk and the eight chunks around it are loaded, so a random tick cannot force-load a chunk from a
+ * worker - the worker chunk source refuses a load instead of waiting for the server thread that is waiting for
+ * the worker - and</li>
+ * <li>its body fits the deferred update budget of the batch.</li>
  * </ul>
- * Every other chunk is ticked on the server thread at the point vanilla ticks it and counted by reason: a
- * boundary chunk, a chunk with an unloaded neighbor, or a chunk collected after the batch already ran.
+ * A chunk that is not an interior chunk of its region is dispatched too: a write of its body that leaves the
+ * region is recorded as a border block write and applied by the target region on its own worker in the same
+ * tick, so the write is the target's vanilla call and the effect is the inline one. The plan counts those
+ * boundary chunks separately, so the share of the level the admission rule hands to workers stays observable.
+ * Every other chunk is ticked on the server thread at the point vanilla ticks it and counted by reason: an
+ * unloaded neighbor, a chunk collected after the batch already ran, or a chunk the batch had no room for.
  * <p>
  * Natural spawning, the inhabited time update, the custom spawners and the per-chunk broadcast stay in
  * {@code ServerChunkCache.tickChunks} on the server thread. The plan never touches {@code SpawnState}, the mob
  * cap or the level random.
+ *
+ * @see RegionThreadingEngine#isLoadedChunkNeighborhood(ServerLevel, ChunkPos)
  */
 @ApiStatus.Internal
 public final class RegionChunkTickPlan {
@@ -74,14 +80,6 @@ public final class RegionChunkTickPlan {
             return;
         }
         final ChunkPos chunkPos = chunk.getPos();
-        if (!this.engine.isInteriorRegionChunk(chunkPos)) {
-            // A random tick of a boundary chunk can write into the neighboring region, so the chunk keeps the
-            // server-thread body. Interior admission is a cheap pre-filter; the unconditional mutation
-            // ownership guard is the guarantee when a callback writes farther than one chunk.
-            this.engine.countBoundaryChunkTick();
-            this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
-            return;
-        }
         if (!this.engine.isLoadedChunkNeighborhood(this.level, chunkPos)) {
             // A random tick that reaches a neighboring chunk would have to load it, and a worker may not load
             // a chunk. The chunk therefore keeps the server-thread body.
@@ -99,6 +97,12 @@ public final class RegionChunkTickPlan {
             return;
         }
         this.chunks.add(RegionChunkTickEntry.of(chunk));
+        if (!this.engine.isInteriorRegionChunk(chunkPos)) {
+            // A boundary chunk is dispatched: a write of its body that lands in the neighboring region is
+            // recorded and applied by that region in the same tick. Only the count is kept, so the share of
+            // the level the relaxed admission rule moved off the server thread stays observable.
+            this.engine.countBoundaryChunkTick();
+        }
     }
 
     /**

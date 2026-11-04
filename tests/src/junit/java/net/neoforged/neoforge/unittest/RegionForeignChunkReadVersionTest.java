@@ -460,8 +460,13 @@ class RegionForeignChunkReadVersionTest {
         assertEquals(2, reads.get());
     }
 
+    /**
+     * A worker callback that writes a block of another region does not mutate that chunk: the write is recorded
+     * and the target region applies the vanilla call on its own worker at the barrier, so the foreign chunk is
+     * never touched by the writing worker and the final state is the inline one.
+     */
     @Test
-    void interiorChunkCallbackCannotMutateForeignChunk() {
+    void workerCallbackDefersItsForeignWriteToTheTargetRegion() {
         final ServerLevel level = this.mockLevel();
         final ChunkPos interior = new ChunkPos(1, 1);
         final ChunkPos foreign = new ChunkPos(3, 1);
@@ -475,25 +480,33 @@ class RegionForeignChunkReadVersionTest {
         }
         serveChunks(level, chunks);
         this.engine = new RegionThreadingEngine(2, false, false, false, false, false, true, FIXED);
+        this.engine.setBorderUpdatesEnabledForTesting(true);
         this.engine.enableUnclassifiedWorkerCallbacksForTesting();
         RegionThreadingManager.install(this.engine);
         for (final LevelChunk chunk : chunks.values()) {
             this.engine.addRegionSection(level, chunk.getPos().x, chunk.getPos().z);
         }
-        final long refusals = net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount();
         final AtomicInteger calls = new AtomicInteger();
+        final AtomicReference<Boolean> accepted = new AtomicReference<>();
+        final AtomicReference<Boolean> visibleInsideTheBody = new AtomicReference<>();
         doAnswer(invocation -> {
             calls.incrementAndGet();
             assertTrue(RegionThreadingHooks.isNativeRegionWorkerThread());
-            assertFalse(level.setBlock(target, Blocks.STONE.defaultBlockState(), 2));
+            accepted.set(level.setBlock(target, Blocks.STONE.defaultBlockState(), 2));
+            visibleInsideTheBody.set(chunks.get(foreign.toLong()).getBlockState(target).is(Blocks.STONE));
             return null;
         }).when(level).tickChunk(any(LevelChunk.class), anyInt());
         final var plan = this.engine.beginChunkTickPlan(level, 3, PARKING_BARRIER);
         plan.accept(chunks.get(interior.toLong()));
         plan.executeAndAwait(PARKING_BARRIER);
         assertEquals(1, calls.get(), "the callback must not be replayed");
-        assertTrue(chunks.get(foreign.toLong()).getBlockState(target).isAir());
-        assertEquals(refusals + 1, net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount());
+        assertEquals(Boolean.TRUE, accepted.get(), "the deferred write reports success to its caller");
+        assertEquals(Boolean.FALSE, visibleInsideTheBody.get(),
+                "the writing worker does not mutate the foreign chunk; the target region applies the write at the barrier");
+        assertTrue(chunks.get(foreign.toLong()).getBlockState(target).is(Blocks.STONE),
+                "the target region applied the vanilla write in the same tick");
+        assertEquals(1L, this.engine.diagnostics().borderUpdates().blockWritesRecorded());
+        assertEquals(1L, this.engine.diagnostics().borderUpdates().blockWritesApplied());
     }
 
     private Race runRace(boolean versionCheck) {

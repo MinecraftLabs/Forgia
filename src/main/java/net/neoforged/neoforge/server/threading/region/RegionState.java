@@ -93,6 +93,25 @@ final class RegionState {
     private final it.unimi.dsi.fastutil.longs.LongArrayList rerunSeeds = new it.unimi.dsi.fastutil.longs.LongArrayList();
     /** Seeds the {@link #MAX_RERUN_SEEDS} bound refused since the last check. */
     private int droppedRerunSeeds;
+    /**
+     * Upper bound of the positions this region wrote outside its lease and keeps for the read-after-write
+     * observation.
+     * <p>
+     * One lease writes a handful of blocks outside its region at most - a random tick that grows a crop across
+     * the border, a block entity that lights a neighbour - so the bound only has to keep a modded callback that
+     * writes far outside its lease from growing the set without limit. A position past the bound is still
+     * applied by its target region; only the observation of a read of it is not counted.
+     */
+    static final int MAX_DEFERRED_WRITE_POSITIONS = 4096;
+    /**
+     * The positions this region wrote outside its lease during the current lease, as packed block positions.
+     * <p>
+     * The write is applied by the target region at the barrier, so a callback that reads one of these positions
+     * back in the same lease observes the state before the write. Recording the positions is what makes that
+     * approximation observable instead of silent. Written by the region's own worker only, exactly like
+     * {@link #foreignChunkReads}.
+     */
+    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet deferredWritePositions = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
 
     RegionState(RegionCoordinate coordinate) {
         this.coordinate = coordinate;
@@ -388,6 +407,10 @@ final class RegionState {
 
     void beginOwnership() {
         this.ownerThread = Thread.currentThread();
+        // A lease starts with no position of its own written outside it: the approximation of the read after
+        // such a write is bounded by one lease, because the fixpoint applies the writes before the region's
+        // next lease starts.
+        this.deferredWritePositions.clear();
     }
 
     void endOwnership() {
@@ -458,6 +481,24 @@ final class RegionState {
         final int dropped = this.droppedRerunSeeds;
         this.droppedRerunSeeds = 0;
         return dropped;
+    }
+
+    /**
+     * Records one position this region wrote outside its lease during the current lease.
+     *
+     * @return {@code false} when the {@link #MAX_DEFERRED_WRITE_POSITIONS} bound refused it
+     */
+    boolean recordDeferredWrite(long packedPos) {
+        if (this.deferredWritePositions.size() >= MAX_DEFERRED_WRITE_POSITIONS) {
+            return false;
+        }
+        this.deferredWritePositions.add(packedPos);
+        return true;
+    }
+
+    /** {@return true when this region wrote {@code packedPos} outside its lease during the current lease} */
+    boolean wroteDeferred(long packedPos) {
+        return this.deferredWritePositions.contains(packedPos);
     }
 
     boolean tryMarkRunning() {

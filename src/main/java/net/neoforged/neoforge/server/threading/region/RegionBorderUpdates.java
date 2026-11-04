@@ -34,10 +34,19 @@ import org.jetbrains.annotations.ApiStatus;
  * <p>
  * Every invocation is retained, including identical payloads: payload equality does not identify a call.
  * <p>
+ * A block write is the one kind of update that is not derived from another update: a region worker that
+ * writes a block outside its lease records the write itself, and the target region runs the vanilla
+ * {@code Level.setBlock} at the barrier. Everything the vanilla call owns - the block-entity lifecycle, the
+ * heightmaps, the light recheck, the neighbour and shape propagation - is therefore the target region's own,
+ * and the write reaches the same state the inline run reaches.
+ * <p>
  * <strong>Bound.</strong> One pass records at most {@link #MAX_ENTRIES} updates. The bound is an
  * admission bound of the capture queue: a record past it is not queued and is counted, so the worker that
  * produced it has to hand it to the next-tick fallback instead. In production the fixpoint bound
- * ({@code maxChainedNeighborUpdates}) is reached long before this memory bound.
+ * ({@code maxChainedNeighborUpdates}) is reached long before this memory bound. A block write is not handed
+ * to that fallback: the record decides the answer the write reports to its caller, so an overflowed write is
+ * refused at the call site with the existing no-replay refusal instead of being applied one tick later than
+ * the inline run would have applied it.
  */
 @ApiStatus.Internal
 final class RegionBorderUpdates {
@@ -49,11 +58,21 @@ final class RegionBorderUpdates {
 
     /** The recorded updates, in the order the worker bodies produced them. */
     private final ConcurrentLinkedQueue<BorderUpdate> updates = new ConcurrentLinkedQueue<>();
-    /** Records past {@link #MAX_ENTRIES}, kept for the next-tick fallback instead of being applied inline. */
+    /** Records past the capture bound, kept for the next-tick fallback instead of being applied inline. */
     private final ConcurrentLinkedQueue<BorderUpdate> overflowed = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queuedCount = new AtomicInteger();
     private final AtomicInteger recorded = new AtomicInteger();
     private final AtomicInteger overflow = new AtomicInteger();
+    /** Entries the queue admits; {@link #MAX_ENTRIES} in production and the mechanics seam in a test. */
+    private final int maxEntries;
+
+    RegionBorderUpdates() {
+        this(MAX_ENTRIES);
+    }
+
+    RegionBorderUpdates(int maxEntries) {
+        this.maxEntries = maxEntries;
+    }
 
     /** The outcome of one capture. */
     enum RecordResult {
@@ -85,9 +104,22 @@ final class RegionBorderUpdates {
      * fixpoint or, after overflow, for the next-tick fallback.
      */
     RecordResult record(BorderUpdate update) {
-        if (this.queuedCount.get() >= MAX_ENTRIES) {
+        return this.record(update, true);
+    }
+
+    /**
+     * Records one border update, choosing what happens past the capture bound.
+     *
+     * @param nextTickFallback whether an overflowed update is kept for the target region's next tick
+     * @return {@link RecordResult#ACCEPTED} when the update is queued, {@link RecordResult#OVERFLOW} when the
+     *         bound refused it
+     */
+    RecordResult record(BorderUpdate update, boolean nextTickFallback) {
+        if (this.queuedCount.get() >= this.maxEntries) {
             this.overflow.incrementAndGet();
-            this.overflowed.add(update);
+            if (nextTickFallback) {
+                this.overflowed.add(update);
+            }
             return RecordResult.OVERFLOW;
         }
         this.updates.add(update);
@@ -135,7 +167,7 @@ final class RegionBorderUpdates {
      * The record carries everything the target worker needs to reproduce the vanilla call. The target state is
      * read on the target worker, so the replay never uses a state a worker of another region read concurrently.
      */
-    sealed interface BorderUpdate permits NeighborUpdate, ShapeUpdate, ComparatorUpdate, BlockEntityChange, SelfUpdate {
+    sealed interface BorderUpdate permits NeighborUpdate, ShapeUpdate, ComparatorUpdate, BlockEntityChange, SelfUpdate, BlockWrite {
         /** {@return the position the update targets, i.e. the position of the region that has to run it} */
         BlockPos pos();
 
@@ -190,6 +222,25 @@ final class RegionBorderUpdates {
         @Override
         public void apply(ServerLevel level) {
             level.blockEntityChanged(this.pos);
+        }
+    }
+
+    /**
+     * One vanilla {@code Level.setBlock} a region worker had to leave to another region.
+     * <p>
+     * The record is the whole call: the position, the state, the update flags and the recursion budget the
+     * caller passed. The target region replays it on its own worker, so the block-entity creation or removal,
+     * the heightmap update, the light recheck and the neighbour and shape propagation of the write are the
+     * target's own vanilla effects, and the write is never applied by the worker that recorded it.
+     * <p>
+     * Only a write that is exactly this call is expressible this way. A block-entity mutation that carries
+     * data (a pre-built block entity, an NBT payload), a multi-position move and a heightmap-only write are
+     * not, and they keep the no-replay refusal of the worker mutation guard.
+     */
+    record BlockWrite(BlockPos pos, BlockState state, int flags, int recursionLeft) implements BorderUpdate {
+        @Override
+        public void apply(ServerLevel level) {
+            level.setBlock(this.pos, this.state, this.flags, this.recursionLeft);
         }
     }
 

@@ -237,6 +237,8 @@ public final class RegionThreadingEngine implements RegionThreading {
     private volatile boolean borderUpdatesEnabled = RegionThreadingConfig.borderUpdatesEnabled();
     /** Test override of the fixpoint bound; a negative value reads the level's vanilla limit. */
     private volatile int borderUpdateBudgetForTesting = -1;
+    /** Entries one capture queue of a level admits; the production bound unless a test lowers it. */
+    private volatile int borderUpdateCapacity = RegionBorderUpdates.MAX_ENTRIES;
     /** Border updates a worker recorded instead of applying. */
     private final AtomicLong borderUpdatesRecorded = new AtomicLong();
     /** Border updates a propagation pass applied on the target region's worker. */
@@ -253,6 +255,16 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong borderUpdateWorstPasses = new AtomicLong();
     /** Border updates the capture bound refused, which were handed to the next-tick fallback. */
     private final AtomicLong borderUpdatesOverflowed = new AtomicLong();
+    /** Block writes a worker recorded for the region that owns the written position. */
+    private final AtomicLong borderBlockWritesRecorded = new AtomicLong();
+    /** Block writes a propagation pass applied on the target region's worker. */
+    private final AtomicLong borderBlockWritesApplied = new AtomicLong();
+    /** Block writes the capture bound refused at the call site, i.e. the caller's write was not applied. */
+    private final AtomicLong borderBlockWritesOverflowed = new AtomicLong();
+    /** Block writes whose target chunk was no longer loaded when the fixpoint grouped them. */
+    private final AtomicLong borderBlockWritesDropped = new AtomicLong();
+    /** Reads of a position the same region wrote outside its lease during the same lease. */
+    private final AtomicLong readAfterDeferredBlockWrite = new AtomicLong();
     /**
      * The regions of each level that read a chunk of another region since their last version check.
      * <p>
@@ -1615,12 +1627,19 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Groups the pending border updates by the live region that has to apply them, in first-seen order.
      * <p>
      * An update whose target region does not exist or is retired is counted as dropped: no region will ever
-     * run it, and handing it to a different region would apply it to the wrong state.
+     * run it, and handing it to a different region would apply it to the wrong state. A block write whose
+     * target chunk is no longer loaded is dropped the same way and counted separately: the target region could
+     * only apply it by loading a chunk, which no worker may do while the server thread waits for the barrier.
      */
     private Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> groupBorderUpdatesByRegion(ServerLevel level,
             List<RegionBorderUpdates.BorderUpdate> updates) {
         final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> byRegion = new java.util.LinkedHashMap<>();
         for (final RegionBorderUpdates.BorderUpdate update : updates) {
+            if (update instanceof RegionBorderUpdates.BlockWrite && !level.isLoaded(update.pos())) {
+                this.borderUpdatesDropped.incrementAndGet();
+                this.borderBlockWritesDropped.incrementAndGet();
+                continue;
+            }
             final RegionState region = this.regionizer.get(this.layout.regionAt(level, update.pos()));
             if (region == null || region.isDead()) {
                 this.borderUpdatesDropped.incrementAndGet();
@@ -1713,6 +1732,9 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     this.currentPropagationOrigin.remove();
                                 }
                                 this.borderUpdatesApplied.incrementAndGet();
+                                if (update instanceof RegionBorderUpdates.BlockWrite) {
+                                    this.borderBlockWritesApplied.incrementAndGet();
+                                }
                             }
                         });
                     } finally {
@@ -1799,7 +1821,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * of that batch applies them on the target region's worker.
      */
     private void recordDelayedBorderUpdates(ServerLevel level, List<RegionBorderUpdates.BorderUpdate> updates) {
-        final RegionBorderUpdates queue = this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates());
+        final RegionBorderUpdates queue = this.borderQueue(level);
         for (final RegionBorderUpdates.BorderUpdate update : updates) {
             if (queue.record(update) == RegionBorderUpdates.RecordResult.OVERFLOW) {
                 this.borderUpdatesOverflowed.incrementAndGet();
@@ -2441,11 +2463,12 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * {@return true when every chunk around {@code chunkPos} belongs to the same region}
      * <p>
-     * Work that writes into the chunks around its own chunk may only run on a worker when all eight
-     * neighboring chunks belong to the same region, so every write within one chunk of its position stays
-     * inside the region lease the worker holds. Boundary chunks stay on the server thread. Writes farther
-     * than one chunk away and arbitrary modded cross-region writes are outside this bound and are not
-     * claimed to be safe.
+     * The block-entity tick slice admits a ticker only when its own chunk is interior: the ticker reads the
+     * container next to it, and a block entity of another region is not readable by a worker, so the read would
+     * silently answer {@code null} instead of the neighbour's value. The chunk tick slice no longer requires it:
+     * a write of a random tick that leaves the region is recorded as a border block write and applied by the
+     * target region in the same tick. This predicate stays the measure of how much of a level is still held
+     * back from the block-entity slice, and the chunk tick plan counts the boundary chunks it dispatches.
      */
     boolean isInteriorRegionChunk(ChunkPos chunkPos) {
         final int regionX = this.layout.regionX(chunkPos.x);
@@ -2546,9 +2569,9 @@ public final class RegionThreadingEngine implements RegionThreading {
     /**
      * {@return true when the chunk tick of a level executes on region workers}
      * <p>
-     * This is the configured request, not the effective dispatch: the profiler, a closing level and the
-     * per-chunk interior and loaded-neighborhood rules still keep work on the server thread, and every
-     * refusal is counted.
+     * This is the configured request, not the effective dispatch: the profiler, a closing level, the
+     * loaded-neighborhood rule, the deferred update budget and a late collection still keep work on the server
+     * thread, and every refusal is counted.
      */
     @ApiStatus.Internal
     public boolean isChunkTickWorkerExecutionEnabled() {
@@ -2769,6 +2792,28 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Lowers the number of border updates one capture pass admits, so a mechanics test can observe the capture
+     * bound without producing {@link RegionBorderUpdates#MAX_ENTRIES} updates.
+     * <p>
+     * The capacity is read when the queue of a level is created, so a test has to call this before the first
+     * update of the level is recorded.
+     *
+     * @param capacity the entries one capture queue admits; must be positive
+     */
+    @ApiStatus.Internal
+    public void setBorderUpdateCapacityForTesting(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("The border update capacity has to admit at least one entry: " + capacity);
+        }
+        this.borderUpdateCapacity = capacity;
+    }
+
+    /** {@return the capture queue of {@code level}, created with the configured capacity} */
+    private RegionBorderUpdates borderQueue(ServerLevel level) {
+        return this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates(this.borderUpdateCapacity));
+    }
+
+    /**
      * Records one neighbor update whose target belongs to another region.
      *
      * @return {@code true} when the caller has to skip the vanilla update
@@ -2818,6 +2863,75 @@ public final class RegionThreadingEngine implements RegionThreading {
             return false;
         }
         return this.recordBorderUpdate(level, new RegionBorderUpdates.BlockEntityChange(pos.immutable()));
+    }
+
+    /**
+     * Records one block write whose position belongs to another region, so the target region runs the vanilla
+     * {@code Level.setBlock} on its own worker at the barrier.
+     * <p>
+     * The record is the whole call - position, state, update flags and recursion budget - so the target region's
+     * block-entity lifecycle, heightmaps, light recheck and neighbour and shape propagation are the vanilla ones
+     * of the write, not a partial replay of it. The recording worker never mutates the target chunk.
+     * <p>
+     * <strong>Read after write.</strong> The write is applied by another region at the barrier, so a callback
+     * that reads the same position again in the same lease observes the state before the write. The position is
+     * remembered in the recording region, so
+     * {@link net.neoforged.neoforge.server.threading.RegionThreadingHooks#observeReadAfterDeferredBlockWrite(BlockPos)}
+     * can count the approximation instead of leaving it silent.
+     * <p>
+     * <strong>Bound.</strong> The capture queue of the fixpoint bounds the records of one pass. A write past the
+     * bound is not queued and this method answers {@code false}: the caller falls back to the worker mutation
+     * guard, which refuses the write with the existing no-replay reason and counts it. Unlike a neighbour update,
+     * an overflowed block write is not handed to the next-tick fallback, because the caller of the write was
+     * told it was accepted and a write that appears a tick later would be a silent difference from inline.
+     *
+     * @return {@code true} when the caller has to skip the inline write and report the call as accepted
+     */
+    @ApiStatus.Internal
+    public boolean deferBorderBlockWrite(ServerLevel level, BlockPos pos, BlockState state, int flags, int recursionLeft) {
+        if (!this.capturesBorderUpdate(level, pos)) {
+            return false;
+        }
+        final RegionBorderUpdates updates = this.borderQueue(level);
+        final BlockPos writePos = pos.immutable();
+        final RegionBorderUpdates.RecordResult result = updates.record(
+                new RegionBorderUpdates.BlockWrite(writePos, state, flags, recursionLeft), false);
+        if (result == RegionBorderUpdates.RecordResult.OVERFLOW) {
+            this.borderUpdatesOverflowed.incrementAndGet();
+            this.borderBlockWritesOverflowed.incrementAndGet();
+            return false;
+        }
+        this.borderUpdatesRecorded.incrementAndGet();
+        this.borderBlockWritesRecorded.incrementAndGet();
+        this.recordDeferredWrite(writePos);
+        return true;
+    }
+
+    /**
+     * Counts one read of a position the current region wrote outside its lease during the current lease.
+     * <p>
+     * Runs on the read path of a foreign chunk of a native region worker, so it costs one context read and one
+     * hash lookup per such read. It never changes the value the read returns: the caller observes the state
+     * before the deferred write, which is the documented approximation.
+     *
+     * @param packedPos the read position, as {@link BlockPos#asLong(int, int, int)}
+     */
+    @ApiStatus.Internal
+    public void observeReadAfterDeferredBlockWrite(long packedPos) {
+        final RegionThreadingContext context = this.currentContext();
+        if (context instanceof BasicRegionThreadingContext basicContext
+                && basicContext.regionState != null
+                && basicContext.regionState.wroteDeferred(packedPos)) {
+            this.readAfterDeferredBlockWrite.incrementAndGet();
+        }
+    }
+
+    /** Remembers one position the current region wrote outside its lease, for the read-after-write count. */
+    private void recordDeferredWrite(BlockPos pos) {
+        final RegionThreadingContext context = this.currentContext();
+        if (context instanceof BasicRegionThreadingContext basicContext && basicContext.regionState != null) {
+            basicContext.regionState.recordDeferredWrite(pos.asLong());
+        }
     }
 
     /**
@@ -2925,7 +3039,7 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     private boolean recordBorderUpdate(ServerLevel level, RegionBorderUpdates.BorderUpdate update) {
-        final RegionBorderUpdates updates = this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates());
+        final RegionBorderUpdates updates = this.borderQueue(level);
         final RegionBorderUpdates.RecordResult result = updates.record(update);
         if (result == RegionBorderUpdates.RecordResult.ACCEPTED) {
             this.borderUpdatesRecorded.incrementAndGet();
@@ -5296,10 +5410,17 @@ public final class RegionThreadingEngine implements RegionThreading {
         return true;
     }
 
-    /** Counts one chunk the plan kept on the server thread because a random tick of it could leave the region. */
+    /**
+     * Counts one chunk of a boundary chunk tick that the plan handed to the region batch.
+     * <p>
+     * A chunk is a boundary chunk when a chunk of its eight-neighbour neighbourhood belongs to another region.
+     * Such a chunk is dispatched since a write of its body that leaves the region is recorded as a border block
+     * write and applied by the target region in the same tick, so the count is the share of the level's chunk
+     * ticks the relaxed rule moved off the server thread. It is not a fallback and does not add to
+     * {@link #fallbackChunkTicks}.
+     */
     void countBoundaryChunkTick() {
         this.boundaryChunkTicks.incrementAndGet();
-        this.fallbackChunkTicks.incrementAndGet();
     }
 
     /** Counts one chunk the plan kept on the server thread because a neighboring chunk is not loaded. */
@@ -7147,7 +7268,12 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.readOfVersionlessChunk.get(),
                         this.foreignReadInvalidatedPasses.get(),
                         this.foreignReadRegionReruns.get(),
-                        this.foreignReadSeedsDropped.get()),
+                        this.foreignReadSeedsDropped.get(),
+                        this.borderBlockWritesRecorded.get(),
+                        this.borderBlockWritesApplied.get(),
+                        this.borderBlockWritesOverflowed.get(),
+                        this.borderBlockWritesDropped.get(),
+                        this.readAfterDeferredBlockWrite.get()),
                 RegionPoiCounters.snapshot(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);

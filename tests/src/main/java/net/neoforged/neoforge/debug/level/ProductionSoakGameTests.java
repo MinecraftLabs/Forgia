@@ -203,7 +203,7 @@ public class ProductionSoakGameTests {
     static final String TICK_HEADER = "ticksChecked,ticksWithActiveBatches,maxActiveBatches,itemChecks,itemMismatches,redstoneTicks,redstoneStates,redstoneTransitions,mappingChecks,mappingMismatches,mappingMismatchesThatSurvivedATick";
     static final String INVARIANT_HEADER = "check,observed,expected,ok";
     static final String ENTITY_HEADER = "category,count";
-    static final String HEARTBEAT_HEADER = "tick,windowTick,mspt,regionCount,regionsBehind,regionP99MeanMs,regionP99MaxMs,entityTicksOnWorkers,blockEntityTicksOnWorkers,chunkTicksOnWorkers,spawnChunksOnWorkers,poiLocalQueries,poiPublishedQueries,borderRecorded,borderApplied,borderDelayed,foreignReads,invalidatedPasses,tickFailures,ownershipViolations,itemCount,entities,contentMobs,heapUsedMiB,foreignWriteRefusals,unstableReadRefusals,rawChunkInternalsAccesses";
+    static final String HEARTBEAT_HEADER = "tick,windowTick,mspt,regionCount,regionsBehind,regionP99MeanMs,regionP99MaxMs,entityTicksOnWorkers,blockEntityTicksOnWorkers,chunkTicksOnWorkers,spawnChunksOnWorkers,poiLocalQueries,poiPublishedQueries,borderRecorded,borderApplied,borderDelayed,foreignReads,invalidatedPasses,tickFailures,ownershipViolations,itemCount,entities,contentMobs,heapUsedMiB,foreignWriteRefusals,unstableReadRefusals,rawChunkInternalsAccesses,boundaryChunkTicks,borderBlockWrites,borderBlockWritesApplied,readAfterBlockWrite";
 
     @GameTest(batch = "productionSoak", timeoutTicks = TIMEOUT_TICKS)
     @EmptyTemplate(value = "15x10x15", floor = true)
@@ -1118,6 +1118,19 @@ public class ProductionSoakGameTests {
                             - (engine.borderUpdates().dropped() - start.borderUpdates().dropped()),
                     0L));
             invariants.add(Invariant.of("foreignChunkReads", engine.borderUpdates().foreignReads() - start.borderUpdates().foreignReads() > 0 ? 1 : 0, 1));
+            // The deferred cross-region block write: the relaxed admission rule hands boundary chunks to workers, and
+            // every write of their bodies that lands in the neighbouring region is recorded here and applied by the
+            // region that owns the position. A recorded write that was neither applied nor counted as dropped would
+            // be a lost block change, so the difference is asserted.
+            final long blockWritesRecorded = engine.borderUpdates().blockWritesRecorded() - start.borderUpdates().blockWritesRecorded();
+            final long blockWritesApplied = engine.borderUpdates().blockWritesApplied() - start.borderUpdates().blockWritesApplied();
+            final long blockWritesDropped = engine.borderUpdates().blockWritesDropped() - start.borderUpdates().blockWritesDropped();
+            final long blockWritesOverflowed = engine.borderUpdates().blockWritesOverflowed() - start.borderUpdates().blockWritesOverflowed();
+            invariants.add(Invariant.of("borderBlockWritesRecorded", blockWritesRecorded > 0 ? 1 : 0, 1));
+            invariants.add(Invariant.of("borderBlockWritesApplied", blockWritesApplied > 0 ? 1 : 0, 1));
+            invariants.add(Invariant.of("borderBlockWritesLost", blockWritesRecorded - blockWritesApplied - blockWritesDropped, 0L));
+            invariants.add(Invariant.of("borderBlockWritesOverflowed", blockWritesOverflowed, 0L));
+            printDispatchRatios(engine, start);
             invariants.add(Invariant.of("droppedDeferredEntityAdditions", engine.droppedDeferredEntityAdditions() - start.droppedDeferredEntityAdditions(), 0L));
             invariants.add(Invariant.of("droppedDeferredEntityRemovals", engine.droppedDeferredEntityRemovals() - start.droppedDeferredEntityRemovals(), 0L));
             // A section update of an entity that was removed between the move and the barrier has nothing left
@@ -1247,6 +1260,49 @@ public class ProductionSoakGameTests {
         } catch (ReflectiveOperationException exception) {
             throw new AssertionError("cannot read the diagnostics counter " + component.getName(), exception);
         }
+    }
+
+    /**
+     * Prints the per-slice dispatch ratio of the window: how much of each slice ran on a region worker and how
+     * much of it kept the server thread.
+     * <p>
+     * The chunk tick row is the measurement of the relaxed admission rule: {@code boundaryChunks} counts the
+     * chunks whose neighbourhood crosses a region border and that the plan dispatched anyway, so the ratio can be
+     * compared with a run of the interior-chunk rule without changing the counters.
+     */
+    private static void printDispatchRatios(RegionThreadingDiagnostics after, RegionThreadingDiagnostics before) {
+        System.out.println("SOAK_DISPATCH_HEADER slice,onWorkers,fallbacks,dispatchedRatio,detail");
+        printDispatchRatio("entityTick", after.entityTicksOnWorkers() - before.entityTicksOnWorkers(),
+                after.fallbackEntityTicks() - before.fallbackEntityTicks(), "");
+        printDispatchRatio("blockEntityTick", after.blockEntityTicksOnWorkers() - before.blockEntityTicksOnWorkers(),
+                after.fallbackBlockEntityTicks() - before.fallbackBlockEntityTicks(),
+                "nonInteriorChunks=" + (after.nonTickingBlockEntityChunks() - before.nonTickingBlockEntityChunks()));
+        printDispatchRatio("chunkTick", after.chunkTicksOnWorkers() - before.chunkTicksOnWorkers(),
+                after.fallbackChunkTicks() - before.fallbackChunkTicks(),
+                "boundaryChunks=" + (after.boundaryChunkTicks() - before.boundaryChunkTicks())
+                        + " unloadedNeighborhood=" + (after.unloadedNeighborhoodChunkTicks() - before.unloadedNeighborhoodChunkTicks())
+                        + " truncated=" + (after.truncatedChunkTicks() - before.truncatedChunkTicks()));
+        printDispatchRatio("spawnChunk", after.spawnChunksOnWorkers() - before.spawnChunksOnWorkers(),
+                after.unleasedSpawnChunks() - before.unleasedSpawnChunks()
+                        + after.lateSpawnChunks() - before.lateSpawnChunks()
+                        + after.deferredUpdateBudgetSpawnChunks() - before.deferredUpdateBudgetSpawnChunks(),
+                "");
+        printDispatchRatio("scheduledTick", after.scheduledTicksOnWorkers() - before.scheduledTicksOnWorkers(),
+                after.fallbackScheduledTicks() - before.fallbackScheduledTicks(), "");
+        final long blockWritesRecorded = after.borderUpdates().blockWritesRecorded() - before.borderUpdates().blockWritesRecorded();
+        final long blockWritesApplied = after.borderUpdates().blockWritesApplied() - before.borderUpdates().blockWritesApplied();
+        System.out.println("SOAK_DISPATCH " + csv("borderBlockWrite",
+                Long.toString(blockWritesApplied), Long.toString(after.borderUpdates().blockWritesDropped() - before.borderUpdates().blockWritesDropped()),
+                fixed(blockWritesRecorded == 0L ? 1.0 : blockWritesApplied / (double) blockWritesRecorded),
+                "recorded=" + blockWritesRecorded
+                        + " overflowed=" + (after.borderUpdates().blockWritesOverflowed() - before.borderUpdates().blockWritesOverflowed())
+                        + " readAfterWrite=" + (after.borderUpdates().readAfterBlockWrite() - before.borderUpdates().readAfterBlockWrite())));
+    }
+
+    private static void printDispatchRatio(String slice, long onWorkers, long fallbacks, String detail) {
+        final long total = onWorkers + fallbacks;
+        System.out.println("SOAK_DISPATCH " + csv(slice, Long.toString(onWorkers), Long.toString(fallbacks),
+                fixed(total == 0L ? 1.0 : onWorkers / (double) total), detail));
     }
 
     /**
@@ -1854,7 +1910,7 @@ public class ProductionSoakGameTests {
                         fixed(mspt), "-1", "-1", "-1", "-1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
                         "0", "0", Long.toString(this.world.itemCount()),
                         Integer.toString(liveLevelEntities(this.level).size()),
-                        Integer.toString(this.world.contentMobs()), Long.toString(heapMiB)));
+                        Integer.toString(this.world.contentMobs()), Long.toString(heapMiB), "0", "0", "0", "0", "0", "0", "0"));
                 return;
             }
             final RegionThreadingDiagnostics value = current.get();
@@ -1894,7 +1950,11 @@ public class ProductionSoakGameTests {
                     Long.toString(heapMiB),
                     Long.toString(net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount()),
                     Long.toString(net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.unstableReadRefusalCount()),
-                    Long.toString(RegionThreadingHooks.rawChunkInternalsAccessCount())));
+                    Long.toString(RegionThreadingHooks.rawChunkInternalsAccessCount()),
+                    Long.toString(value.boundaryChunkTicks() - before.boundaryChunkTicks()),
+                    Long.toString(value.borderUpdates().blockWritesRecorded() - before.borderUpdates().blockWritesRecorded()),
+                    Long.toString(value.borderUpdates().blockWritesApplied() - before.borderUpdates().blockWritesApplied()),
+                    Long.toString(value.borderUpdates().readAfterBlockWrite() - before.borderUpdates().readAfterBlockWrite())));
         }
     }
 
