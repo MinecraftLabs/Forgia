@@ -310,6 +310,32 @@ class RegionBlockEntityTickEligibilityTest {
     }
 
     @Test
+    void unstableReadRefusalIsNeitherWrappedNorReplayedByRealTicker() throws ReflectiveOperationException {
+        this.installEngine();
+        final ServerLevel level = mockEligibilityLevel();
+        completeEntityLoad(attachPendingEntityLoad(level));
+        final LevelChunk chunk = furnaceChunk(level);
+        final FurnaceBlockEntity furnace = furnace(level);
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        final var refusal = net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forUnstableRead(3, 1);
+        final Method createTicker = LevelChunk.class.getDeclaredMethod("createTicker", BlockEntity.class, BlockEntityTicker.class);
+        createTicker.setAccessible(true);
+        final TickingBlockEntity bound = (TickingBlockEntity) createTicker.invoke(chunk, furnace,
+                (BlockEntityTicker<FurnaceBlockEntity>) (world, pos, state, entity) -> {
+                    calls.incrementAndGet();
+                    throw refusal;
+                });
+        assertSame(refusal, assertThrows(net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.class, bound::tick));
+        calls.set(0);
+        final RegionBlockEntityTickPlan plan = plan(level);
+        assertTrue(plan.accept(wrappedTicker(chunk, bound)));
+        plan.executeAndAwait();
+        assertEquals(1, calls.get(), "the interrupted ticker must not run again on the server thread");
+        assertEquals(0L, this.engine.diagnostics().fallbackBlockEntityTicks());
+        assertFalse(furnace.isRemoved());
+    }
+
+    @Test
     void realWrapperAuthorizesOnlyItsCapturedBoundDelegate() throws ReflectiveOperationException {
         this.installEngine();
         final ServerLevel level = mockEligibilityLevel();

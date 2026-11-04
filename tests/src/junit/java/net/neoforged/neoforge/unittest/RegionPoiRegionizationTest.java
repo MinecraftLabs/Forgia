@@ -400,6 +400,88 @@ class RegionPoiRegionizationTest {
         }
     }
 
+    @Test
+    void liveQueryInvokesPredicateOncePerSectionType() {
+        try (Fixture fixture = this.fixture("predicate-order")) {
+            fixture.storage().add(POSITION_IN_A, fixture.type(PoiTypes.HOME));
+            fixture.storage().add(POSITION_IN_A.above(), fixture.type(PoiTypes.HOME));
+            final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+            assertEquals(2, fixture.storage().getInChunk(type -> {
+                calls.incrementAndGet();
+                return true;
+            }, new ChunkPos(POSITION_IN_A), PoiManager.Occupancy.ANY).count());
+            assertEquals(1, calls.get());
+        }
+    }
+
+    @Test
+    void oppositeRegionPredicatesCanTakeTicketsWithoutHoldingLocalLocks() throws Exception {
+        final Fixture fixture = this.fixture("predicate-locks");
+        {
+            fixture.storage().add(POSITION_IN_A, fixture.type(PoiTypes.HOME));
+            fixture.storage().add(POSITION_IN_B, fixture.type(PoiTypes.HOME));
+            fixture.storage().publishLevel();
+            final CountDownLatch predicates = new CountDownLatch(2);
+            final CountDownLatch completed = new CountDownLatch(2);
+            final AtomicReference<Throwable> failure = new AtomicReference<>();
+            for (final BlockPos local : List.of(POSITION_IN_A, POSITION_IN_B)) {
+                final BlockPos foreign = local.equals(POSITION_IN_A) ? POSITION_IN_B : POSITION_IN_A;
+                final Thread worker = new Thread(() -> {
+                    RegionPoiStorage.forceQueryRegionForTesting(fixture.regionAt(local));
+                    try {
+                        fixture.storage().getInChunk(type -> {
+                            predicates.countDown();
+                            try {
+                                assertTrue(predicates.await(5, TimeUnit.SECONDS));
+                            } catch (InterruptedException exception) {
+                                throw new AssertionError(exception);
+                            }
+                            assertEquals(Optional.of(foreign), fixture.storage().take(t -> true, (t, pos) -> true, foreign, 0));
+                            return true;
+                        }, new ChunkPos(local), PoiManager.Occupancy.ANY).toList();
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    } finally {
+                        RegionPoiStorage.forceQueryRegionForTesting(null);
+                        completed.countDown();
+                    }
+                }, "poi-predicate-lock-test");
+                worker.setDaemon(true);
+                worker.start();
+            }
+            assertTrue(completed.await(10, TimeUnit.SECONDS), "opposite-region predicates deadlocked");
+            fixture.close();
+            assertEquals(null, failure.get());
+        }
+    }
+
+    @Test
+    void villageDistanceTracksLiveOccupancyAndSeparatesQueryPerspectives() {
+        for (final boolean ownerFirst : List.of(true, false)) {
+            try (Fixture fixture = this.fixture("distance-" + ownerFirst)) {
+                final Holder<PoiType> home = org.mockito.Mockito.spy(fixture.type(PoiTypes.HOME));
+                when(home.is(net.minecraft.tags.PoiTypeTags.VILLAGE)).thenReturn(true);
+                fixture.storage().add(POSITION_IN_B, home);
+                fixture.storage().publishLevel();
+                final var section = net.minecraft.core.SectionPos.of(POSITION_IN_B);
+                try {
+                    RegionPoiStorage.forceQueryRegionForTesting(fixture.regionAt(POSITION_IN_B));
+                    assertEquals(7, fixture.storage().sectionsToVillage(section));
+                    assertEquals(Optional.of(POSITION_IN_B), fixture.storage().take(type -> true, (type, pos) -> true, POSITION_IN_B, 0));
+                    for (final boolean owner : List.of(ownerFirst, !ownerFirst)) {
+                        RegionPoiStorage.forceQueryRegionForTesting(fixture.regionAt(owner ? POSITION_IN_B : POSITION_IN_A));
+                        assertEquals(owner ? 0 : 7, fixture.storage().sectionsToVillage(section), "unpublished occupancy, owner=" + owner);
+                    }
+                    RegionPoiStorage.forceQueryRegionForTesting(fixture.regionAt(POSITION_IN_B));
+                    fixture.storage().release(POSITION_IN_B);
+                    assertEquals(7, fixture.storage().sectionsToVillage(section), "release is visible without publishing");
+                } finally {
+                    RegionPoiStorage.forceQueryRegionForTesting(null);
+                }
+            }
+        }
+    }
+
     private Optional<CompoundTag> read(Path dir, DataFixer dataFixer, ChunkPos chunk) {
         final SimpleRegionStorage storage = new SimpleRegionStorage(
                 new RegionStorageInfo("test", Level.OVERWORLD, "poi"), dir, dataFixer, false, DataFixTypes.POI_CHUNK);

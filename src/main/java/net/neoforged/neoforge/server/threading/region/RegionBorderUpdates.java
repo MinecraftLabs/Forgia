@@ -7,8 +7,6 @@ package net.neoforged.neoforge.server.threading.region;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
@@ -34,11 +32,9 @@ import org.jetbrains.annotations.ApiStatus;
  * vanilla order. Regions are processed one after another, so an update of the second region sees the writes of
  * the first region of the same pass.
  * <p>
- * <strong>Deduplication.</strong> An identical record captured twice in one pass is applied once. Two records
- * that differ in their type, target, source or payload are distinct updates and both apply; the deduplication
- * only removes a repeated capture of the same vanilla call, never a second call.
+ * Every invocation is retained, including identical payloads: payload equality does not identify a call.
  * <p>
- * <strong>Bound.</strong> One pass records at most {@link #MAX_ENTRIES} distinct updates. The bound is an
+ * <strong>Bound.</strong> One pass records at most {@link #MAX_ENTRIES} updates. The bound is an
  * admission bound of the capture queue: a record past it is not queued and is counted, so the worker that
  * produced it has to hand it to the next-tick fallback instead. In production the fixpoint bound
  * ({@code maxChainedNeighborUpdates}) is reached long before this memory bound.
@@ -53,21 +49,16 @@ final class RegionBorderUpdates {
 
     /** The recorded updates, in the order the worker bodies produced them. */
     private final ConcurrentLinkedQueue<BorderUpdate> updates = new ConcurrentLinkedQueue<>();
-    /** The records currently queued, so a repeated capture of the same call is applied once. */
-    private final Set<BorderUpdate> queued = ConcurrentHashMap.newKeySet();
     /** Records past {@link #MAX_ENTRIES}, kept for the next-tick fallback instead of being applied inline. */
     private final ConcurrentLinkedQueue<BorderUpdate> overflowed = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queuedCount = new AtomicInteger();
     private final AtomicInteger recorded = new AtomicInteger();
-    private final AtomicInteger duplicates = new AtomicInteger();
     private final AtomicInteger overflow = new AtomicInteger();
 
     /** The outcome of one capture. */
     enum RecordResult {
         /** The update is queued for the fixpoint. */
         ACCEPTED,
-        /** The same update was already queued for this pass; it must not be applied twice. */
-        DUPLICATE,
         /** The capture bound is exhausted; the update is kept for the next-tick fallback. */
         OVERFLOW
     }
@@ -77,14 +68,9 @@ final class RegionBorderUpdates {
         return this.updates.isEmpty();
     }
 
-    /** {@return the number of distinct records accepted so far} */
+    /** {@return the number of records accepted so far} */
     int recordedCount() {
         return this.recorded.get();
-    }
-
-    /** {@return the number of repeated captures removed by the deduplication} */
-    int duplicateCount() {
-        return this.duplicates.get();
     }
 
     /** {@return the number of records refused because the capture bound was reached} */
@@ -95,19 +81,14 @@ final class RegionBorderUpdates {
     /**
      * Records one border update.
      * <p>
-     * A repeated capture and an overflow are both consumed: the caller must skip the vanilla body either way,
-     * because the update is already queued or kept for the next-tick fallback. Only the return value tells the
-     * caller which of the three outcomes happened.
+     * Every call is consumed: the caller skips the inline body because the update is queued for this
+     * fixpoint or, after overflow, for the next-tick fallback.
      */
     RecordResult record(BorderUpdate update) {
         if (this.queuedCount.get() >= MAX_ENTRIES) {
             this.overflow.incrementAndGet();
             this.overflowed.add(update);
             return RecordResult.OVERFLOW;
-        }
-        if (!this.queued.add(update)) {
-            this.duplicates.incrementAndGet();
-            return RecordResult.DUPLICATE;
         }
         this.updates.add(update);
         this.queuedCount.incrementAndGet();
@@ -129,15 +110,13 @@ final class RegionBorderUpdates {
      * Hands every recorded update to the caller in recording order and empties the queue.
      * <p>
      * Runs on the server thread after the worker phase, when no worker can record anymore, so the
-     * deduplication set and the queue cannot be mutated while the list is built.
+     * queue cannot be mutated while the list is built.
      */
     List<BorderUpdate> drain() {
         final List<BorderUpdate> drained = new ArrayList<>(this.updates.size());
         BorderUpdate update;
         while ((update = this.updates.poll()) != null) {
-            if (this.queued.remove(update)) {
-                this.queuedCount.decrementAndGet();
-            }
+            this.queuedCount.decrementAndGet();
             drained.add(update);
         }
         return drained;
@@ -146,7 +125,6 @@ final class RegionBorderUpdates {
     /** Drops every queued update, counting nothing: the caller owns the count of a closed level. */
     void discard() {
         this.updates.clear();
-        this.queued.clear();
         this.queuedCount.set(0);
         this.overflowed.clear();
     }

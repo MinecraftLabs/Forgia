@@ -187,7 +187,7 @@ class RegionForeignChunkReadVersionTest {
         assertEquals(1, ticked.get(), "the tick has to run");
         final RegionThreadingDiagnostics.BorderUpdateCounters counters = this.engine.diagnostics().borderUpdates();
         assertEquals(0L, counters.foreignReads(), "a read inside the region is not a foreign read: " + counters);
-        assertEquals(0L, counters.foreignReadsWithoutVersion(), "no read had to be left unverified: " + counters);
+        assertEquals(0L, counters.readOfVersionlessChunk(), "no read had to be left unverified: " + counters);
         assertEquals(0L, counters.invalidatedPasses(), "a quiet region invalidates nothing: " + counters);
         assertEquals(0L, counters.regionsRerunByReads(), "a quiet region is not re-run: " + counters);
         assertEquals(0L, counters.rerunSeedsDropped(), "no seed bound was reached: " + counters);
@@ -221,7 +221,12 @@ class RegionForeignChunkReadVersionTest {
             level.getBlockState(WRITER_POS);
             // Flags 18: the client update only, so the write notifies no neighbour and sends no shape update; the
             // re-run changes the version of the foreign chunk and nothing else.
-            level.setBlock(WRITER_POS, (written.getAndIncrement() & 1) == 0 ? Blocks.STONE.defaultBlockState() : Blocks.DIRT.defaultBlockState(), 18);
+            // An independent writer changes the dependency while the reader is paused. The reader may no
+            // longer mutate a foreign chunk itself: that is now refused by the ownership guarantee.
+            final Thread writer = Thread.ofVirtual().start(() -> chunks.get(WRITER_CHUNK.toLong()).setBlockState(
+                    WRITER_POS, (written.getAndIncrement() & 1) == 0 ? Blocks.STONE.defaultBlockState() : Blocks.DIRT.defaultBlockState(), false));
+            writer.join(5000);
+            assertFalse(writer.isAlive(), "dependency writer must complete");
             return null;
         }).when(readerState).handleNeighborChanged(any(), any(), any(), any(), anyBoolean());
         doReturn(readerState).when(level).getBlockState(READER_POS);
@@ -360,12 +365,156 @@ class RegionForeignChunkReadVersionTest {
     // ---------------------------------------------------------------------------------------------------------
 
     /** One reader that reads across the border and one writer that mutates the chunk it read, in the same tick. */
+    @Test
+    void versionedUnownedChunkRemainsReadable() {
+        final ServerLevel level = this.mockLevel();
+        final Map<Long, LevelChunk> chunks = new HashMap<>();
+        chunks.put(READER_CHUNK.toLong(), realChunk(level, READER_CHUNK));
+        final ChunkPos unowned = new ChunkPos(9, 0);
+        final LevelChunk foreign = realChunk(level, unowned);
+        chunks.put(unowned.toLong(), foreign);
+        serveChunks(level, chunks);
+        this.installEngine(level, true);
+        final LevelTicks<Block> ticks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
+        ticks.addContainer(READER_CHUNK, new LevelChunkTicks<>());
+        ticks.schedule(new ScheduledTick<>(Blocks.STONE, READER_POS, 1L, TickPriority.NORMAL, 0L));
+        final AtomicInteger completed = new AtomicInteger();
+        ticks.tick(1L, 65536, (pos, block) -> {
+            assertTrue(level.getBlockState(new BlockPos(144, Y, 0)).isAir());
+            completed.incrementAndGet();
+        }, this.engine.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, PARKING_BARRIER));
+        assertEquals(1, completed.get());
+        assertTrue(this.engine.diagnostics().borderUpdates().readOfUnownedChunk() > 0);
+        assertEquals(0L, this.engine.diagnostics().borderUpdates().readOfVersionlessChunk());
+    }
+
+    @Test
+    void versionlessNativeReadIsRefusedWithoutReplayingTheBody() {
+        final ServerLevel level = this.mockLevel();
+        final Map<Long, LevelChunk> chunks = new HashMap<>();
+        chunks.put(READER_CHUNK.toLong(), realChunk(level, READER_CHUNK));
+        serveChunks(level, chunks);
+        this.installEngine(level, true);
+        final LevelTicks<Block> ticks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
+        ticks.addContainer(READER_CHUNK, new LevelChunkTicks<>());
+        ticks.schedule(new ScheduledTick<>(Blocks.STONE, READER_POS, 1L, TickPriority.NORMAL, 0L));
+        final AtomicInteger before = new AtomicInteger();
+        final AtomicInteger after = new AtomicInteger();
+        final var proto = mock(net.minecraft.world.level.chunk.ProtoChunk.class);
+        ticks.tick(1L, 65536, (pos, block) -> {
+            before.incrementAndGet();
+            RegionThreadingHooks.recordForeignChunkRead(level, WRITER_CHUNK.x, WRITER_CHUNK.z, proto);
+            after.incrementAndGet();
+        }, this.engine.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, PARKING_BARRIER));
+        assertEquals(1, before.get());
+        assertEquals(0, after.get());
+        assertEquals(1L, this.engine.diagnostics().borderUpdates().readOfVersionlessChunk());
+        assertEquals(0L, this.engine.diagnostics().borderUpdates().readOfUnownedChunk());
+    }
+
+    @Test
+    void unstableForeignReadAbandonsScheduledBodyWithoutReplay() {
+        final ServerLevel level = this.mockLevel();
+        final Map<Long, LevelChunk> chunks = new HashMap<>();
+        final LevelChunk foreign = realChunk(level, WRITER_CHUNK);
+        chunks.put(READER_CHUNK.toLong(), realChunk(level, READER_CHUNK));
+        chunks.put(WRITER_CHUNK.toLong(), foreign);
+        serveChunks(level, chunks);
+        this.installEngine(level, true);
+        final LevelTicks<Block> ticks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
+        ticks.addContainer(READER_CHUNK, new LevelChunkTicks<>());
+        ticks.schedule(new ScheduledTick<>(Blocks.STONE, READER_POS, 1L, TickPriority.NORMAL, 0L));
+        final AtomicInteger before = new AtomicInteger();
+        final AtomicInteger after = new AtomicInteger();
+        final long refused = net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.unstableReadRefusalCount();
+        foreign.beginChunkMutation();
+        try {
+            assertEquals(1L, foreign.chunkVersion() & 1L);
+            ticks.tick(1L, 65536, (pos, block) -> {
+                before.incrementAndGet();
+                level.getBlockState(WRITER_POS);
+                after.incrementAndGet();
+            }, this.engine.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, PARKING_BARRIER));
+        } finally {
+            foreign.endChunkMutation();
+        }
+        assertEquals(1, before.get(), "partial effects must not be replayed");
+        assertEquals(0, after.get(), "an unstable value must not reach the callback");
+        assertEquals(refused + 1, net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.unstableReadRefusalCount());
+        assertEquals(0L, foreign.chunkVersion() & 1L);
+    }
+
+    @Test
+    void stableForeignReadRetriesWhenMutationOverlapsTheRead() {
+        final ServerLevel level = this.mockLevel();
+        final LevelChunk chunk = realChunk(level, WRITER_CHUNK);
+        final AtomicInteger reads = new AtomicInteger();
+        final BlockState state = RegionThreadingHooks.readStableForeignChunk(chunk, () -> {
+            final BlockState observed = chunk.getBlockState(WRITER_POS);
+            if (reads.incrementAndGet() == 1) {
+                chunk.setBlockState(WRITER_POS, Blocks.STONE.defaultBlockState(), false);
+            }
+            return observed;
+        });
+        assertTrue(state.is(Blocks.STONE), "discard the value read during a version change");
+        assertEquals(2, reads.get());
+    }
+
+    @Test
+    void interiorChunkCallbackCannotMutateForeignChunk() {
+        final ServerLevel level = this.mockLevel();
+        final ChunkPos interior = new ChunkPos(1, 1);
+        final ChunkPos foreign = new ChunkPos(3, 1);
+        final BlockPos target = new BlockPos(48, Y, 16);
+        final Map<Long, LevelChunk> chunks = new HashMap<>();
+        for (int x = 0; x <= 5; x++) {
+            for (int z = 0; z < 3; z++) {
+                final ChunkPos pos = new ChunkPos(x, z);
+                chunks.put(pos.toLong(), realChunk(level, pos));
+            }
+        }
+        serveChunks(level, chunks);
+        this.engine = new RegionThreadingEngine(2, false, false, false, false, false, true, FIXED);
+        this.engine.enableUnclassifiedWorkerCallbacksForTesting();
+        RegionThreadingManager.install(this.engine);
+        for (final LevelChunk chunk : chunks.values()) {
+            this.engine.addRegionSection(level, chunk.getPos().x, chunk.getPos().z);
+        }
+        final long refusals = net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount();
+        final AtomicInteger calls = new AtomicInteger();
+        doAnswer(invocation -> {
+            calls.incrementAndGet();
+            assertTrue(RegionThreadingHooks.isNativeRegionWorkerThread());
+            assertFalse(level.setBlock(target, Blocks.STONE.defaultBlockState(), 2));
+            return null;
+        }).when(level).tickChunk(any(LevelChunk.class), anyInt());
+        final var plan = this.engine.beginChunkTickPlan(level, 3, PARKING_BARRIER);
+        plan.accept(chunks.get(interior.toLong()));
+        plan.executeAndAwait(PARKING_BARRIER);
+        assertEquals(1, calls.get(), "the callback must not be replayed");
+        assertTrue(chunks.get(foreign.toLong()).getBlockState(target).isAir());
+        assertEquals(refusals + 1, net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount());
+    }
+
     private Race runRace(boolean versionCheck) {
+        return this.runRace(versionCheck, false);
+    }
+
+    @Test
+    void staleDecisionWithNoWriteStillReevaluatesItsOrigin() {
+        final Race race = this.runRace(true, true);
+        assertEquals(LIT, race.finalReaderState, race.diagnostics());
+    }
+
+    private Race runRace(boolean versionCheck, boolean initiallyUnlit) {
         final ServerLevel level = this.mockLevel();
         final Map<Long, LevelChunk> chunks = new HashMap<>();
         chunks.put(READER_CHUNK.toLong(), realChunk(level, READER_CHUNK));
         chunks.put(WRITER_CHUNK.toLong(), realChunk(level, WRITER_CHUNK));
         serveChunks(level, chunks);
+        if (initiallyUnlit) {
+            level.setBlock(READER_POS, lamp(false), 2);
+        }
         this.installEngine(level, versionCheck);
         final LevelTicks<Block> blockTicks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
         blockTicks.addContainer(READER_CHUNK, new LevelChunkTicks<>());

@@ -338,16 +338,16 @@ public record RegionThreadingDiagnostics(
      * growing {@code delayed} count is the only observable sign that a circuit needed more than one tick.
      * <p>
      * The foreign read counters cover the version check of a cross-region read. {@code foreignReads} counts the
-     * chunks a region read from another region, one per chunk and region and pass, {@code foreignReadsWithoutVersion}
-     * the reads of a chunk that has no version - a proto chunk, or a chunk no region owns - which keep the
-     * behaviour they had before the check. {@code invalidatedPasses} counts the fixpoint checks in which a region
+     * chunks a region read from another region, one per chunk and region and pass. {@code readOfUnownedChunk}
+     * counts reads of versioned chunks with no owning region; {@code readOfVersionlessChunk} counts refused
+     * native-worker reads of chunks without a seqlock, such as proto chunks. {@code invalidatedPasses} counts the fixpoint checks in which a region
      * observed a changed version of a chunk it read, {@code regionsRerunByReads} the region propagation groups
      * re-run because of one, and {@code rerunSeedsDropped} the written positions the seed bound refused, which a
      * re-run of that region does not re-evaluate. {@code worstPasses} bounds the re-runs too, because a re-run
      * needs a pass of its own.
      */
     public record BorderUpdateCounters(long recorded, long applied, long delayed, long dropped, long passes,
-            long regionsRerun, long worstPasses, long overflowed, long foreignReads, long foreignReadsWithoutVersion,
+            long regionsRerun, long worstPasses, long overflowed, long foreignReads, long readOfUnownedChunk, long readOfVersionlessChunk,
             long invalidatedPasses, long regionsRerunByReads, long rerunSeedsDropped) {
         @Override
         public String toString() {
@@ -360,7 +360,8 @@ public record RegionThreadingDiagnostics(
                     + "/worstPasses=" + this.worstPasses
                     + "/overflowed=" + this.overflowed
                     + "/foreignReads=" + this.foreignReads
-                    + "/foreignReadsWithoutVersion=" + this.foreignReadsWithoutVersion
+                    + "/readOfUnownedChunk=" + this.readOfUnownedChunk
+                    + "/readOfVersionlessChunk=" + this.readOfVersionlessChunk
                     + "/invalidatedPasses=" + this.invalidatedPasses
                     + "/regionsRerunByReads=" + this.regionsRerunByReads
                     + "/rerunSeedsDropped=" + this.rerunSeedsDropped;

@@ -274,14 +274,7 @@ final class RegionPoiRegion {
     }
 
     boolean exists(BlockPos pos, Predicate<Holder<PoiType>> typeFilter) {
-        final long sectionKey = SectionPos.asLong(pos);
-        this.lock.lock();
-        try {
-            final PoiSection section = this.sections.get(sectionKey);
-            return section != null && section.exists(pos, typeFilter);
-        } finally {
-            this.lock.unlock();
-        }
+        return this.getType(pos).filter(typeFilter).isPresent();
     }
 
     int getFreeTickets(BlockPos pos) {
@@ -303,29 +296,34 @@ final class RegionPoiRegion {
      * same data.
      */
     List<PoiRecord> liveChunk(ChunkPos chunk, Predicate<Holder<PoiType>> typeFilter, PoiManager.Occupancy occupancy) {
+        final List<TypeRecords> snapshots = new ArrayList<>();
         this.lock.lock();
         try {
-            List<PoiRecord> records = List.of();
             for (int sectionY = this.storage.minSection(); sectionY < this.storage.maxSection(); sectionY++) {
                 final PoiSection section = this.sections.get(SectionPos.asLong(chunk.x, sectionY, chunk.z));
                 if (section == null) {
                     continue;
                 }
-                final List<PoiRecord> sectionRecords = section.getRecords(typeFilter, occupancy).toList();
-                if (sectionRecords.isEmpty()) {
-                    continue;
-                }
-                if (records.isEmpty()) {
-                    records = new ArrayList<>(sectionRecords);
-                } else {
-                    records.addAll(sectionRecords);
-                }
+                // Capture each type even when occupancy selects no records. Vanilla invokes the type
+                // predicate once per section/type, not once per matching record.
+                section.getRecords(type -> {
+                    snapshots.add(new TypeRecords(type, new ArrayList<>()));
+                    return true;
+                }, occupancy).forEach(record -> snapshots.getLast().records().add(record));
             }
-            return records;
         } finally {
             this.lock.unlock();
         }
+        final List<PoiRecord> records = new ArrayList<>();
+        for (final TypeRecords snapshot : snapshots) {
+            if (typeFilter.test(snapshot.type())) {
+                records.addAll(snapshot.records());
+            }
+        }
+        return records;
     }
+
+    private record TypeRecords(Holder<PoiType> type, List<PoiRecord> records) {}
 
     /**
      * {@return the records of {@code chunk} in vanilla's order, read from the published views}
@@ -437,7 +435,6 @@ final class RegionPoiRegion {
             if (!this.publishPending) {
                 return;
             }
-            final Set<Long> previousCenters = this.published.villageCenters();
             final Map<Long, RegionPoiSections> views = new HashMap<>(this.published.sections());
             for (final long sectionKey : this.dirtySections) {
                 final PoiSection section = this.sections.get(sectionKey);
@@ -448,11 +445,7 @@ final class RegionPoiRegion {
             final Set<Long> centers = Set.copyOf(this.villageCenters);
             this.published = new Published(views, Set.copyOf(this.knownColumns), centers, ++this.publishVersion);
             RegionPoiCounters.recordPublish();
-            if (!centers.equals(previousCenters)) {
-                // The village distance cache is invalidated after the new centers are installed, so a query
-                // that races this publish either recomputes or is not cached against the old centers.
-                this.storage.centerVersionChanged();
-            }
+
         } finally {
             this.lock.unlock();
         }

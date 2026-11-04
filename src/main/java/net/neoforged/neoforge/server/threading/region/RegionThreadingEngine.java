@@ -263,8 +263,10 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final Map<ServerLevel, Set<RegionState>> regionsWithForeignReads = new ConcurrentHashMap<>();
     /** Foreign chunk reads a region recorded, i.e. one per chunk and region and pass. */
     private final AtomicLong foreignChunkReads = new AtomicLong();
-    /** Foreign chunk reads of a chunk without a version, i.e. of a chunk no region owns or of a proto chunk. */
-    private final AtomicLong foreignChunkReadsWithoutVersion = new AtomicLong();
+    /** Stable reads of a versioned chunk that no region owns. */
+    private final AtomicLong readOfUnownedChunk = new AtomicLong();
+    /** Native-worker requests refused because their chunk has no seqlock version. */
+    private final AtomicLong readOfVersionlessChunk = new AtomicLong();
     /** Fixpoint checks in which a region observed a changed version of a foreign chunk it read. */
     private final AtomicLong foreignReadInvalidatedPasses = new AtomicLong();
     /** Region propagation groups the fixpoint re-ran because a foreign read was invalidated. */
@@ -470,6 +472,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * else and the vanilla level random stays authoritative outside a batch.
      */
     private final ThreadLocal<RandomSource> currentScheduledTickRandom = new ThreadLocal<>();
+    /** The propagation decision to revisit on a foreign read, even when the decision writes nothing. */
+    private final ThreadLocal<BlockPos> currentPropagationOrigin = new ThreadLocal<>();
     /**
      * Server-owned mutation queue of the region tick group executing on the current thread. It is only
      * set for the duration of a worker group; the server thread drains it after the phase, so a worker
@@ -926,8 +930,7 @@ public final class RegionThreadingEngine implements RegionThreading {
      * lock-free; this method only adds a map entry.
      * <p>
      * A chunk no region owns cannot change under the read, and a chunk without a version - a proto chunk of
-     * another status - cannot be verified. Both keep the behaviour they had before this check existed and are
-     * counted.
+     * another status - cannot be verified and is refused without replay. These cases have separate counters.
      *
      * @param chunkX  the chunk x of the chunk that is handed to the worker
      * @param chunkZ  the chunk z of the chunk that is handed to the worker
@@ -945,18 +948,23 @@ public final class RegionThreadingEngine implements RegionThreading {
             return;
         }
         final RegionState region = basicContext.regionState;
+        if (version < 0L) {
+            this.recordVersionlessChunkRead();
+            throw RegionWorkerChunkUnavailableException.forVersionlessRead(chunkX, chunkZ);
+        }
         if (this.ownsChunk(level, chunkX, chunkZ, basicContext, region)) {
             return;
         }
         if (this.regionizer.get(this.layout.regionAt(level, chunkX, chunkZ)) == null) {
             // No region owns the chunk, so no region mutates it and no version can change under the read. The read
             // keeps the behaviour it had before this check and is counted.
-            this.foreignChunkReadsWithoutVersion.incrementAndGet();
+            this.readOfUnownedChunk.incrementAndGet();
             return;
         }
-        if (version < 0L) {
-            this.foreignChunkReadsWithoutVersion.incrementAndGet();
-            return;
+        final BlockPos origin = this.currentPropagationOrigin.get();
+        if (origin != null) {
+            region.recordRerunSeed(origin.asLong());
+            this.currentPropagationOrigin.remove();
         }
         if (region.recordForeignChunkRead(ChunkPos.asLong(chunkX, chunkZ), version)) {
             this.foreignChunkReads.incrementAndGet();
@@ -1513,10 +1521,10 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * Checks the foreign chunks {@code region} read since its last check and builds the propagation it has to
-     * re-run, then forgets both the reads and the written positions of the region.
+     * re-run, then forgets both the reads and the reevaluation origins of the region.
      * <p>
      * The re-run payload is the propagation the region already ran - the updates it applied in this pass - plus a
-     * re-evaluation of every position it wrote, as a self-directed neighbour update. A block that decided its
+     * re-evaluation of propagation origins and written positions, as self-directed neighbour updates. A block that decided its
      * state from a foreign read therefore decides it again, against the state the read reports now, without
      * repeating any entity, block-entity, chunk or spawn work.
      *
@@ -1694,7 +1702,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                     try {
                         this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
                             for (final RegionBorderUpdates.BorderUpdate update : updates) {
-                                update.apply(level);
+                                this.currentPropagationOrigin.set(update.pos());
+                                try {
+                                    update.apply(level);
+                                } catch (Throwable throwable) {
+                                    if (!RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
+                                        throw throwable;
+                                    }
+                                } finally {
+                                    this.currentPropagationOrigin.remove();
+                                }
                                 this.borderUpdatesApplied.incrementAndGet();
                             }
                         });
@@ -2844,10 +2861,16 @@ public final class RegionThreadingEngine implements RegionThreading {
         return this.foreignChunkReads.get();
     }
 
-    /** {@return the foreign chunk reads of a chunk that has no version, i.e. of a chunk no region owns} */
+    /** {@return reads of versioned chunks that no region owns} */
     @ApiStatus.Internal
-    public long foreignChunkReadsWithoutVersion() {
-        return this.foreignChunkReadsWithoutVersion.get();
+    public long readOfUnownedChunk() {
+        return this.readOfUnownedChunk.get();
+    }
+
+    /** Counts a versionless native-worker read refused before returning chunk data. */
+    @ApiStatus.Internal
+    public void recordVersionlessChunkRead() {
+        this.readOfVersionlessChunk.incrementAndGet();
     }
 
     /** {@return the fixpoint checks in which a region observed a changed version of a foreign chunk} */
@@ -3791,6 +3814,9 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
             return false;
         }
+        if (RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
+            return true;
+        }
         group.batch().addChunkFallback(entity);
         this.chunkFallbackEntityTicks.incrementAndGet();
         return true;
@@ -4192,9 +4218,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                                             this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
                                             return;
                                         }
-                                        group.batch().addFallback(admission);
-                                        this.fallbackBlockEntityTicks.incrementAndGet();
-                                        RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE, 1);
+                                        if (!RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
+                                            group.batch().addFallback(admission);
+                                            this.fallbackBlockEntityTicks.incrementAndGet();
+                                            RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE, 1);
+                                        }
                                         continue;
                                     }
                                     if (tickerTiming) {
@@ -4486,8 +4514,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
                         for (final ScheduledTick<T> tick : ticks) {
                             try {
-                                callback.accept(tick.pos(), tick.type());
+                                this.currentPropagationOrigin.set(tick.pos());
+                                try {
+                                    callback.accept(tick.pos(), tick.type());
+                                } finally {
+                                    this.currentPropagationOrigin.remove();
+                                }
                             } catch (Throwable throwable) {
+                                if (RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
+                                    continue;
+                                }
                                 // The failure is recorded for the server thread instead of failing the group with
                                 // it; the group stops at its first failing tick, like every other worker group.
                                 this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
@@ -7107,7 +7143,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.borderUpdateWorstPasses.get(),
                         this.borderUpdatesOverflowed.get(),
                         this.foreignChunkReads.get(),
-                        this.foreignChunkReadsWithoutVersion.get(),
+                        this.readOfUnownedChunk.get(),
+                        this.readOfVersionlessChunk.get(),
                         this.foreignReadInvalidatedPasses.get(),
                         this.foreignReadRegionReruns.get(),
                         this.foreignReadSeedsDropped.get()),

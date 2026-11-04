@@ -76,7 +76,8 @@ public final class RegionChunkTickPlan {
         final ChunkPos chunkPos = chunk.getPos();
         if (!this.engine.isInteriorRegionChunk(chunkPos)) {
             // A random tick of a boundary chunk can write into the neighboring region, so the chunk keeps the
-            // server-thread body: the one-chunk bound of the interior rule is what makes a worker write safe.
+            // server-thread body. Interior admission is a cheap pre-filter; the unconditional mutation
+            // ownership guard is the guarantee when a callback writes farther than one chunk.
             this.engine.countBoundaryChunkTick();
             this.engine.tickChunkInline(this.level, chunk, this.randomTickSpeed);
             return;

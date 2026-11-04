@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
-@@ -73,6 +_,24 @@
+@@ -73,6 +_,25 @@
          }
      };
      private final Map<BlockPos, LevelChunk.RebindableTickingBlockEntityWrapper> tickersInLevel = Maps.newHashMap();
@@ -22,6 +22,7 @@
 +     * version when nothing reads it.
 +     */
 +    private volatile long chunkVersion;
++    private int chunkMutationDepth;
      private boolean loaded;
      final Level level;
      @Nullable
@@ -33,6 +34,56 @@
          for (Entry<Heightmap.Types, Heightmap> entry : p_196851_.getHeightmaps()) {
              if (ChunkStatus.FULL.heightmapsAfter().contains(entry.getKey())) {
                  this.setHeightmap(entry.getKey(), entry.getValue().getRawData());
+@@ -175,6 +_,13 @@
+ 
+     @Override
+     public BlockState getBlockState(BlockPos p_62923_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.readStableForeignChunk(this, () -> this.getBlockStateUnchecked(p_62923_));
++        }
++        return this.getBlockStateUnchecked(p_62923_);
++    }
++
++    private BlockState getBlockStateUnchecked(BlockPos p_62923_) {
+         int i = p_62923_.getX();
+         int j = p_62923_.getY();
+         int k = p_62923_.getZ();
+@@ -215,6 +_,13 @@
+     }
+ 
+     public FluidState getFluidState(int p_62815_, int p_62816_, int p_62817_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.readStableForeignChunk(this, () -> this.getFluidStateUnchecked(p_62815_, p_62816_, p_62817_));
++        }
++        return this.getFluidStateUnchecked(p_62815_, p_62816_, p_62817_);
++    }
++
++    private FluidState getFluidStateUnchecked(int p_62815_, int p_62816_, int p_62817_) {
+         try {
+             int i = this.getSectionIndex(p_62816_);
+             if (i >= 0 && i < this.sections.length) {
+@@ -236,6 +_,21 @@
+     @Nullable
+     @Override
+     public BlockState setBlockState(BlockPos p_62865_, BlockState p_62866_, boolean p_62867_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return null;
++        }
++        if (this.getBlockState(p_62865_) == p_62866_) {
++            return null;
++        }
++        this.beginChunkMutation();
++        try {
++            return this.setBlockStateUnderMutation(p_62865_, p_62866_, p_62867_);
++        } finally {
++            this.endChunkMutation();
++        }
++    }
++
++    private BlockState setBlockStateUnderMutation(BlockPos p_62865_, BlockState p_62866_, boolean p_62867_) {
+         int i = p_62865_.getY();
+         LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
+         boolean flag = levelchunksection.hasOnlyAir();
 @@ -256,7 +_,11 @@
                  this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
                  boolean flag1 = levelchunksection.hasOnlyAir();
@@ -59,11 +110,8 @@
                      profilerfiller.pop();
                  }
  
-@@ -276,9 +_,10 @@
-                 }
- 
+@@ -278,7 +_,7 @@
                  if (!levelchunksection.getBlockState(j, k, l).is(block)) {
-+                    ++this.chunkVersion;
                      return null;
                  } else {
 -                    if (!this.level.isClientSide) {
@@ -71,17 +119,23 @@
                          p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
                      }
  
-@@ -301,6 +_,7 @@
-                     }
+@@ -326,7 +_,24 @@
  
-                     this.unsaved = true;
-+                    ++this.chunkVersion;
-                     return blockstate;
-                 }
-             }
-@@ -327,6 +_,10 @@
      @Nullable
      public BlockEntity getBlockEntity(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, p_62868_)) {
++                return null;
++            }
++            BlockEntity existing = this.blockEntities.get(p_62868_);
++            // A foreign lookup must not promote pending NBT or remove an entry from this chunk.
++            if ((existing != null && existing.isRemoved()) || this.pendingBlockEntities.containsKey(p_62868_)
++                    || (existing == null && p_62869_ == LevelChunk.EntityCreationType.IMMEDIATE)) {
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this);
++                return null;
++            }
++            return existing;
++        }
          BlockEntity blockentity = this.blockEntities.get(p_62868_);
 +        if (blockentity != null && blockentity.isRemoved()) {
 +            blockEntities.remove(p_62868_);
@@ -90,7 +144,7 @@
          if (blockentity == null) {
              CompoundTag compoundtag = this.pendingBlockEntities.remove(p_62868_);
              if (compoundtag != null) {
-@@ -344,9 +_,6 @@
+@@ -344,15 +_,15 @@
                      this.addAndRegisterBlockEntity(blockentity);
                  }
              }
@@ -100,6 +154,15 @@
          }
  
          return blockentity;
+     }
+ 
+     public void addAndRegisterBlockEntity(BlockEntity p_156391_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
+         this.setBlockEntity(p_156391_);
+         if (this.isInLevel()) {
+             if (this.level instanceof ServerLevel serverlevel) {
 @@ -360,6 +_,7 @@
              }
  
@@ -108,7 +171,7 @@
          }
      }
  
-@@ -368,12 +_,22 @@
+@@ -368,17 +_,39 @@
      }
  
      boolean isTicking(BlockPos p_156411_) {
@@ -132,16 +195,31 @@
          }
      }
  
-@@ -403,7 +_,9 @@
+     @Override
+     public void setBlockEntity(BlockEntity p_156374_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            this.setBlockEntityUnderMutation(p_156374_);
++        } finally {
++            this.endChunkMutation();
++        }
++    }
++
++    private void setBlockEntityUnderMutation(BlockEntity p_156374_) {
+         BlockPos blockpos = p_156374_.getBlockPos();
+         BlockState blockstate = this.getBlockState(blockpos);
+         if (!blockstate.hasBlockEntity()) {
+@@ -403,6 +_,7 @@
              BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
              if (blockentity != null && blockentity != p_156374_) {
                  blockentity.setRemoved();
 +                auxLightManager.removeLightAt(blockpos);
              }
-+            ++this.chunkVersion;
          }
      }
- 
 @@ -412,9 +_,14 @@
      public CompoundTag getBlockEntityNbtForSaving(BlockPos p_62932_, HolderLookup.Provider p_323699_) {
          BlockEntity blockentity = this.getBlockEntity(p_62932_);
@@ -157,15 +235,35 @@
          } else {
              CompoundTag compoundtag = this.pendingBlockEntities.get(p_62932_);
              if (compoundtag != null) {
-@@ -436,6 +_,8 @@
+@@ -428,6 +_,18 @@
+ 
+     @Override
+     public void removeBlockEntity(BlockPos p_62919_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            this.removeBlockEntityUnderMutation(p_62919_);
++        } finally {
++            this.endChunkMutation();
++        }
++    }
++
++    private void removeBlockEntityUnderMutation(BlockPos p_62919_) {
+         if (this.isInLevel()) {
+             BlockEntity blockentity = this.blockEntities.remove(p_62919_);
+             if (blockentity != null) {
+@@ -436,7 +_,8 @@
                  }
  
                  blockentity.setRemoved();
+-            }
 +                auxLightManager.removeLightAt(p_62919_);
-+                ++this.chunkVersion;
-             }
++                }
          }
  
+         this.removeBlockEntityTicker(p_62919_);
 @@ -459,9 +_,16 @@
      }
  
@@ -192,12 +290,23 @@
              }
          });
      }
-@@ -604,6 +_,15 @@
+@@ -604,6 +_,26 @@
      }
  
      public void clearAllBlockEntities() {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            this.clearAllBlockEntitiesUnderMutation();
++        } finally {
++            this.endChunkMutation();
++        }
++    }
++
++    private void clearAllBlockEntitiesUnderMutation() {
 +        ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
-+        ++this.chunkVersion; // Neo: every block entity of this chunk is gone
 +        // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
 +        // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
 +        // plan's chunk index.
@@ -224,7 +333,7 @@
          BlockState blockstate = p_156407_.getBlockState();
          BlockEntityTicker<T> blockentityticker = blockstate.getTicker(this.level, (BlockEntityType<T>)p_156407_.getType());
          if (blockentityticker == null) {
-@@ -656,33 +_,160 @@
+@@ -656,33 +_,175 @@
                      }
                  );
          }
@@ -293,8 +402,9 @@
 +    }
 +
 +    /**
-+     * Neo: the monotonic version of the mutable content of this chunk, bumped once per completed block state,
-+     * heightmap or block-entity mutation.
++     * Neo: a seqlock sequence: odd throughout block state, heightmap and block-entity membership mutations,
++     * even after completion. Nested writes keep the outer mutation odd. Mutable block-entity internals are
++     * not covered; foreign block-entity access still requires a quiescent owner.
 +     * <p>
 +     * A region worker that reads a chunk of another region records this value. The border fixpoint compares it
 +     * after the read and re-runs the propagation of the reader if the chunk changed under the read, so a torn
@@ -303,6 +413,20 @@
 +     */
 +    public long chunkVersion() {
 +        return this.chunkVersion;
++    }
++
++    /** Neo: paired by mutation entry points, including nested heightmap and block-entity writes. */
++    public void beginChunkMutation() {
++        if (this.chunkMutationDepth++ == 0) {
++            ++this.chunkVersion;
++            java.lang.invoke.VarHandle.storeStoreFence();
++        }
++    }
++
++    public void endChunkMutation() {
++        if (--this.chunkMutationDepth == 0) {
++            ++this.chunkVersion;
++        }
 +    }
 +
 +    /** Neo: whether this chunk is currently loaded in its level. */
@@ -387,7 +511,15 @@
                              this.loggedInvalidBlockState = false;
                          } else if (!this.loggedInvalidBlockState) {
                              this.loggedInvalidBlockState = true;
-@@ -700,7 +_,15 @@
+@@ -697,10 +_,23 @@
+ 
+                         profilerfiller.pop();
+                     } catch (Throwable throwable) {
++                        // A bounded read refusal abandons this tick without replay or removal, regardless
++                        // of the removeErroringBlockEntities configuration.
++                        if (net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
++                            throw throwable;
++                        }
                          CrashReport crashreport = CrashReport.forThrowable(throwable, "Ticking block entity");
                          CrashReportCategory crashreportcategory = crashreport.addCategory("Block entity being ticked");
                          this.blockEntity.fillCrashReportCategory(crashreportcategory);

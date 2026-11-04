@@ -52,6 +52,19 @@ import org.jetbrains.annotations.Nullable;
  */
 @ApiStatus.Internal
 public final class RegionThreadingHooks {
+    private static final java.util.concurrent.atomic.AtomicLong RAW_CHUNK_INTERNALS_ACCESSES = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Diagnostic access count only: obtaining raw internals is not proof that a caller mutated them. */
+    public static void recordRawChunkInternalsAccess() {
+        if (isNativeRegionWorkerThread()) {
+            RAW_CHUNK_INTERNALS_ACCESSES.incrementAndGet();
+        }
+    }
+
+    public static long rawChunkInternalsAccessCount() {
+        return RAW_CHUNK_INTERNALS_ACCESSES.get();
+    }
+
     private RegionThreadingHooks() {}
 
     /**
@@ -896,6 +909,53 @@ public final class RegionThreadingHooks {
         return vanilla;
     }
 
+    /** Foreign scalar reads use a bounded seqlock; a refusal never replays a partially executed callback. */
+    public static boolean requiresStableForeignRead(net.minecraft.world.level.chunk.LevelChunk chunk) {
+        return isNativeRegionWorkerThread() && !isRegionTickOwnedByCurrentThread(chunk.getLevel(), chunk.getPos().getWorldPosition());
+    }
+
+    public static <T> T readStableForeignChunk(net.minecraft.world.level.chunk.LevelChunk chunk, java.util.function.Supplier<T> read) {
+        for (int attempt = 0; attempt < 4096; attempt++) {
+            final long before = chunk.chunkVersion();
+            if ((before & 1L) == 0L) {
+                T value = null;
+                RuntimeException failure = null;
+                try {
+                    value = read.get();
+                } catch (RuntimeException exception) {
+                    failure = exception;
+                }
+                java.lang.invoke.VarHandle.loadLoadFence();
+                if (chunk.chunkVersion() == before) {
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    final RegionThreading threading = RegionThreadingManager.currentOrNull();
+                    if (threading instanceof RegionThreadingEngine engine && chunk.getLevel() instanceof ServerLevel level) {
+                        engine.recordForeignChunkRead(level, chunk.getPos().x, chunk.getPos().z, before);
+                    }
+                    return value;
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forUnstableRead(chunk.getPos().x, chunk.getPos().z);
+    }
+
+    public static boolean refuseForeignChunkMutation(net.minecraft.world.level.chunk.ChunkAccess chunk) {
+        if (!isNativeRegionWorkerThread()) {
+            return false;
+        }
+        if (chunk instanceof net.minecraft.world.level.chunk.LevelChunk levelChunk
+                && isRegionTickOwnedByCurrentThread(levelChunk.getLevel(), chunk.getPos().getWorldPosition())) {
+            return false;
+        }
+        // Interior admission covers ordinary vanilla work. This safety net refuses callbacks that reach
+        // beyond their lease before any mutation, without replaying their already-applied effects.
+        net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.countForeignWriteRefusal();
+        return true;
+    }
+
     /**
      * {@return true when a region execution context is running on the current thread and that context
      * holds the lease of the region containing {@code pos}}
@@ -939,10 +999,10 @@ public final class RegionThreadingHooks {
      * Records the version of one chunk a region worker is about to read.
      * <p>
      * The chunk source of a level serves any loaded chunk to a region worker, including a chunk another region
-     * is mutating. Its writes are safe - neighbour updates are captured and block events are deferred - but a
-     * read can observe a state that is torn or stale. The version the read observed is recorded per region and
-     * per pass, and the border fixpoint re-runs the propagation of the region when it changed, so the read is
-     * repaired in the same tick without a lock on the read path and without a copy of the chunk.
+     * is mutating. Block, fluid and heightmap scalar reads validate the chunk seqlock before returning data;
+     * versionless native-worker reads are refused without replay. The observed version is also recorded per
+     * region and pass, so propagation origins are reevaluated if their dependencies change later in the tick.
+     * Non-replayable callbacks receive a consistent scalar value, not a whole-world transaction snapshot.
      * <p>
      * The call site is the worker chunk lookup, so the hook is on the read path of every block, fluid and block
      * entity read of a worker. It costs one static read on a server without region threading and one thread-local
@@ -956,6 +1016,12 @@ public final class RegionThreadingHooks {
     public static void recordForeignChunkRead(net.minecraft.world.level.Level level, int chunkX, int chunkZ,
             net.minecraft.world.level.chunk.ChunkAccess chunk) {
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (isNativeRegionWorkerThread() && !(chunk instanceof net.minecraft.world.level.chunk.LevelChunk)) {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.recordVersionlessChunkRead();
+            }
+            throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forVersionlessRead(chunkX, chunkZ);
+        }
         if (!(threading instanceof RegionThreadingEngine engine) || !(level instanceof ServerLevel serverLevel)) {
             return;
         }

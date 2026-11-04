@@ -135,30 +135,37 @@ class RegionBorderUpdateTest {
     }
 
     @Test
-    void duplicateBorderUpdateIsAppliedOnce() {
+    void repeatedBorderUpdatesMatchInlineDeliveryAndOrder() {
         final ServerLevel level = this.mockLevel();
         this.installEngine(level);
-        final AtomicInteger targetUpdates = new AtomicInteger();
-        doReturn(mockTargetState(targetUpdates, new CopyOnWriteArrayList<>())).when(level).getBlockState(TARGET_POS);
-        final Block block = mock(Block.class);
+        final List<Block> delivered = new CopyOnWriteArrayList<>();
+        final BlockState targetState = mock(BlockState.class);
         doAnswer(invocation -> {
-            final LevelChunk chunk = invocation.getArgument(0);
-            if (!SOURCE_CHUNK.equals(chunk.getPos())) {
-                return null;
+            delivered.add(invocation.getArgument(2));
+            return null;
+        }).when(targetState).handleNeighborChanged(any(), any(), any(), any(), anyBoolean());
+        doReturn(targetState).when(level).getBlockState(TARGET_POS);
+        final Block a = mock(Block.class);
+        final Block b = mock(Block.class);
+        final List<Block> calls = List.of(a, a, b, a);
+        for (final Block block : calls) {
+            level.neighborChanged(TARGET_POS, block, SOURCE_POS);
+        }
+        assertEquals(calls, delivered, "inline delivers identical calls and A-B-A in order");
+        final List<Block> inline = List.copyOf(delivered);
+        delivered.clear();
+        doAnswer(invocation -> {
+            for (final Block block : calls) {
+                level.neighborChanged(TARGET_POS, block, SOURCE_POS);
             }
-            // Two identical captures of the same vanilla call in one pass.
-            level.neighborChanged(TARGET_POS, block, SOURCE_POS);
-            level.neighborChanged(TARGET_POS, block, SOURCE_POS);
             return null;
         }).when(level).tickChunk(any(LevelChunk.class), anyInt());
-
         final RegionChunkTickPlan plan = this.beginPlan(level);
         plan.accept(this.sourceChunk());
         plan.executeAndAwait(PARKING_BARRIER);
-
-        assertEquals(1, targetUpdates.get(), "a border update recorded twice for one pass is applied once");
-        assertEquals(1L, this.engine.diagnostics().borderUpdates().recorded());
-        assertEquals(1L, this.engine.diagnostics().borderUpdates().applied());
+        assertEquals(inline, delivered, "border delivery must preserve every inline invocation");
+        assertEquals(4L, this.engine.diagnostics().borderUpdates().recorded());
+        assertEquals(4L, this.engine.diagnostics().borderUpdates().applied());
     }
 
     @Test

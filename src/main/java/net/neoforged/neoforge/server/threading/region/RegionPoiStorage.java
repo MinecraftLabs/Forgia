@@ -14,7 +14,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -104,8 +103,6 @@ public final class RegionPoiStorage implements AutoCloseable {
     private final Set<Long> dirtyColumns = ConcurrentHashMap.newKeySet();
     /** The chunks {@link #ensureLoadedAndValid} already asked the level to load, like the vanilla manager. */
     private final Set<Long> ensuredChunks = ConcurrentHashMap.newKeySet();
-    private final AtomicLong centerVersion = new AtomicLong();
-    private volatile DistanceCache distanceCache = new DistanceCache(0L, new ConcurrentHashMap<>());
     /**
      * The region a test drives this storage as, instead of the region of the calling thread's lease.
      * <p>
@@ -115,8 +112,6 @@ public final class RegionPoiStorage implements AutoCloseable {
      * like a lease: the forced region is live, every other region is read from its published snapshot.
      */
     private static final ThreadLocal<RegionCoordinate> FORCED_QUERY_REGION = new ThreadLocal<>();
-
-    private record DistanceCache(long version, Map<Long, Byte> levels) {}
 
     public RegionPoiStorage(ServerLevel level, RegionLayout layout, SimpleRegionStorage storage, RegistryAccess registryAccess, LevelHeightAccessor heightAccessor) {
         this.level = level;
@@ -420,27 +415,12 @@ public final class RegionPoiStorage implements AutoCloseable {
      * section; a section farther than 6 answers 7, the tracker's default. The index of village-center sections
      * is the live set of the querying region and the published set of every other region, so the answer is
      * exact for the querying region's own sections and at most one publish old for a foreign section. The
-     * result is memoized per section against a version that any village-center change bumps.
+     * result is computed for each query: live occupancy can change before publication, and different
+     * querying regions intentionally see different center sets.
      */
     public int sectionsToVillage(SectionPos sectionPos) {
-        final long sectionKey = sectionPos.asLong();
-        final long version = this.centerVersion.get();
-        DistanceCache cache = this.distanceCache;
-        if (cache.version() == version) {
-            final Byte cached = cache.levels().get(sectionKey);
-            if (cached != null) {
-                return cached;
-            }
-        } else {
-            cache = new DistanceCache(version, new ConcurrentHashMap<>());
-            this.distanceCache = cache;
-        }
-        final int level = this.computeVillageDistance(sectionPos);
-        if (this.centerVersion.get() == version) {
-            cache.levels().put(sectionKey, (byte) level);
-        }
         RegionPoiCounters.recordVillageDistanceQuery();
-        return level;
+        return this.computeVillageDistance(sectionPos);
     }
 
     private int computeVillageDistance(SectionPos sectionPos) {
@@ -479,10 +459,6 @@ public final class RegionPoiStorage implements AutoCloseable {
             }
         }
         return nearest;
-    }
-
-    void centerVersionChanged() {
-        this.centerVersion.incrementAndGet();
     }
 
     // ---------------------------------------------------------------------------------------------------

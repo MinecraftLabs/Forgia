@@ -82,9 +82,13 @@
      @Nullable
      @Override
      public MinecraftServer getServer() {
-@@ -216,11 +_,40 @@
+@@ -215,12 +_,44 @@
+             return false;
          } else {
              LevelChunk levelchunk = this.getChunkAt(p_46605_);
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(levelchunk)) {
++                return false;
++            }
              Block block = p_46606_.getBlock();
 +
 +            p_46605_ = p_46605_.immutable(); // Forge - prevent mutable BlockPos leaks

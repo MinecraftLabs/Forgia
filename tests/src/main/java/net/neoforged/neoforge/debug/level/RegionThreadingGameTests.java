@@ -449,10 +449,22 @@ public class RegionThreadingGameTests {
             final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
             final ServerLevel level = helper.getLevel();
             final BlockPos icePos = evidenceBlockPos(helper, diagnostics.map(RegionThreadingDiagnostics::regionPolicy).orElse(RegionPolicy.FIXED_3X3), diagnostics.map(RegionThreadingDiagnostics::regionChunkSize).orElse(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE), 2);
+            // A single ice block depends on one random position being selected, which made this test flaky in the
+            // vanilla path as well (about one failure in ten full-suite runs). A patch of nine blocks each with its
+            // own light source keeps the same property - the selected random tick melts the ice - but the chance
+            // that none of them is selected for a whole window is negligible.
+            final java.util.List<BlockPos> icePositions = new java.util.ArrayList<>();
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    icePositions.add(icePos.offset(dx, 0, dz));
+                }
+            }
             helper.addEndListener(passed -> {
                 randomTickSpeed.set(previousRandomTickSpeed, level.getServer());
-                level.setBlock(icePos, Blocks.AIR.defaultBlockState(), 3);
-                level.setBlock(icePos.above(), Blocks.AIR.defaultBlockState(), 3);
+                for (final BlockPos pos : icePositions) {
+                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                    level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3);
+                }
                 releaseForcedChunk(level, icePos);
             });
             final long chunkTicksBefore = diagnostics.map(RegionThreadingDiagnostics::chunkTicksOnWorkers).orElse(0L);
@@ -463,21 +475,33 @@ public class RegionThreadingGameTests {
                         forceChunk(level, icePos);
                         // Place the light first and let the light engine update the forced chunk before the
                         // ice exists; the ice random tick only melts above block light 11.
-                        level.setBlock(icePos.above(), Blocks.GLOWSTONE.defaultBlockState(), 3);
+                        for (final BlockPos pos : icePositions) {
+                            level.setBlock(pos.above(), Blocks.GLOWSTONE.defaultBlockState(), 3);
+                        }
                     })
                     .thenIdle(2)
-                    .thenExecute(() -> level.setBlock(icePos, Blocks.ICE.defaultBlockState(), 3))
-                    // A random tick that lands on the ice melts it on the first hit, so 60 ticks are enough in
-                    // almost every run. The window is longer because a chunk can lose the random ticks of a tick
-                    // (a truncated worker chunk tick, a chunk that is not randomly ticking yet) and one lost
-                    // window must not fail the test. The message reports the counters that say which happened.
+                    .thenExecute(() -> {
+                        for (final BlockPos pos : icePositions) {
+                            level.setBlock(pos, Blocks.ICE.defaultBlockState(), 3);
+                        }
+                    })
+                    // A random tick that lands on an ice block melts it on the first hit. The window is generous
+                    // because a chunk can lose the random ticks of a tick (a truncated worker chunk tick, a chunk
+                    // that is not randomly ticking yet); the counters in the message say which happened.
                     .thenIdle(180)
                     .thenExecute(() -> {
                         final RegionThreadingDiagnostics after = diagnostics.isPresent() ? diagnostics() : null;
-                        helper.assertTrue(
-                                level.getBlockState(icePos).is(Blocks.WATER),
-                                "ice did not melt, so the selected random tick was not executed; state="
-                                        + level.getBlockState(icePos)
+                        int melted = 0;
+                        for (final BlockPos pos : icePositions) {
+                            if (level.getBlockState(pos).is(Blocks.WATER)) {
+                                melted++;
+                            }
+                        }
+                        final int meltedCount = melted;
+                        helper.assertTrue(meltedCount == icePositions.size(),
+                                "not every ice block melted, so the selected random tick was not executed for all of them; melted="
+                                        + meltedCount + "/" + icePositions.size()
+                                        + " state=" + level.getBlockState(icePos)
                                         + " randomTickSpeed=" + randomTickSpeed.get()
                                         + (after == null ? " slice=absent"
                                                 : " workers=" + after.chunkTicksOnWorkers()

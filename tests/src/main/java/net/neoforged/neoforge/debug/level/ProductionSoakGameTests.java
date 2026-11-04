@@ -203,7 +203,7 @@ public class ProductionSoakGameTests {
     static final String TICK_HEADER = "ticksChecked,ticksWithActiveBatches,maxActiveBatches,itemChecks,itemMismatches,redstoneTicks,redstoneStates,redstoneTransitions,mappingChecks,mappingMismatches,mappingMismatchesThatSurvivedATick";
     static final String INVARIANT_HEADER = "check,observed,expected,ok";
     static final String ENTITY_HEADER = "category,count";
-    static final String HEARTBEAT_HEADER = "tick,windowTick,mspt,regionCount,regionsBehind,regionP99MeanMs,regionP99MaxMs,entityTicksOnWorkers,blockEntityTicksOnWorkers,chunkTicksOnWorkers,spawnChunksOnWorkers,poiLocalQueries,poiPublishedQueries,borderRecorded,borderApplied,borderDelayed,foreignReads,invalidatedPasses,tickFailures,ownershipViolations,itemCount,entities,contentMobs,heapUsedMiB";
+    static final String HEARTBEAT_HEADER = "tick,windowTick,mspt,regionCount,regionsBehind,regionP99MeanMs,regionP99MaxMs,entityTicksOnWorkers,blockEntityTicksOnWorkers,chunkTicksOnWorkers,spawnChunksOnWorkers,poiLocalQueries,poiPublishedQueries,borderRecorded,borderApplied,borderDelayed,foreignReads,invalidatedPasses,tickFailures,ownershipViolations,itemCount,entities,contentMobs,heapUsedMiB,foreignWriteRefusals,unstableReadRefusals,rawChunkInternalsAccesses";
 
     @GameTest(batch = "productionSoak", timeoutTicks = TIMEOUT_TICKS)
     @EmptyTemplate(value = "15x10x15", floor = true)
@@ -1891,7 +1891,10 @@ public class ProductionSoakGameTests {
                     Long.toString(this.world.itemCount()),
                     Integer.toString(liveLevelEntities(this.level).size()),
                     Integer.toString(this.world.contentMobs()),
-                    Long.toString(heapMiB)));
+                    Long.toString(heapMiB),
+                    Long.toString(net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.foreignWriteRefusalCount()),
+                    Long.toString(net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.unstableReadRefusalCount()),
+                    Long.toString(RegionThreadingHooks.rawChunkInternalsAccessCount())));
         }
     }
 

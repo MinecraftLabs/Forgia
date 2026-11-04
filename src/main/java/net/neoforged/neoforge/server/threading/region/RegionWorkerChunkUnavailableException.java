@@ -20,11 +20,16 @@ import org.jetbrains.annotations.Nullable;
  * load or deadlocks the tick outright. A worker therefore only receives a chunk that is already available,
  * and asks for the server-thread fallback instead of waiting for one that is not.
  * <p>
- * The refusal is a handoff, not a failure. The entity tick group catches it per entity, counts it in
+ * A missing-chunk refusal is a handoff, not a failure. The entity tick group catches it per entity, counts it in
  * {@link RegionThreadingDiagnostics#chunkFallbackEntityTicks()} and ticks that entity on the server thread
  * after the batch, exactly once. The block-entity tick group hands the refused ticker to its existing
  * server-thread fallback the same way. {@link net.minecraft.world.level.Level#guardEntityTick} rethrows the
  * exception unwrapped, so the handoff never builds a crash report and never discards the entity.
+ * <p>
+ * An unstable-read refusal is different: {@link #mustNotReplay(Throwable)} identifies a body that may
+ * already have applied effects. Its handlers abandon the unit for this tick without replay or removal.
+ * Regular entity, block-entity and chunk ticks can run again in the next tick; a consumed scheduled call
+ * is not rescheduled as a whole. The unstable-read counter records every such loss.
  * <p>
  * The exception is only ever thrown from a native region worker (see
  * {@link net.neoforged.neoforge.server.threading.RegionThreadingHooks#isNativeRegionWorkerThread()}). The
@@ -34,6 +39,18 @@ import org.jetbrains.annotations.Nullable;
 @ApiStatus.Internal
 public final class RegionWorkerChunkUnavailableException extends IllegalStateException {
     private static final AtomicLong REFUSALS = new AtomicLong();
+    private static final AtomicLong UNSTABLE_READ_REFUSALS = new AtomicLong();
+    private boolean noReplay;
+    private static final AtomicLong FOREIGN_WRITE_REFUSALS = new AtomicLong();
+
+    public static void countForeignWriteRefusal() {
+        FOREIGN_WRITE_REFUSALS.incrementAndGet();
+    }
+
+    public static long foreignWriteRefusalCount() {
+        return FOREIGN_WRITE_REFUSALS.get();
+    }
+
     /**
      * Bound of the cause walk in {@link #isChunkUnavailable(Throwable)}, so a cyclic cause chain cannot hang
      * the worker that is already recovering from a refusal.
@@ -42,6 +59,35 @@ public final class RegionWorkerChunkUnavailableException extends IllegalStateExc
 
     private RegionWorkerChunkUnavailableException(String message) {
         super(message);
+    }
+
+    /** Unlike missing-chunk handoffs, this mid-body refusal must never replay prior callback effects. */
+    public static RegionWorkerChunkUnavailableException forUnstableRead(int chunkX, int chunkZ) {
+        UNSTABLE_READ_REFUSALS.incrementAndGet();
+        final RegionWorkerChunkUnavailableException refusal = new RegionWorkerChunkUnavailableException(
+                "Foreign chunk remained unstable during bounded read: " + chunkX + ", " + chunkZ);
+        refusal.noReplay = true;
+        return refusal;
+    }
+
+    public static RegionWorkerChunkUnavailableException forVersionlessRead(int chunkX, int chunkZ) {
+        final RegionWorkerChunkUnavailableException refusal = new RegionWorkerChunkUnavailableException(
+                "Native worker cannot verify a versionless chunk read: " + chunkX + ", " + chunkZ);
+        refusal.noReplay = true;
+        return refusal;
+    }
+
+    public static long unstableReadRefusalCount() {
+        return UNSTABLE_READ_REFUSALS.get();
+    }
+
+    public static boolean mustNotReplay(@Nullable Throwable throwable) {
+        for (int depth = 0; throwable != null && depth < MAX_CAUSE_DEPTH; depth++, throwable = throwable.getCause()) {
+            if (throwable instanceof RegionWorkerChunkUnavailableException refusal) {
+                return refusal.noReplay;
+            }
+        }
+        return false;
     }
 
     /**
