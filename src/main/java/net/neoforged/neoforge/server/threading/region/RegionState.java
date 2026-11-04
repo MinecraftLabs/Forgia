@@ -60,6 +60,39 @@ final class RegionState {
     /** Number of ticking entities only the server thread may tick, i.e. always-ticking entities such as players. */
     private final AtomicInteger serverThreadOnlyEntityCount = new AtomicInteger();
     private volatile Thread ownerThread;
+    /**
+     * Upper bound of the foreign chunk keys this region records between two version checks.
+     * <p>
+     * A region reads a handful of chunks of its neighbours at most, so the bound only has to keep a region that
+     * scans far outside its own area from growing the set without limit. A key past the bound is not recorded,
+     * so a change of that chunk is not detected by this region's check.
+     */
+    static final int MAX_FOREIGN_READ_CHUNKS = 256;
+    /**
+     * Upper bound of the written positions this region keeps for a re-run of its propagation.
+     * <p>
+     * The seeds of one pass are the blocks the pass wrote; a pass writes at most the deferred block-update
+     * budget of its batch. A position past the bound is dropped and counted, so a re-run of a region that wrote
+     * an extreme number of blocks only re-evaluates the positions that fit.
+     */
+    static final int MAX_RERUN_SEEDS = 1024;
+    /**
+     * The version of every foreign chunk this region read since its last check, by
+     * {@link net.minecraft.world.level.ChunkPos#asLong(int, int)} key.
+     * <p>
+     * Written by the region's own worker only: a region holds one lease at a time, so the recording worker is
+     * the only writer. The border fixpoint reads and clears the map on the server thread after the barrier of
+     * the batch, when no worker of the region runs, so no lock is needed on either side.
+     */
+    private final it.unimi.dsi.fastutil.longs.Long2LongMap foreignChunkReads = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
+    /**
+     * The positions this region wrote since its last check, as packed block positions. A changed foreign chunk
+     * makes the border fixpoint re-evaluate these positions on the region's own worker, which is the propagation
+     * a re-run of the region repeats. Recorded and read under the same rule as {@link #foreignChunkReads}.
+     */
+    private final it.unimi.dsi.fastutil.longs.LongArrayList rerunSeeds = new it.unimi.dsi.fastutil.longs.LongArrayList();
+    /** Seeds the {@link #MAX_RERUN_SEEDS} bound refused since the last check. */
+    private int droppedRerunSeeds;
 
     RegionState(RegionCoordinate coordinate) {
         this.coordinate = coordinate;
@@ -363,6 +396,68 @@ final class RegionState {
 
     boolean isOwnedByCurrentThread() {
         return this.ownerThread == Thread.currentThread();
+    }
+
+    /**
+     * Records the version of one chunk of another region this region read.
+     * <p>
+     * The first version a region observes for a chunk is the one it keeps: a chunk that changes after that first
+     * read differs from the recorded version, so the region is invalidated either way.
+     *
+     * @return {@code true} when the key was recorded, {@code false} when the same chunk was already recorded or
+     *         the {@link #MAX_FOREIGN_READ_CHUNKS} bound refused it
+     */
+    boolean recordForeignChunkRead(long chunkKey, long version) {
+        if (this.foreignChunkReads.containsKey(chunkKey)) {
+            return false;
+        }
+        if (this.foreignChunkReads.size() >= MAX_FOREIGN_READ_CHUNKS) {
+            return false;
+        }
+        this.foreignChunkReads.put(chunkKey, version);
+        return true;
+    }
+
+    /** {@return the version of every foreign chunk this region read since its last check, by chunk key} */
+    it.unimi.dsi.fastutil.longs.Long2LongMap foreignChunkReads() {
+        return this.foreignChunkReads;
+    }
+
+    /** Forgets the foreign chunks this region read, so the next check only sees the reads that follow. */
+    void clearForeignChunkReads() {
+        this.foreignChunkReads.clear();
+    }
+
+    /**
+     * Records one position this region wrote, which a re-run of the region has to re-evaluate.
+     *
+     * @return {@code true} when the position was kept, {@code false} when the {@link #MAX_RERUN_SEEDS} bound
+     *         dropped it
+     */
+    boolean recordRerunSeed(long packedPos) {
+        if (this.rerunSeeds.size() >= MAX_RERUN_SEEDS) {
+            this.droppedRerunSeeds++;
+            return false;
+        }
+        this.rerunSeeds.add(packedPos);
+        return true;
+    }
+
+    /** {@return the positions this region wrote since its last check, as packed block positions} */
+    it.unimi.dsi.fastutil.longs.LongArrayList rerunSeeds() {
+        return this.rerunSeeds;
+    }
+
+    /**
+     * Forgets the written positions of this region.
+     *
+     * @return the number of positions the {@link #MAX_RERUN_SEEDS} bound dropped since the last check
+     */
+    int clearRerunSeeds() {
+        this.rerunSeeds.clear();
+        final int dropped = this.droppedRerunSeeds;
+        this.droppedRerunSeeds = 0;
+        return dropped;
     }
 
     boolean tryMarkRunning() {

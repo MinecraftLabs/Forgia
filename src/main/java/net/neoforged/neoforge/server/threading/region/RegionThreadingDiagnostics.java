@@ -332,9 +332,19 @@ public record RegionThreadingDiagnostics(
      * phase needed. {@code overflowed} counts the records the capture queue's own bound refused; they are handed
      * to the same next-tick fallback. Every record reaches exactly one of applied, delayed or dropped, so a
      * growing {@code delayed} count is the only observable sign that a circuit needed more than one tick.
+     * <p>
+     * The foreign read counters cover the version check of a cross-region read. {@code foreignReads} counts the
+     * chunks a region read from another region, one per chunk and region and pass, {@code foreignReadsWithoutVersion}
+     * the reads of a chunk that has no version - a proto chunk, or a chunk no region owns - which keep the
+     * behaviour they had before the check. {@code invalidatedPasses} counts the fixpoint checks in which a region
+     * observed a changed version of a chunk it read, {@code regionsRerunByReads} the region propagation groups
+     * re-run because of one, and {@code rerunSeedsDropped} the written positions the seed bound refused, which a
+     * re-run of that region does not re-evaluate. {@code worstPasses} bounds the re-runs too, because a re-run
+     * needs a pass of its own.
      */
     public record BorderUpdateCounters(long recorded, long applied, long delayed, long dropped, long passes,
-            long regionsRerun, long worstPasses, long overflowed) {
+            long regionsRerun, long worstPasses, long overflowed, long foreignReads, long foreignReadsWithoutVersion,
+            long invalidatedPasses, long regionsRerunByReads, long rerunSeedsDropped) {
         @Override
         public String toString() {
             return "recorded=" + this.recorded
@@ -344,7 +354,12 @@ public record RegionThreadingDiagnostics(
                     + "/passes=" + this.passes
                     + "/regionsRerun=" + this.regionsRerun
                     + "/worstPasses=" + this.worstPasses
-                    + "/overflowed=" + this.overflowed;
+                    + "/overflowed=" + this.overflowed
+                    + "/foreignReads=" + this.foreignReads
+                    + "/foreignReadsWithoutVersion=" + this.foreignReadsWithoutVersion
+                    + "/invalidatedPasses=" + this.invalidatedPasses
+                    + "/regionsRerunByReads=" + this.regionsRerunByReads
+                    + "/rerunSeedsDropped=" + this.rerunSeedsDropped;
         }
     }
 

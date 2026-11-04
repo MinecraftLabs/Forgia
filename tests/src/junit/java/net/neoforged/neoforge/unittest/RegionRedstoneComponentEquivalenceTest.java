@@ -170,6 +170,14 @@ class RegionRedstoneComponentEquivalenceTest {
     }
 
     @Test
+    void bothSidesOfTheBorderChangeInTheSameTick() {
+        for (int offset = 1; offset <= 15; offset++) {
+            final long seed = 0x51DE5L + offset;
+            this.assertEquivalent(Layout.simultaneousSides(seed, offset), seed);
+        }
+    }
+
+    @Test
     void inputComponentsAcrossTheBorder() {
         for (int offset : new int[] { 1, 5, 10, 15 }) {
             final long seed = 0x1E7E2L + offset;
@@ -668,6 +676,44 @@ class RegionRedstoneComponentEquivalenceTest {
                 final BlockState state = world.level.getBlockState(buttonPos);
                 ((ButtonBlock) Blocks.OAK_BUTTON).press(state, world.level, buttonPos, null);
             });
+            return layout;
+        }
+
+        /**
+         * Two independent driver circuits, one on each side of the border, clocked on the same ticks.
+         * <p>
+         * The dust line of the west circuit ends on the last block of its region and the dust line of the east
+         * circuit starts on the first block of its region, so the two lines connect across the border: each side
+         * reads the dust of the other side while its own worker writes it. Both clocks toggle on the same ticks,
+         * so the two regions write and read the same chunk in the same tick, which is the interleaving the version
+         * check of a foreign read has to keep equivalent to the single-threaded run.
+         */
+        static Layout simultaneousSides(long seed, int offset) {
+            final RandomSource random = RandomSource.create(seed);
+            final int westStart = BORDER_X - offset;
+            final int westLength = offset - 1;
+            final int eastEnd = BORDER_X + offset - 1;
+            final int eastLength = offset;
+            final int delay = 1 + random.nextInt(2);
+            final Layout layout = new Layout("simultaneous-sides-" + offset, westStart - 2, eastEnd + 3);
+            // West: a clock, a repeater and the dust that reaches the border, with a lamp under the first dust.
+            layout.support(westStart, Z);
+            layout.place(westStart, Y, Z, repeater(Direction.WEST, delay));
+            if (westLength > 0) {
+                layout.dustRun(westStart + 1, westLength, Z);
+                layout.lampAt(westStart + 1, Z);
+            }
+            // East: the mirrored circuit, whose dust starts on the first block of the other region.
+            layout.dustRun(BORDER_X, eastLength, Z);
+            layout.lampAt(eastEnd, Z);
+            layout.support(eastEnd + 1, Z);
+            layout.place(eastEnd + 1, Y, Z, repeater(Direction.EAST, delay));
+            // Both clocks drive their side on the same tick, so both regions change in the same tick.
+            for (final int tick : new int[] { 0, 20, 40 }) {
+                final BlockState state = tick == 20 ? Blocks.AIR.defaultBlockState() : Blocks.REDSTONE_BLOCK.defaultBlockState();
+                layout.source(tick, westStart - 1, Z, state);
+                layout.source(tick, eastEnd + 2, Z, state);
+            }
             return layout;
         }
 

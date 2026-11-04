@@ -21,7 +21,7 @@
              profilerfiller.incrementCounter("getChunkCacheMiss");
              CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
              this.mainThreadProcessor.managedBlock(completablefuture::isDone);
-@@ -164,6 +_,37 @@
+@@ -164,6 +_,43 @@
          }
      }
  
@@ -42,12 +42,18 @@
 +     * <p>
 +     * The result cache of the main-thread path is not read or written here: it is a plain array owned by the
 +     * server thread. The visible holder and its futures are thread-safe.
++     * <p>
++     * The version of the chunk this worker is about to read is handed to the engine, which records it for the
++     * region of the caller. A chunk of another region can be mutated by its own worker while this one reads it,
++     * so the border fixpoint re-runs the propagation of the caller when the version of a recorded chunk changed.
++     * A chunk of the caller's own region is filtered out by the engine and costs one thread-local read.
 +     */
 +    @Nullable
 +    private ChunkAccess getChunkForRegionWorker(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
 +        ChunkHolder chunkholder = this.getVisibleChunkIfPresent(ChunkPos.asLong(p_8360_, p_8361_));
 +        ChunkAccess chunkaccess = chunkholder == null ? null : chunkholder.getChunkIfPresent(p_330876_);
 +        if (chunkaccess != null) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.recordForeignChunkRead(this.level, p_8360_, p_8361_, chunkaccess);
 +            return chunkaccess;
 +        }
 +        if (!p_8363_) {

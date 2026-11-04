@@ -245,6 +245,29 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong borderUpdateWorstPasses = new AtomicLong();
     /** Border updates the capture bound refused, which were handed to the next-tick fallback. */
     private final AtomicLong borderUpdatesOverflowed = new AtomicLong();
+    /**
+     * The regions of each level that read a chunk of another region since their last version check.
+     * <p>
+     * A region adds itself on the first foreign read after a check and the fixpoint removes it when it checks
+     * the region, so the fixpoint only walks the regions that actually read across a border. A level that never
+     * does has no entry at all.
+     */
+    private final Map<ServerLevel, Set<RegionState>> regionsWithForeignReads = new ConcurrentHashMap<>();
+    /** Foreign chunk reads a region recorded, i.e. one per chunk and region and pass. */
+    private final AtomicLong foreignChunkReads = new AtomicLong();
+    /** Foreign chunk reads of a chunk without a version, i.e. of a chunk no region owns or of a proto chunk. */
+    private final AtomicLong foreignChunkReadsWithoutVersion = new AtomicLong();
+    /** Fixpoint checks in which a region observed a changed version of a foreign chunk it read. */
+    private final AtomicLong foreignReadInvalidatedPasses = new AtomicLong();
+    /** Region propagation groups the fixpoint re-ran because a foreign read was invalidated. */
+    private final AtomicLong foreignReadRegionReruns = new AtomicLong();
+    /** Written positions a region dropped because the re-run seed bound of the region was reached. */
+    private final AtomicLong foreignReadSeedsDropped = new AtomicLong();
+    /**
+     * Whether a changed foreign chunk version re-runs the propagation of the reader. The mechanics seam of the
+     * race tests turns it off to show the stale read the re-run repairs.
+     */
+    private volatile boolean foreignReadRerunEnabled = true;
     /** Block events a region worker recorded for the server thread's block event phase. */
     private final AtomicLong deferredBlockEvents = new AtomicLong();
     /** Block entity reads a region group made against a quiescent foreign region. */
@@ -843,6 +866,74 @@ public final class RegionThreadingEngine implements RegionThreading {
         return readable;
     }
 
+    /**
+     * Records the version of one chunk a region worker is about to read through the chunk source.
+     * <p>
+     * A chunk of the caller's own region is not recorded: it is mutated by the caller only, so its reads cannot
+     * race another region's worker. Every other chunk is remembered with the version it has now, and the border
+     * fixpoint re-runs the caller's propagation if that version changed before the check. The read itself stays
+     * lock-free; this method only adds a map entry.
+     * <p>
+     * A chunk no region owns cannot change under the read, and a chunk without a version - a proto chunk of
+     * another status - cannot be verified. Both keep the behaviour they had before this check existed and are
+     * counted.
+     *
+     * @param chunkX  the chunk x of the chunk that is handed to the worker
+     * @param chunkZ  the chunk z of the chunk that is handed to the worker
+     * @param version the version of the chunk, or a negative value when the chunk has none
+     */
+    @ApiStatus.Internal
+    public void recordForeignChunkRead(ServerLevel level, int chunkX, int chunkZ, long version) {
+        if (!this.borderUpdatesEnabled) {
+            return;
+        }
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext)
+                || basicContext.kind() != RegionThreadingContext.Kind.REGION
+                || basicContext.regionState == null) {
+            return;
+        }
+        final RegionState region = basicContext.regionState;
+        if (this.ownsChunk(level, chunkX, chunkZ, basicContext, region)) {
+            return;
+        }
+        if (this.regionizer.get(this.layout.regionAt(level, chunkX, chunkZ)) == null) {
+            // No region owns the chunk, so no region mutates it and no version can change under the read. The read
+            // keeps the behaviour it had before this check and is counted.
+            this.foreignChunkReadsWithoutVersion.incrementAndGet();
+            return;
+        }
+        if (version < 0L) {
+            this.foreignChunkReadsWithoutVersion.incrementAndGet();
+            return;
+        }
+        if (region.recordForeignChunkRead(ChunkPos.asLong(chunkX, chunkZ), version)) {
+            this.foreignChunkReads.incrementAndGet();
+            this.regionsWithForeignReads.computeIfAbsent(level, key -> ConcurrentHashMap.newKeySet()).add(region);
+        }
+    }
+
+    /**
+     * {@return true when the chunk of {@code chunkX}/{@code chunkZ} belongs to the region the current thread
+     * holds the lease of}
+     * <p>
+     * The fixed layout answers from the chunk coordinate alone, so the check of a read of the caller's own
+     * region costs two divisions and two comparisons. A dynamic region may be merged and then owns more than one
+     * layout cell, so only the regionizer can answer for it.
+     */
+    private boolean ownsChunk(ServerLevel level, int chunkX, int chunkZ, BasicRegionThreadingContext context, RegionState region) {
+        if (!region.isOwnedByCurrentThread()) {
+            return false;
+        }
+        final RegionCoordinate coordinate = context.regionCoordinate;
+        if (coordinate != null && coordinate.level() == level && this.layout.isFixed()
+                && this.layout.regionX(chunkX) == coordinate.regionX()
+                && this.layout.regionZ(chunkZ) == coordinate.regionZ()) {
+            return true;
+        }
+        return this.regionizer.get(this.layout.regionAt(level, chunkX, chunkZ)) == region;
+    }
+
     @Override
     public void assertOwnedByCurrentRegion(ServerLevel level, BlockPos pos) {
         if (!this.isOwnedByCurrentRegion(level, pos)) {
@@ -1197,23 +1288,35 @@ public final class RegionThreadingEngine implements RegionThreading {
      * <p>
      * The capture queue's own bound ({@link RegionBorderUpdates#MAX_ENTRIES}) is an overflow of the memory of
      * one pass, not of the vanilla limit: the records past it are posted to the same next-tick fallback.
+     * <p>
+     * <strong>Foreign reads.</strong> A propagation group reads block states, fluids and block entities of the
+     * neighbouring regions, and a chunk of another region can change between two of those reads. Every region
+     * records the version of each foreign chunk it read ({@link RegionState#foreignChunkReads()}), and the
+     * version of every position it wrote ({@link RegionState#rerunSeeds()}). The check runs once for the worker
+     * phase before the first pass and once per region after its propagation group. A region whose observed
+     * version changed re-runs its propagation - the updates it applied, plus a re-evaluation of the positions it
+     * wrote - in the next pass. The re-run is bounded by the same pass bound and falls back to the same mailbox,
+     * so a region that keeps invalidating converges one tick later instead of spinning.
      */
     private void runBorderUpdateFixpoint(ServerLevel level) {
         if (!this.borderUpdatesEnabled) {
             return;
         }
+        // The regions whose reads of the worker phase observed a chunk version that changed before the phase
+        // ended. They re-run their propagation in the first pass even when no border update is pending, because
+        // the repair of a stale read is not an update the fixpoint's own queue could carry.
+        final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> invalidated = this.invalidatedForeignReads(level);
         final RegionBorderUpdates updates = this.borderUpdates.get(level);
-        if (updates == null) {
-            return;
-        }
-        List<RegionBorderUpdates.BorderUpdate> pending = updates.drain();
-        final List<RegionBorderUpdates.BorderUpdate> overflow = updates.drainOverflow();
-        if (pending.isEmpty() && overflow.isEmpty()) {
+        final List<RegionBorderUpdates.BorderUpdate> pending = updates == null ? List.of() : updates.drain();
+        final List<RegionBorderUpdates.BorderUpdate> overflow = updates == null ? List.of() : updates.drainOverflow();
+        if (pending.isEmpty() && overflow.isEmpty() && invalidated.isEmpty()) {
             return;
         }
         if (this.regionizer.isLevelClosed(level) || this.shutdown) {
             this.borderUpdatesDropped.addAndGet(pending.size() + overflow.size());
-            updates.discard();
+            if (updates != null) {
+                updates.discard();
+            }
             return;
         }
         this.delayBorderUpdates(level, overflow);
@@ -1223,9 +1326,27 @@ public final class RegionThreadingEngine implements RegionThreading {
         int passes = 0;
         int applied = 0;
         List<RegionBorderUpdates.BorderUpdate> deferred = new ArrayList<>();
-        while (!pending.isEmpty() && passes < budget && applied < budget) {
+        Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> reruns = invalidated;
+        if (!reruns.isEmpty()) {
+            this.foreignReadInvalidatedPasses.incrementAndGet();
+        }
+        List<RegionBorderUpdates.BorderUpdate> nextPending = pending;
+        while ((!nextPending.isEmpty() || !reruns.isEmpty()) && passes < budget && applied < budget) {
             passes++;
-            final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> byRegion = this.groupBorderUpdatesByRegion(level, pending);
+            final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> byRegion = this.groupBorderUpdatesByRegion(level, nextPending);
+            for (final Map.Entry<RegionState, List<RegionBorderUpdates.BorderUpdate>> rerun : reruns.entrySet()) {
+                final RegionState region = rerun.getKey();
+                if (region.isDead()) {
+                    this.borderUpdatesDropped.addAndGet(rerun.getValue().size());
+                    continue;
+                }
+                byRegion.merge(region, rerun.getValue(), (existing, added) -> {
+                    existing.addAll(added);
+                    return existing;
+                });
+            }
+            reruns = new java.util.LinkedHashMap<>();
+            final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> ranThisPass = new java.util.LinkedHashMap<>();
             for (final Map.Entry<RegionState, List<RegionBorderUpdates.BorderUpdate>> entry : byRegion.entrySet()) {
                 final List<RegionBorderUpdates.BorderUpdate> regionUpdates = entry.getValue();
                 if (applied >= budget) {
@@ -1240,22 +1361,164 @@ public final class RegionThreadingEngine implements RegionThreading {
                 if (this.runBorderPropagationPass(level, entry.getKey(), apply, barrier)) {
                     applied += apply.size();
                     this.borderUpdateRegionsRerun.incrementAndGet();
+                    ranThisPass.put(entry.getKey(), apply);
                 } else {
                     deferred.addAll(apply);
                 }
             }
+            // A region whose propagation read a foreign chunk that changed under the read re-runs in the next
+            // pass, so its cascade sees the state the chunk has now. The check also drains the region's read set
+            // and its written positions, so both are per pass.
+            boolean passInvalidated = false;
+            for (final Map.Entry<RegionState, List<RegionBorderUpdates.BorderUpdate>> entry : ranThisPass.entrySet()) {
+                final List<RegionBorderUpdates.BorderUpdate> payload = this.invalidatedForeignRead(level, entry.getKey(), entry.getValue());
+                if (payload == null) {
+                    continue;
+                }
+                passInvalidated = true;
+                reruns.put(entry.getKey(), payload);
+                this.foreignReadRegionReruns.incrementAndGet();
+            }
+            if (passInvalidated) {
+                this.foreignReadInvalidatedPasses.incrementAndGet();
+            }
             // The cascades of this pass recorded new border updates. They run in the next pass, after every
             // region of this pass saw the writes of the regions before it.
-            pending = updates.drain();
+            nextPending = updates == null ? List.of() : updates.drain();
         }
-        if (!pending.isEmpty()) {
-            deferred.addAll(pending);
+        if (!nextPending.isEmpty()) {
+            deferred.addAll(nextPending);
+        }
+        for (final List<RegionBorderUpdates.BorderUpdate> leftover : reruns.values()) {
+            deferred.addAll(leftover);
         }
         this.borderUpdatePasses.addAndGet(passes);
         this.borderUpdateWorstPasses.accumulateAndGet(passes, Math::max);
         if (!deferred.isEmpty()) {
             this.delayBorderUpdates(level, deferred);
         }
+    }
+
+    /**
+     * Checks the foreign chunks every region of {@code level} read during the worker phase that just ended.
+     *
+     * @return the propagation each invalidated region has to re-run, in first-seen order, or an empty map when
+     *         no region read a foreign chunk that changed
+     */
+    private Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> invalidatedForeignReads(ServerLevel level) {
+        final Set<RegionState> regions = this.regionsWithForeignReads.get(level);
+        if (regions == null || regions.isEmpty()) {
+            return Map.of();
+        }
+        Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> invalidated = null;
+        for (final RegionState region : List.copyOf(regions)) {
+            regions.remove(region);
+            if (region.isDead()) {
+                this.discardForeignReads(region);
+                continue;
+            }
+            final List<RegionBorderUpdates.BorderUpdate> payload = this.invalidatedForeignRead(level, region, List.of());
+            if (payload != null) {
+                if (invalidated == null) {
+                    invalidated = new java.util.LinkedHashMap<>();
+                }
+                invalidated.put(region, payload);
+                this.foreignReadRegionReruns.incrementAndGet();
+            }
+        }
+        return invalidated == null ? Map.of() : invalidated;
+    }
+
+    /**
+     * Checks the foreign chunks {@code region} read since its last check and builds the propagation it has to
+     * re-run, then forgets both the reads and the written positions of the region.
+     * <p>
+     * The re-run payload is the propagation the region already ran - the updates it applied in this pass - plus a
+     * re-evaluation of every position it wrote, as a self-directed neighbour update. A block that decided its
+     * state from a foreign read therefore decides it again, against the state the read reports now, without
+     * repeating any entity, block-entity, chunk or spawn work.
+     *
+     * @param applied the border updates the region applied in the checked pass, empty for the worker phase
+     * @return the propagation to re-run, or {@code null} when no observed version changed
+     */
+    @Nullable
+    private List<RegionBorderUpdates.BorderUpdate> invalidatedForeignRead(ServerLevel level, RegionState region,
+            List<RegionBorderUpdates.BorderUpdate> applied) {
+        final it.unimi.dsi.fastutil.longs.Long2LongMap reads = region.foreignChunkReads();
+        final boolean changed = this.foreignReadRerunEnabled && this.foreignReadVersionsChanged(level, reads);
+        final List<RegionBorderUpdates.BorderUpdate> payload = changed ? this.rerunPayload(applied, region.rerunSeeds()) : null;
+        final int dropped = region.clearRerunSeeds();
+        if (dropped > 0) {
+            this.foreignReadSeedsDropped.addAndGet(dropped);
+        }
+        region.clearForeignChunkReads();
+        return payload == null || payload.isEmpty() ? null : payload;
+    }
+
+    /**
+     * {@return true when the version of any chunk in {@code reads} differs from the version the region observed}
+     * <p>
+     * A chunk that is no longer loaded cannot be shown to be unchanged, so its read counts as changed. A level
+     * without a chunk source - a mechanics test level - verifies nothing and keeps the vanilla behaviour.
+     */
+    private boolean foreignReadVersionsChanged(ServerLevel level, it.unimi.dsi.fastutil.longs.Long2LongMap reads) {
+        if (reads.isEmpty()) {
+            return false;
+        }
+        final ServerChunkCache chunkSource = level.getChunkSource();
+        if (chunkSource == null) {
+            return false;
+        }
+        boolean changed = false;
+        for (final it.unimi.dsi.fastutil.longs.Long2LongMap.Entry read : reads.long2LongEntrySet()) {
+            if (currentChunkVersion(chunkSource, read.getLongKey()) != read.getLongValue()) {
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * {@return the version of the chunk with {@code chunkKey}, or {@code -1} when the chunk is not a loaded
+     * {@link LevelChunk}}
+     */
+    private static long currentChunkVersion(@Nullable ServerChunkCache chunkSource, long chunkKey) {
+        if (chunkSource == null) {
+            return -1L;
+        }
+        final LevelChunk chunk = chunkSource.getChunkNow(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+        return chunk == null ? -1L : chunk.chunkVersion();
+    }
+
+    /**
+     * Builds the propagation a re-run of {@code region} repeats: the updates it applied, plus a self-directed
+     * neighbour update for every written position no applied update already targets.
+     */
+    private List<RegionBorderUpdates.BorderUpdate> rerunPayload(List<RegionBorderUpdates.BorderUpdate> applied,
+            it.unimi.dsi.fastutil.longs.LongArrayList seeds) {
+        final List<RegionBorderUpdates.BorderUpdate> payload = new ArrayList<>(applied);
+        if (seeds.isEmpty()) {
+            return payload;
+        }
+        final it.unimi.dsi.fastutil.longs.LongOpenHashSet covered = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(applied.size());
+        for (final RegionBorderUpdates.BorderUpdate update : applied) {
+            covered.add(update.pos().asLong());
+        }
+        for (final long seed : seeds) {
+            if (covered.add(seed)) {
+                payload.add(new RegionBorderUpdates.SelfUpdate(BlockPos.of(seed)));
+            }
+        }
+        return payload;
+    }
+
+    /** Forgets the foreign reads and the written positions of {@code region}, counting the dropped seeds. */
+    private void discardForeignReads(RegionState region) {
+        final int dropped = region.clearRerunSeeds();
+        if (dropped > 0) {
+            this.foreignReadSeedsDropped.addAndGet(dropped);
+        }
+        region.clearForeignChunkReads();
     }
 
     /**
@@ -2354,7 +2617,31 @@ public final class RegionThreadingEngine implements RegionThreading {
             return false;
         }
         updates.deferBlockUpdate(pos, oldState, newState, flags);
+        // The position is the propagation a re-run of this region has to repeat if a chunk it read changed
+        // under the write. Recording it here costs one context read and one list add per written block.
+        this.recordRerunSeed(pos);
         return true;
+    }
+
+    /**
+     * Remembers one position the region of the current group wrote, so a re-run of the region can re-evaluate it.
+     * <p>
+     * Only a thread that holds the lease of the region records: a write the group sends to another region is
+     * already a border update, and the region that applies it records it as its own seed there. A region that has
+     * not read a chunk of another region since its last check records nothing: no re-run can need the position,
+     * so the seed list of a region that never reads across a border stays empty.
+     */
+    private void recordRerunSeed(BlockPos pos) {
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext) || basicContext.regionState == null) {
+            return;
+        }
+        final RegionState region = basicContext.regionState;
+        if (region.foreignChunkReads().isEmpty() || !region.isOwnedByCurrentThread()) {
+            return;
+        }
+        // A position past the bound is counted by the region and drained with its next check.
+        region.recordRerunSeed(pos.asLong());
     }
 
     /** {@return true when this engine captures cross-region border updates} */
@@ -2467,6 +2754,48 @@ public final class RegionThreadingEngine implements RegionThreading {
     @ApiStatus.Internal
     public long foreignBlockEntityReads() {
         return this.foreignBlockEntityReads.get();
+    }
+
+    /** {@return the foreign chunk reads a region recorded for the border fixpoint} */
+    @ApiStatus.Internal
+    public long foreignChunkReads() {
+        return this.foreignChunkReads.get();
+    }
+
+    /** {@return the foreign chunk reads of a chunk that has no version, i.e. of a chunk no region owns} */
+    @ApiStatus.Internal
+    public long foreignChunkReadsWithoutVersion() {
+        return this.foreignChunkReadsWithoutVersion.get();
+    }
+
+    /** {@return the fixpoint checks in which a region observed a changed version of a foreign chunk} */
+    @ApiStatus.Internal
+    public long foreignReadInvalidatedPasses() {
+        return this.foreignReadInvalidatedPasses.get();
+    }
+
+    /** {@return the region propagation groups the fixpoint re-ran because a foreign read was invalidated} */
+    @ApiStatus.Internal
+    public long foreignReadRegionReruns() {
+        return this.foreignReadRegionReruns.get();
+    }
+
+    /** {@return the written positions a region dropped because its re-run seed bound was reached} */
+    @ApiStatus.Internal
+    public long foreignReadSeedsDropped() {
+        return this.foreignReadSeedsDropped.get();
+    }
+
+    /**
+     * Enables or disables the re-run of a region whose foreign read was invalidated.
+     * <p>
+     * The race tests turn it off to show the stale state a cross-region read produces without the version
+     * check; production always has it on. The switch does not disable the recording, so a disabled check still
+     * counts the foreign reads it did not act on.
+     */
+    @ApiStatus.Internal
+    public void setForeignReadRerunEnabledForTesting(boolean enabled) {
+        this.foreignReadRerunEnabled = enabled;
     }
 
     /**
@@ -5295,6 +5624,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // worker can be inside a delivery or a phase transition either.
                     this.closeLevelMailbox(level);
                     this.levelTickPhases.remove(level);
+                    final Set<RegionState> foreignReaders = this.regionsWithForeignReads.remove(level);
+                    if (foreignReaders != null) {
+                        foreignReaders.forEach(this::discardForeignReads);
+                    }
                     final RegionBorderUpdates borderUpdates = this.borderUpdates.remove(level);
                     if (borderUpdates != null) {
                         this.borderUpdatesDropped.addAndGet(borderUpdates.drain().size() + borderUpdates.drainOverflow().size());
@@ -6654,7 +6987,12 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.borderUpdatePasses.get(),
                         this.borderUpdateRegionsRerun.get(),
                         this.borderUpdateWorstPasses.get(),
-                        this.borderUpdatesOverflowed.get()),
+                        this.borderUpdatesOverflowed.get(),
+                        this.foreignChunkReads.get(),
+                        this.foreignChunkReadsWithoutVersion.get(),
+                        this.foreignReadInvalidatedPasses.get(),
+                        this.foreignReadRegionReruns.get(),
+                        this.foreignReadSeedsDropped.get()),
                 RegionPoiCounters.snapshot(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);

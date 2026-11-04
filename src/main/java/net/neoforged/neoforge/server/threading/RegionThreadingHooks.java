@@ -936,6 +936,34 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Records the version of one chunk a region worker is about to read.
+     * <p>
+     * The chunk source of a level serves any loaded chunk to a region worker, including a chunk another region
+     * is mutating. Its writes are safe - neighbour updates are captured and block events are deferred - but a
+     * read can observe a state that is torn or stale. The version the read observed is recorded per region and
+     * per pass, and the border fixpoint re-runs the propagation of the region when it changed, so the read is
+     * repaired in the same tick without a lock on the read path and without a copy of the chunk.
+     * <p>
+     * The call site is the worker chunk lookup, so the hook is on the read path of every block, fluid and block
+     * entity read of a worker. It costs one static read on a server without region threading and one thread-local
+     * read plus a chunk-coordinate comparison for a read of the caller's own region.
+     *
+     * @param level  the level of the chunk
+     * @param chunkX the chunk x of the chunk that is handed to the worker
+     * @param chunkZ the chunk z of the chunk that is handed to the worker
+     * @param chunk  the chunk the worker is about to read
+     */
+    public static void recordForeignChunkRead(net.minecraft.world.level.Level level, int chunkX, int chunkZ,
+            net.minecraft.world.level.chunk.ChunkAccess chunk) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (!(threading instanceof RegionThreadingEngine engine) || !(level instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        engine.recordForeignChunkRead(serverLevel, chunkX, chunkZ,
+                chunk instanceof net.minecraft.world.level.chunk.LevelChunk levelChunk ? levelChunk.chunkVersion() : -1L);
+    }
+
+    /**
      * Defers the block event of a region worker to the server thread's block event queue.
      * <p>
      * {@code ServerLevel.blockEvent} adds the event to one level-wide ordered set, and the event body of a

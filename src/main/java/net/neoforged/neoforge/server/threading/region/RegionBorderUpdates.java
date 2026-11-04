@@ -157,7 +157,7 @@ final class RegionBorderUpdates {
      * The record carries everything the target worker needs to reproduce the vanilla call. The target state is
      * read on the target worker, so the replay never uses a state a worker of another region read concurrently.
      */
-    sealed interface BorderUpdate permits NeighborUpdate, ShapeUpdate, ComparatorUpdate, BlockEntityChange {
+    sealed interface BorderUpdate permits NeighborUpdate, ShapeUpdate, ComparatorUpdate, BlockEntityChange, SelfUpdate {
         /** {@return the position the update targets, i.e. the position of the region that has to run it} */
         BlockPos pos();
 
@@ -212,6 +212,24 @@ final class RegionBorderUpdates {
         @Override
         public void apply(ServerLevel level) {
             level.blockEntityChanged(this.pos);
+        }
+    }
+
+    /**
+     * The re-evaluation of one position a region wrote, used by the re-run of a region whose foreign read was
+     * invalidated.
+     * <p>
+     * The block at the position decided its own state from a chunk of another region. The re-run replays the
+     * vanilla neighbour update of the position against itself, which is the weakest source a block re-evaluates
+     * from, and the target state is read on the worker that holds the lease, so the re-run never uses the state
+     * the invalidated pass read. A block that ignores its source - redstone dust, a piston, a repeater - decides
+     * again from the state the foreign chunk has now.
+     */
+    record SelfUpdate(BlockPos pos) implements BorderUpdate {
+        @Override
+        public void apply(ServerLevel level) {
+            final BlockState state = level.getBlockState(this.pos);
+            NeighborUpdater.executeUpdate(level, state, this.pos, state.getBlock(), this.pos, false);
         }
     }
 }

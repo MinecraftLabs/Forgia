@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
-@@ -73,6 +_,15 @@
+@@ -73,6 +_,24 @@
          }
      };
      private final Map<BlockPos, LevelChunk.RebindableTickingBlockEntityWrapper> tickersInLevel = Maps.newHashMap();
@@ -13,6 +13,15 @@
 +     * It is volatile because a worker revalidates the snapshot it was handed against it.
 +     */
 +    private volatile long blockEntityTickerRevision;
++    /**
++     * Neo: monotonic version of the mutable content of this chunk. Every block state write, every heightmap
++     * update that write performs and every block entity add or removal bumps it once, at the end of the
++     * mutation, so a reader that observes version {@code v} saw every mutation that completed before its read
++     * and the border fixpoint can tell that the chunk changed under a read that observed an older version.
++     * The bump is one volatile store on an object the mutation already dirties, and it is the only cost of the
++     * version when nothing reads it.
++     */
++    private volatile long chunkVersion;
      private boolean loaded;
      final Level level;
      @Nullable
@@ -50,8 +59,11 @@
                      profilerfiller.pop();
                  }
  
-@@ -278,7 +_,7 @@
+@@ -276,9 +_,10 @@
+                 }
+ 
                  if (!levelchunksection.getBlockState(j, k, l).is(block)) {
++                    ++this.chunkVersion;
                      return null;
                  } else {
 -                    if (!this.level.isClientSide) {
@@ -59,6 +71,14 @@
                          p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
                      }
  
+@@ -301,6 +_,7 @@
+                     }
+ 
+                     this.unsaved = true;
++                    ++this.chunkVersion;
+                     return blockstate;
+                 }
+             }
 @@ -327,6 +_,10 @@
      @Nullable
      public BlockEntity getBlockEntity(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
@@ -112,14 +132,16 @@
          }
      }
  
-@@ -403,6 +_,7 @@
+@@ -403,7 +_,9 @@
              BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
              if (blockentity != null && blockentity != p_156374_) {
                  blockentity.setRemoved();
 +                auxLightManager.removeLightAt(blockpos);
              }
++            ++this.chunkVersion;
          }
      }
+ 
 @@ -412,9 +_,14 @@
      public CompoundTag getBlockEntityNbtForSaving(BlockPos p_62932_, HolderLookup.Provider p_323699_) {
          BlockEntity blockentity = this.getBlockEntity(p_62932_);
@@ -135,11 +157,12 @@
          } else {
              CompoundTag compoundtag = this.pendingBlockEntities.get(p_62932_);
              if (compoundtag != null) {
-@@ -436,6 +_,7 @@
+@@ -436,6 +_,8 @@
                  }
  
                  blockentity.setRemoved();
 +                auxLightManager.removeLightAt(p_62919_);
++                ++this.chunkVersion;
              }
          }
  
@@ -169,11 +192,12 @@
              }
          });
      }
-@@ -604,6 +_,14 @@
+@@ -604,6 +_,15 @@
      }
  
      public void clearAllBlockEntities() {
 +        ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
++        ++this.chunkVersion; // Neo: every block entity of this chunk is gone
 +        // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
 +        // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
 +        // plan's chunk index.
@@ -200,7 +224,7 @@
          BlockState blockstate = p_156407_.getBlockState();
          BlockEntityTicker<T> blockentityticker = blockstate.getTicker(this.level, (BlockEntityType<T>)p_156407_.getType());
          if (blockentityticker == null) {
-@@ -656,33 +_,147 @@
+@@ -656,33 +_,160 @@
                      }
                  );
          }
@@ -266,6 +290,19 @@
 +     */
 +    public long blockEntityTickerRevision() {
 +        return this.blockEntityTickerRevision;
++    }
++
++    /**
++     * Neo: the monotonic version of the mutable content of this chunk, bumped once per completed block state,
++     * heightmap or block-entity mutation.
++     * <p>
++     * A region worker that reads a chunk of another region records this value. The border fixpoint compares it
++     * after the read and re-runs the propagation of the reader if the chunk changed under the read, so a torn
++     * or stale cross-region read is repaired in the same tick without a lock on the read path and without a
++     * copy of the chunk.
++     */
++    public long chunkVersion() {
++        return this.chunkVersion;
 +    }
 +
 +    /** Neo: whether this chunk is currently loaded in its level. */
