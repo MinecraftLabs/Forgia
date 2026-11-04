@@ -45,7 +45,14 @@ public enum RegionTickSlice {
      * chunk and admits entities - so the reservation only has to cover the writes a modded spawn hook, a
      * {@code finalizeSpawn} or a mob's equipment could still make; eight entries cover one spawn attempt.
      */
-    SPAWN(8);
+    SPAWN(8),
+    /**
+     * One border-propagation pass of one region. The pass only applies the captured neighbor updates and runs
+     * their cascades; it does not tick an entity, a block entity, a chunk or a spawn body. It reserves no
+     * deferred-block-update entries before its body because the number of writes of a cascade is not known
+     * before it runs, and a propagation batch is never admitted through a unit budget.
+     */
+    PROPAGATION(8);
 
     private final int reservationPerUnit;
 

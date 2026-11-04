@@ -652,6 +652,80 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * {@return true when the installed engine captures cross-region border updates}
+     * <p>
+     * The switch is the engine's copy of {@code enableRegionThreadingBorderUpdates}. It decides whether a region
+     * context collects neighbor updates through the vanilla collector or through the border-capturing one.
+     */
+    public static boolean borderUpdatesEnabled() {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.borderUpdatesEnabled();
+    }
+
+    /**
+     * Defers one neighbor update whose target belongs to another region.
+     * <p>
+     * Called from the region collector before the vanilla update reads or applies the target state. Outside a
+     * region lease, with the switch off, or for a target of the current lease this returns {@code false} and the
+     * vanilla path runs unchanged.
+     *
+     * @return {@code true} when the update was recorded for the target region's fixpoint pass
+     */
+    public static boolean deferBorderNeighborUpdate(net.minecraft.world.level.Level level, BlockPos pos, net.minecraft.world.level.block.Block block,
+            BlockPos neighborPos, boolean movedByPiston) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.deferBorderNeighborUpdate(serverLevel, pos, block, neighborPos, movedByPiston);
+    }
+
+    /**
+     * Defers one shape update whose target belongs to another region.
+     *
+     * @return {@code true} when the update was recorded for the target region's fixpoint pass
+     */
+    public static boolean deferBorderShapeUpdate(net.minecraft.world.level.Level level, net.minecraft.core.Direction direction,
+            net.minecraft.world.level.block.state.BlockState state, BlockPos pos, BlockPos neighborPos, int updateFlags, int updateLimit) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.deferBorderShapeUpdate(serverLevel, direction, state, pos, neighborPos, updateFlags, updateLimit);
+    }
+
+    /**
+     * Defers one direction of {@code Level.updateNeighbourForOutputSignal} whose target belongs to another
+     * region.
+     *
+     * @return {@code true} when the comparator update was recorded for the target region's fixpoint pass
+     */
+    public static boolean deferBorderComparatorUpdate(net.minecraft.world.level.Level level, BlockPos pos, BlockPos sourcePos,
+            net.minecraft.world.level.block.Block sourceBlock, net.minecraft.core.Direction direction) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.deferBorderComparatorUpdate(serverLevel, pos, sourcePos, sourceBlock, direction);
+    }
+
+    /**
+     * Defers the unsaved-chunk mark of one block-entity change whose block entity belongs to another region.
+     *
+     * @return {@code true} when the change was recorded for the target region's fixpoint pass
+     */
+    public static boolean deferBorderBlockEntityChange(net.minecraft.world.level.Level level, BlockPos pos) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferBorderBlockEntityChange(serverLevel, pos);
+    }
+
+    /**
      * Defers the light section status change of one block write of a region worker group to the server thread.
      * <p>
      * The light engine of a level is one engine with one set of queues and one light thread, so a region worker

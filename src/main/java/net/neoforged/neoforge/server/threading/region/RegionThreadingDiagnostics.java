@@ -291,6 +291,7 @@ public record RegionThreadingDiagnostics(
         long mailboxDroppedRetiredMessages,
         long mailboxDroppedOnCloseMessages,
         long mailboxDeliveryFailures,
+        BorderUpdateCounters borderUpdates,
         PoiCounters poiCounters,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
@@ -318,6 +319,34 @@ public record RegionThreadingDiagnostics(
             long loadedColumns,
             long savedColumns,
             long villageDistanceQueries) {}
+
+    /**
+     * The counters of the cross-region border update fixpoint.
+     * <p>
+     * {@code recorded} counts the neighbor, shape, comparator and block-entity updates a region worker captured
+     * because they targeted another region. {@code applied} counts the records a propagation pass applied on the
+     * target region's worker, {@code delayed} the records the bound pushed to the target region's next tick
+     * through the mailbox, and {@code dropped} the records no live target region (or no open mailbox) could take.
+     * {@code passes} counts the full fixpoint passes the server thread ran, {@code regionsRerun} the
+     * propagation-only groups it submitted, and {@code worstPasses} the largest number of passes one worker
+     * phase needed. {@code overflowed} counts the records the capture queue's own bound refused; they are handed
+     * to the same next-tick fallback. Every record reaches exactly one of applied, delayed or dropped, so a
+     * growing {@code delayed} count is the only observable sign that a circuit needed more than one tick.
+     */
+    public record BorderUpdateCounters(long recorded, long applied, long delayed, long dropped, long passes,
+            long regionsRerun, long worstPasses, long overflowed) {
+        @Override
+        public String toString() {
+            return "recorded=" + this.recorded
+                    + "/applied=" + this.applied
+                    + "/delayed=" + this.delayed
+                    + "/dropped=" + this.dropped
+                    + "/passes=" + this.passes
+                    + "/regionsRerun=" + this.regionsRerun
+                    + "/worstPasses=" + this.worstPasses
+                    + "/overflowed=" + this.overflowed;
+        }
+    }
 
     /**
      * The light rechecks and block update publications the batches of the level deferred, counted per slice.

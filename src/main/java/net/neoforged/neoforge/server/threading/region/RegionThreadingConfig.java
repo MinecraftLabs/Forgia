@@ -47,6 +47,19 @@ final class RegionThreadingConfig {
         return NeoForgeConfig.SERVER.enableRegionThreadingPoi.get() || NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get();
     }
 
+    /**
+     * {@return true when a region context captures the neighbor updates that target another region}
+     * <p>
+     * The switch is off by default. When it is off the region context uses the vanilla collecting updater and
+     * the level write paths keep their vanilla behavior, so the feature costs nothing on a server that does not
+     * enable it.
+     */
+    static boolean borderUpdatesEnabled() {
+        return NeoForgeConfig.isServerConfigLoaded()
+                ? NeoForgeConfig.SERVER.enableRegionThreadingBorderUpdates.get()
+                : NeoForgeConfig.SERVER.enableRegionThreadingBorderUpdates.getDefault();
+    }
+
     static NeoForgeConfig.RegionThreadingOwnershipViolationMode ownershipViolationMode() {
         return NeoForgeConfig.isServerConfigLoaded()
                 ? NeoForgeConfig.SERVER.regionThreadingOwnershipViolationMode.get()

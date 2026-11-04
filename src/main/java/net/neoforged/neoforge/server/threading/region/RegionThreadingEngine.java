@@ -24,11 +24,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
@@ -37,6 +40,7 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -210,6 +214,37 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong mailboxDroppedRetiredMessages = new AtomicLong();
     private final AtomicLong mailboxDroppedOnCloseMessages = new AtomicLong();
     private final AtomicLong mailboxDeliveryFailures = new AtomicLong();
+
+    /**
+     * The captured border updates of each level. A region worker records an update that targets another region
+     * here instead of applying it; the server thread drains the queue after the worker phase and runs the
+     * same-tick fixpoint. The map is empty for a level without border updates and for a server whose switch is
+     * off.
+     */
+    private final Map<ServerLevel, RegionBorderUpdates> borderUpdates = new ConcurrentHashMap<>();
+    /**
+     * Whether the installed engine captures cross-region border updates. It is the engine's copy of
+     * {@code enableRegionThreadingBorderUpdates}, taken at construction so a batch never re-reads the config.
+     */
+    private volatile boolean borderUpdatesEnabled = RegionThreadingConfig.borderUpdatesEnabled();
+    /** Test override of the fixpoint bound; a negative value reads the level's vanilla limit. */
+    private volatile int borderUpdateBudgetForTesting = -1;
+    /** Border updates a worker recorded instead of applying. */
+    private final AtomicLong borderUpdatesRecorded = new AtomicLong();
+    /** Border updates a propagation pass applied on the target region's worker. */
+    private final AtomicLong borderUpdatesApplied = new AtomicLong();
+    /** Border updates the fixpoint bound pushed to the target region's next tick through the mailbox. */
+    private final AtomicLong borderUpdatesDelayed = new AtomicLong();
+    /** Border updates neither applied nor delayed, i.e. a closed mailbox or a retired target. */
+    private final AtomicLong borderUpdatesDropped = new AtomicLong();
+    /** Full fixpoint passes the server thread ran after a worker phase. */
+    private final AtomicLong borderUpdatePasses = new AtomicLong();
+    /** Region propagation groups the fixpoint re-ran. */
+    private final AtomicLong borderUpdateRegionsRerun = new AtomicLong();
+    /** Worst number of passes one worker phase needed. */
+    private final AtomicLong borderUpdateWorstPasses = new AtomicLong();
+    /** Border updates the capture bound refused, which were handed to the next-tick fallback. */
+    private final AtomicLong borderUpdatesOverflowed = new AtomicLong();
 
     /** One level's chunk-load answers and the loaded chunk count they were read at. */
     private static final class ChunkLoadAnswers {
@@ -1075,10 +1110,300 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private void runRegionBatch(ServerLevel level, Runnable batch) {
         this.beginRegionPhase(level);
+        Throwable failure = null;
         try {
             batch.run();
+        } catch (Throwable throwable) {
+            failure = throwable;
         } finally {
-            this.endRegionPhase(level);
+            try {
+                // The worker phase of the batch is over: no worker holds a lease anymore, so the server thread
+                // can hand the captured cross-region updates to their target regions and repeat until the
+                // circuit stops changing or the vanilla chained-update bound is reached. A failure of the batch
+                // is not masked by a failure of the fixpoint.
+                try {
+                    this.runBorderUpdateFixpoint(level);
+                } catch (Throwable throwable) {
+                    if (failure == null) {
+                        failure = throwable;
+                    } else {
+                        failure.addSuppressed(throwable);
+                    }
+                }
+            } finally {
+                this.endRegionPhase(level);
+            }
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /**
+     * Applies the border updates of the worker phase that just ended and re-runs the affected regions until no
+     * border update remains or the bound is reached.
+     * <p>
+     * The fixpoint is a sequence of passes. A pass groups the pending updates by target region and runs one
+     * propagation-only group per region, one region after another, so the second region of a pass sees the
+     * writes of the first one. A propagation group only applies the captured vanilla updates and runs their
+     * neighbor cascades; it ticks no entity, block entity, chunk or spawn body. The cascades record further
+     * cross-region updates into the same queue, which become the next pass.
+     * <p>
+     * <strong>Bound.</strong> The bound is the level's {@code max-chained-neighbor-updates} limit, the number
+     * vanilla uses for one cascade (default {@code 1000000}). A negative configured value means unlimited in
+     * vanilla; the fixpoint then uses {@link SharedConstants#MAX_CHAINED_NEIGHBOR_UPDATES} so it can never spin.
+     * The bound applies to the border updates applied by the passes and to the number of passes, because every
+     * pass applies at least one update. The updates that do not fit are posted to the target region's mailbox
+     * and applied at the start of its next group, so the circuit converges one tick later instead of losing
+     * an update.
+     * <p>
+     * The capture queue's own bound ({@link RegionBorderUpdates#MAX_ENTRIES}) is an overflow of the memory of
+     * one pass, not of the vanilla limit: the records past it are posted to the same next-tick fallback.
+     */
+    private void runBorderUpdateFixpoint(ServerLevel level) {
+        if (!this.borderUpdatesEnabled) {
+            return;
+        }
+        final RegionBorderUpdates updates = this.borderUpdates.get(level);
+        if (updates == null) {
+            return;
+        }
+        List<RegionBorderUpdates.BorderUpdate> pending = updates.drain();
+        final List<RegionBorderUpdates.BorderUpdate> overflow = updates.drainOverflow();
+        if (pending.isEmpty() && overflow.isEmpty()) {
+            return;
+        }
+        if (this.regionizer.isLevelClosed(level) || this.shutdown) {
+            this.borderUpdatesDropped.addAndGet(pending.size() + overflow.size());
+            updates.discard();
+            return;
+        }
+        this.delayBorderUpdates(level, overflow);
+
+        final int budget = this.borderUpdateBudget(level);
+        final RegionTickBarrier barrier = borderFixpointBarrier(level);
+        int passes = 0;
+        int applied = 0;
+        List<RegionBorderUpdates.BorderUpdate> deferred = new ArrayList<>();
+        while (!pending.isEmpty() && passes < budget && applied < budget) {
+            passes++;
+            final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> byRegion = this.groupBorderUpdatesByRegion(level, pending);
+            for (final Map.Entry<RegionState, List<RegionBorderUpdates.BorderUpdate>> entry : byRegion.entrySet()) {
+                final List<RegionBorderUpdates.BorderUpdate> regionUpdates = entry.getValue();
+                if (applied >= budget) {
+                    deferred.addAll(regionUpdates);
+                    continue;
+                }
+                final int allowed = Math.min(regionUpdates.size(), budget - applied);
+                final List<RegionBorderUpdates.BorderUpdate> apply = regionUpdates.subList(0, allowed);
+                if (allowed < regionUpdates.size()) {
+                    deferred.addAll(regionUpdates.subList(allowed, regionUpdates.size()));
+                }
+                if (this.runBorderPropagationPass(level, entry.getKey(), apply, barrier)) {
+                    applied += apply.size();
+                    this.borderUpdateRegionsRerun.incrementAndGet();
+                } else {
+                    deferred.addAll(apply);
+                }
+            }
+            // The cascades of this pass recorded new border updates. They run in the next pass, after every
+            // region of this pass saw the writes of the regions before it.
+            pending = updates.drain();
+        }
+        if (!pending.isEmpty()) {
+            deferred.addAll(pending);
+        }
+        this.borderUpdatePasses.addAndGet(passes);
+        this.borderUpdateWorstPasses.accumulateAndGet(passes, Math::max);
+        if (!deferred.isEmpty()) {
+            this.delayBorderUpdates(level, deferred);
+        }
+    }
+
+    /**
+     * Groups the pending border updates by the live region that has to apply them, in first-seen order.
+     * <p>
+     * An update whose target region does not exist or is retired is counted as dropped: no region will ever
+     * run it, and handing it to a different region would apply it to the wrong state.
+     */
+    private Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> groupBorderUpdatesByRegion(ServerLevel level,
+            List<RegionBorderUpdates.BorderUpdate> updates) {
+        final Map<RegionState, List<RegionBorderUpdates.BorderUpdate>> byRegion = new java.util.LinkedHashMap<>();
+        for (final RegionBorderUpdates.BorderUpdate update : updates) {
+            final RegionState region = this.regionizer.get(this.layout.regionAt(level, update.pos()));
+            if (region == null || region.isDead()) {
+                this.borderUpdatesDropped.incrementAndGet();
+                continue;
+            }
+            byRegion.computeIfAbsent(region, key -> new ArrayList<>()).add(update);
+        }
+        return byRegion;
+    }
+
+    /**
+     * Runs one propagation-only pass of one region and waits for it.
+     *
+     * @return {@code true} when the region was leased and the pass ran; {@code false} when the region retired
+     *         or the level closed before the lease, so the caller has to fall back to the next tick
+     */
+    private boolean runBorderPropagationPass(ServerLevel level, RegionState region, List<RegionBorderUpdates.BorderUpdate> updates,
+            RegionTickBarrier barrier) {
+        final RegionBorderPropagationBatch batch = new RegionBorderPropagationBatch(level, this.deferredBlockUpdateBudget);
+        final TickBatchPublication publication = this.publishTickBatch(batch, level);
+        if (publication != TickBatchPublication.PUBLISHED) {
+            return false;
+        }
+        batch.markExecutingOnCurrentThread();
+        Throwable failure = null;
+        boolean ran = false;
+        try {
+            if (this.acquireRegionLease(region, barrier)) {
+                ran = true;
+                this.addLeasedGroup(region, () -> batch.addGroup(region, this.borderPropagationGroup(batch, region, updates)));
+                this.beginRegionPhase(level);
+                try {
+                    batch.submitAndAwait(this.workerPool, barrier);
+                } catch (Throwable throwable) {
+                    failure = throwable;
+                } finally {
+                    this.endRegionPhase(level);
+                }
+            }
+        } catch (Throwable throwable) {
+            if (failure == null) {
+                failure = throwable;
+            } else {
+                failure.addSuppressed(throwable);
+            }
+        } finally {
+            failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
+            failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.regionTickMutations()));
+            batch.finish();
+            this.activeTickBatches.remove(batch);
+            batch.clearExecutingOnCurrentThread();
+        }
+        if (failure != null) {
+            throwUnchecked(failure);
+        }
+        batch.throwIfFailed();
+        return ran;
+    }
+
+    /**
+     * The worker body of one border-propagation group.
+     * <p>
+     * The group holds the lease of the target region, enters the same region execution context and neighbor
+     * update scope as a tick group, and applies the captured vanilla updates in recording order. It installs
+     * the scheduled-tick mutation queue so a cascade that schedules a tick defers it to the server thread, but
+     * it ticks nothing itself.
+     */
+    private Runnable borderPropagationGroup(RegionBorderPropagationBatch batch, RegionState region,
+            List<RegionBorderUpdates.BorderUpdate> updates) {
+        final RegionCoordinate coordinate = region.coordinate();
+        final ServerLevel level = batch.level();
+        return () -> {
+            final long start = System.nanoTime();
+            try {
+                region.beginOwnership();
+                this.currentRegionTickMutations.set(batch.regionTickMutations());
+                try {
+                    final RegionNeighborUpdateScope previousNeighbors = RegionNeighborUpdateScope.enter(new RegionNeighborUpdateScope());
+                    try {
+                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
+                            for (final RegionBorderUpdates.BorderUpdate update : updates) {
+                                update.apply(level);
+                                this.borderUpdatesApplied.incrementAndGet();
+                            }
+                        });
+                    } finally {
+                        RegionNeighborUpdateScope.exit(previousNeighbors);
+                    }
+                } finally {
+                    this.currentRegionTickMutations.remove();
+                }
+            } finally {
+                region.endOwnership();
+                region.clearRunning();
+                final long duration = System.nanoTime() - start;
+                region.tickMetrics().recordTick(duration);
+                RegionTickWatchdog.warnIfLongTick("border propagation " + coordinate, duration);
+                this.regionizer.removeIfEmpty(region);
+            }
+        };
+    }
+
+    /**
+     * {@return the fixpoint bound of {@code level}, i.e. vanilla's own chained-update limit}
+     */
+    private int borderUpdateBudget(ServerLevel level) {
+        if (this.borderUpdateBudgetForTesting >= 0) {
+            return this.borderUpdateBudgetForTesting;
+        }
+        final int configured = level.maxChainedNeighborUpdates();
+        return configured >= 0 ? configured : SharedConstants.MAX_CHAINED_NEIGHBOR_UPDATES;
+    }
+
+    /**
+     * {@return the barrier the propagation passes wait on}
+     * <p>
+     * Production uses the level's chunk-source barrier, exactly like a tick batch. A mechanics test whose mock
+     * level has no chunk source parks until the group finishes.
+     */
+    private static RegionTickBarrier borderFixpointBarrier(ServerLevel level) {
+        final RegionTickBarrier barrier = levelBarrier(level);
+        return barrier != null ? barrier : condition -> {
+            while (!condition.getAsBoolean()) {
+                LockSupport.parkNanos(100_000L);
+            }
+        };
+    }
+
+    /**
+     * Hands the border updates the fixpoint could not apply this tick to the target regions' mailboxes.
+     * <p>
+     * A message is delivered at the start of the target region's next group, on the worker that holds the
+     * lease, and only records the updates again; the fixpoint of that batch then applies them. The message is
+     * therefore one tick later, never lost. A target region that retired, or a mailbox that is full or closed,
+     * drops the updates and counts them.
+     */
+    private void delayBorderUpdates(ServerLevel level, List<RegionBorderUpdates.BorderUpdate> updates) {
+        if (updates.isEmpty()) {
+            return;
+        }
+        final Map<RegionCoordinate, List<RegionBorderUpdates.BorderUpdate>> byTarget = new java.util.LinkedHashMap<>();
+        for (final RegionBorderUpdates.BorderUpdate update : updates) {
+            final RegionState region = this.regionizer.get(this.layout.regionAt(level, update.pos()));
+            if (region == null || region.isDead()) {
+                this.borderUpdatesDropped.incrementAndGet();
+                continue;
+            }
+            byTarget.computeIfAbsent(region.coordinate(), key -> new ArrayList<>()).add(update);
+        }
+        if (byTarget.isEmpty()) {
+            return;
+        }
+        final RegionMailbox mailbox = this.mailbox(level);
+        for (final Map.Entry<RegionCoordinate, List<RegionBorderUpdates.BorderUpdate>> entry : byTarget.entrySet()) {
+            final List<RegionBorderUpdates.BorderUpdate> message = List.copyOf(entry.getValue());
+            final RegionMailbox.PostResult result = mailbox.post(entry.getKey(), () -> this.recordDelayedBorderUpdates(level, message));
+            if (result == RegionMailbox.PostResult.ACCEPTED) {
+                this.borderUpdatesDelayed.addAndGet(message.size());
+            } else {
+                this.borderUpdatesDropped.addAndGet(message.size());
+            }
+        }
+    }
+
+    /**
+     * Re-queues the updates a mailbox delivered at the start of the target region's next group, so the fixpoint
+     * of that batch applies them on the target region's worker.
+     */
+    private void recordDelayedBorderUpdates(ServerLevel level, List<RegionBorderUpdates.BorderUpdate> updates) {
+        final RegionBorderUpdates queue = this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates());
+        for (final RegionBorderUpdates.BorderUpdate update : updates) {
+            if (queue.record(update) == RegionBorderUpdates.RecordResult.OVERFLOW) {
+                this.borderUpdatesOverflowed.incrementAndGet();
+            }
         }
     }
 
@@ -1994,6 +2319,123 @@ public final class RegionThreadingEngine implements RegionThreading {
         return true;
     }
 
+    /** {@return true when this engine captures cross-region border updates} */
+    public boolean borderUpdatesEnabled() {
+        return this.borderUpdatesEnabled;
+    }
+
+    /**
+     * Enables or disables the border capture of this engine.
+     * <p>
+     * Production reads the switch from the server config at construction. The setter is the mechanics seam the
+     * cross-region tests use, so a test does not have to load the config.
+     */
+    @ApiStatus.Internal
+    public void setBorderUpdatesEnabledForTesting(boolean enabled) {
+        this.borderUpdatesEnabled = enabled;
+    }
+
+    /**
+     * Overrides the fixpoint bound, so a mechanics test can observe the next-tick fallback without producing
+     * the level's default million chained updates.
+     */
+    @ApiStatus.Internal
+    public void setBorderUpdateBudgetForTesting(int budget) {
+        this.borderUpdateBudgetForTesting = budget;
+    }
+
+    /**
+     * Records one neighbor update whose target belongs to another region.
+     *
+     * @return {@code true} when the caller has to skip the vanilla update
+     */
+    public boolean deferBorderNeighborUpdate(ServerLevel level, BlockPos pos, Block block, BlockPos neighborPos, boolean movedByPiston) {
+        if (!this.capturesBorderUpdate(level, pos)) {
+            return false;
+        }
+        return this.recordBorderUpdate(level, new RegionBorderUpdates.NeighborUpdate(pos.immutable(), block, neighborPos.immutable(), movedByPiston));
+    }
+
+    /**
+     * Records one shape update whose target belongs to another region.
+     *
+     * @return {@code true} when the caller has to skip the vanilla update
+     */
+    public boolean deferBorderShapeUpdate(ServerLevel level, Direction direction, BlockState state, BlockPos pos, BlockPos neighborPos,
+            int updateFlags, int updateLimit) {
+        if (!this.capturesBorderUpdate(level, pos)) {
+            return false;
+        }
+        return this.recordBorderUpdate(level,
+                new RegionBorderUpdates.ShapeUpdate(direction, state, pos.immutable(), neighborPos.immutable(), updateFlags, updateLimit));
+    }
+
+    /**
+     * Records one direction of {@code Level.updateNeighbourForOutputSignal} whose target belongs to another
+     * region.
+     *
+     * @return {@code true} when the caller has to skip the vanilla body of that direction
+     */
+    public boolean deferBorderComparatorUpdate(ServerLevel level, BlockPos pos, BlockPos sourcePos, Block sourceBlock, Direction direction) {
+        if (!this.capturesBorderUpdate(level, pos)) {
+            return false;
+        }
+        return this.recordBorderUpdate(level,
+                new RegionBorderUpdates.ComparatorUpdate(pos.immutable(), sourcePos.immutable(), sourceBlock, direction));
+    }
+
+    /**
+     * Records the unsaved-chunk mark of one block-entity change whose block entity belongs to another region.
+     *
+     * @return {@code true} when the caller has to skip the vanilla mark
+     */
+    public boolean deferBorderBlockEntityChange(ServerLevel level, BlockPos pos) {
+        if (!this.capturesBorderUpdate(level, pos)) {
+            return false;
+        }
+        return this.recordBorderUpdate(level, new RegionBorderUpdates.BlockEntityChange(pos.immutable()));
+    }
+
+    /**
+     * {@return true when the current thread holds a region lease that does not contain {@code pos}}
+     * <p>
+     * Only a region lease captures. The server thread, the global region, a plain region queue task without a
+     * lease and a worker whose target is inside its own region all keep the vanilla inline path. The check runs
+     * before the record is allocated, so a server with the switch on but no cross-region update pays no
+     * allocation per neighbor update.
+     */
+    private boolean capturesBorderUpdate(ServerLevel level, BlockPos pos) {
+        if (!this.borderUpdatesEnabled) {
+            return false;
+        }
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext)
+                || basicContext.kind() != RegionThreadingContext.Kind.REGION
+                || basicContext.regionCoordinate == null) {
+            return false;
+        }
+        return !this.isOwnedByCurrentRegion(level, pos);
+    }
+
+    private boolean recordBorderUpdate(ServerLevel level, RegionBorderUpdates.BorderUpdate update) {
+        final RegionBorderUpdates updates = this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates());
+        final RegionBorderUpdates.RecordResult result = updates.record(update);
+        if (result == RegionBorderUpdates.RecordResult.ACCEPTED) {
+            this.borderUpdatesRecorded.incrementAndGet();
+        } else if (result == RegionBorderUpdates.RecordResult.OVERFLOW) {
+            this.borderUpdatesOverflowed.incrementAndGet();
+        }
+        // A duplicate is already queued and an overflow is kept for the next-tick fallback: the caller must not
+        // apply either inline, because the worker does not hold the target lease.
+        return true;
+    }
+
+    /**
+     * {@return true when the current thread holds a region lease that does not contain {@code update.pos()}}
+     * <p>
+     * Only a region lease captures. The server thread, the global region, a plain region queue task without a
+     * lease and a worker whose target is inside its own region all keep the vanilla inline path.
+     */
     /**
      * {@return the entries one region tick batch may reserve for its deferred block updates}
      */
@@ -4772,6 +5214,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                     // worker can be inside a delivery or a phase transition either.
                     this.closeLevelMailbox(level);
                     this.levelTickPhases.remove(level);
+                    final RegionBorderUpdates borderUpdates = this.borderUpdates.remove(level);
+                    if (borderUpdates != null) {
+                        this.borderUpdatesDropped.addAndGet(borderUpdates.drain().size() + borderUpdates.drainOverflow().size());
+                        borderUpdates.discard();
+                    }
                     for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                         if (task.isOwnedBy(level)) {
                             task.cancel();
@@ -6118,6 +6565,15 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.mailboxDroppedRetiredMessages.get(),
                 this.mailboxDroppedOnCloseMessages.get(),
                 this.mailboxDeliveryFailures.get(),
+                new RegionThreadingDiagnostics.BorderUpdateCounters(
+                        this.borderUpdatesRecorded.get(),
+                        this.borderUpdatesApplied.get(),
+                        this.borderUpdatesDelayed.get(),
+                        this.borderUpdatesDropped.get(),
+                        this.borderUpdatePasses.get(),
+                        this.borderUpdateRegionsRerun.get(),
+                        this.borderUpdateWorstPasses.get(),
+                        this.borderUpdatesOverflowed.get()),
                 RegionPoiCounters.snapshot(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);
@@ -6183,6 +6639,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                 }
                 this.mailboxes.clear();
                 this.levelTickPhases.clear();
+                for (final RegionBorderUpdates borderUpdates : this.borderUpdates.values()) {
+                    this.borderUpdatesDropped.addAndGet(borderUpdates.drain().size() + borderUpdates.drainOverflow().size());
+                    borderUpdates.discard();
+                }
+                this.borderUpdates.clear();
                 // The global region has no coordinate and is not part of the region metrics, so its window is
                 // released here: a shut-down engine holds no metric buffer at all.
                 this.globalRegion.tickMetrics().release();

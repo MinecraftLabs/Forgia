@@ -7,7 +7,6 @@ package net.neoforged.neoforge.server.threading.region;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
-import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
 import net.minecraft.world.level.redstone.NeighborUpdater;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
@@ -27,7 +26,7 @@ import org.jetbrains.annotations.Nullable;
 final class RegionNeighborUpdateScope {
     private static final ThreadLocal<RegionNeighborUpdateScope> CURRENT = new ThreadLocal<>();
     @Nullable
-    private Map<RegionAwareNeighborUpdater, CollectingNeighborUpdater> updaters;
+    private Map<RegionAwareNeighborUpdater, NeighborUpdater> updaters;
 
     RegionNeighborUpdateScope() {}
 

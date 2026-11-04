@@ -9,9 +9,13 @@
      public static final Codec<ResourceKey<Level>> RESOURCE_KEY_CODEC = ResourceKey.codec(Registries.DIMENSION);
      public static final ResourceKey<Level> OVERWORLD = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("overworld"));
      public static final ResourceKey<Level> NETHER = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("the_nether"));
-@@ -91,6 +_,18 @@
+@@ -90,7 +_,22 @@
+     public static final int MIN_ENTITY_SPAWN_Y = -20000000;
      protected final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
      protected final NeighborUpdater neighborUpdater;
++    // Neo: the vanilla chained-neighbor-update limit of this level. The cross-region border fixpoint uses the
++    // same number as its bound, so a circuit that crosses a region border stops where a vanilla cascade stops.
++    private final int maxChainedNeighborUpdates;
      private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
 +    private final Object blockEntityTickerLock = new Object();
 +    // Neo: the chunks that currently hold block-entity tickers, in registration order. The block-entity
@@ -51,15 +55,33 @@
  
      protected Level(
          WritableLevelData p_270739_,
-@@ -151,7 +_,7 @@
+@@ -151,7 +_,8 @@
          this.thread = Thread.currentThread();
          this.biomeManager = new BiomeManager(this, p_270248_);
          this.isDebug = p_270470_;
 -        this.neighborUpdater = new CollectingNeighborUpdater(this, p_270466_);
++        this.maxChainedNeighborUpdates = p_270466_;
 +        this.neighborUpdater = new net.neoforged.neoforge.server.threading.region.RegionAwareNeighborUpdater(this, p_270466_);
          this.registryAccess = p_270200_;
          this.damageSources = new DamageSources(p_270200_);
      }
+@@ -161,6 +_,16 @@
+         return this.isClientSide;
+     }
+ 
++    /**
++     * Neo: {@return the vanilla chained-neighbor-update limit of this level}
++     * <p>
++     * A negative value means unlimited in vanilla; the cross-region fixpoint maps it to
++     * {@code SharedConstants.MAX_CHAINED_NEIGHBOR_UPDATES} so it still has a finite bound.
++     */
++    public int maxChainedNeighborUpdates() {
++        return this.maxChainedNeighborUpdates;
++    }
++
+     @Nullable
+     @Override
+     public MinecraftServer getServer() {
 @@ -216,11 +_,40 @@
          } else {
              LevelChunk levelchunk = this.getChunkAt(p_46605_);
@@ -504,7 +526,19 @@
      }
  
      @Nullable
-@@ -979,16 +_,15 @@
+@@ -858,6 +_,11 @@
+ 
+     public void blockEntityChanged(BlockPos p_151544_) {
+         if (this.hasChunkAt(p_151544_)) {
++            // Neo: a region worker may not mark a chunk it does not lease; the target region's propagation
++            // pass runs the vanilla mark in the same tick.
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderBlockEntityChange(this, p_151544_)) {
++                return;
++            }
+             this.getChunkAt(p_151544_).setUnsaved(true);
+         }
+     }
+@@ -979,16 +_,20 @@
      public abstract Scoreboard getScoreboard();
  
      public void updateNeighbourForOutputSignal(BlockPos p_46718_, Block p_46719_) {
@@ -512,6 +546,11 @@
 +        for(Direction direction : Direction.values()) {
              BlockPos blockpos = p_46718_.relative(direction);
              if (this.hasChunkAt(blockpos)) {
++                // Neo: one direction of the comparator update can target another region. The target region's
++                // propagation pass runs the exact vanilla body of that direction in the same tick.
++                if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderComparatorUpdate(this, blockpos, p_46718_, p_46719_, direction)) {
++                    continue;
++                }
                  BlockState blockstate = this.getBlockState(blockpos);
 -                if (blockstate.is(Blocks.COMPARATOR)) {
 -                    this.neighborChanged(blockstate, blockpos, p_46719_, p_46718_, false);

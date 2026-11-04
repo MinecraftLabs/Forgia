@@ -12,6 +12,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
 import net.minecraft.world.level.redstone.NeighborUpdater;
+import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -49,8 +50,23 @@ public final class RegionAwareNeighborUpdater implements NeighborUpdater {
         return scope == null ? this.sharedUpdater : scope.updaterFor(this);
     }
 
-    CollectingNeighborUpdater newRegionUpdater() {
-        return new CollectingNeighborUpdater(this.level, this.maxChainedNeighborUpdates);
+    NeighborUpdater newRegionUpdater() {
+        // The vanilla collector is the exact server-thread behavior and stays in use while the cross-region
+        // border updates are off. With the switch on, the region collector additionally records an update that
+        // targets another region instead of applying it against a lease it does not hold.
+        return RegionThreadingHooks.borderUpdatesEnabled()
+                ? new RegionCollectingNeighborUpdater(this.level, this.maxChainedNeighborUpdates)
+                : new CollectingNeighborUpdater(this.level, this.maxChainedNeighborUpdates);
+    }
+
+    /**
+     * {@return the chained-update limit the level handed to its neighbor updater}
+     * <p>
+     * The cross-region fixpoint uses the same limit: a vanilla cascade stops after this many chained updates,
+     * so the same-tick passes stop after this many border updates and the rest fall back to the next tick.
+     */
+    public int maxChainedNeighborUpdates() {
+        return this.maxChainedNeighborUpdates;
     }
 
     @Override

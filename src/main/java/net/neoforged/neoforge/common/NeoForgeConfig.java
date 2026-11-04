@@ -52,6 +52,8 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingPoi;
 
+        public final BooleanValue enableRegionThreadingBorderUpdates;
+
         public final IntValue regionThreadingWorkerThreads;
 
         public final ModConfigSpec.EnumValue<RegionPolicy> regionThreadingMode;
@@ -152,6 +154,13 @@ public class NeoForgeConfig {
                     .translation("neoforge.configgui.enableRegionThreadingPoi")
                     .worldRestart()
                     .define("enableRegionThreadingPoi", false);
+
+            enableRegionThreadingBorderUpdates = builder
+                    .comment(
+                            "EXPERIMENTAL: Captures the neighbor updates a region worker cannot apply because they target another region, and applies them on the target region's own worker in the same tick. The fixpoint repeats until no border update remains or the level's max-chained-neighbor-updates limit is reached; the rest falls back to the target region's next tick through the region mailbox and is counted as delayed. Requires enableRegionThreadingBridge. With the switch off, a region context uses the unchanged vanilla neighbor collector and no border update is recorded.")
+                    .translation("neoforge.configgui.enableRegionThreadingBorderUpdates")
+                    .worldRestart()
+                    .define("enableRegionThreadingBorderUpdates", false);
 
             regionThreadingWorkerThreads = builder
                     .comment("EXPERIMENTAL: Number of native region worker threads reserved for the future region scheduler. A value of 0 uses max(1, available processors - 1).")
