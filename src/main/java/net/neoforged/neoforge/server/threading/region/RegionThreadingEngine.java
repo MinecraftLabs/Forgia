@@ -245,6 +245,10 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong borderUpdateWorstPasses = new AtomicLong();
     /** Border updates the capture bound refused, which were handed to the next-tick fallback. */
     private final AtomicLong borderUpdatesOverflowed = new AtomicLong();
+    /** Block events a region worker recorded for the server thread's block event phase. */
+    private final AtomicLong deferredBlockEvents = new AtomicLong();
+    /** Block entity reads a region group made against a quiescent foreign region. */
+    private final AtomicLong foreignBlockEntityReads = new AtomicLong();
 
     /** One level's chunk-load answers and the loaded chunk count they were read at. */
     private static final class ChunkLoadAnswers {
@@ -803,6 +807,40 @@ public final class RegionThreadingEngine implements RegionThreading {
             return false;
         }
         return this.isOwnedByCurrentRegion(level, entity.blockPosition());
+    }
+
+    /**
+     * {@return true when the current region context may read a block entity of another region}
+     * <p>
+     * A comparator reads the analog output of the block behind it and a piston reads the moving block entity
+     * in front of it, and that block can belong to the next region. A region that holds no execution lease
+     * cannot start a group before the current phase ends, because the server thread leases every region of a
+     * phase before it submits the phase's groups. Its block entities are therefore quiescent for the duration
+     * of the current group, and the read is safe. A region that is running, or has a worker submission
+     * pending, keeps the vanilla {@code null} answer: only its own worker may read it.
+     */
+    @ApiStatus.Internal
+    public boolean isForeignRegionBlockEntityReadable(ServerLevel level, BlockPos pos) {
+        if (this.shutdown) {
+            return false;
+        }
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext)
+                || basicContext.kind() != RegionThreadingContext.Kind.REGION
+                || basicContext.regionState == null
+                || !basicContext.regionState.isOwnedByCurrentThread()) {
+            return false;
+        }
+        final RegionCoordinate coordinate = this.layout.regionAt(level, pos);
+        if (coordinate.equals(basicContext.regionCoordinate)) {
+            return false;
+        }
+        final RegionState target = this.regionizer.get(coordinate);
+        final boolean readable = target == null || (!target.isDead() && !target.isRunning() && !target.isWorkerSubmitted());
+        if (readable) {
+            this.foreignBlockEntityReads.incrementAndGet();
+        }
+        return readable;
     }
 
     @Override
@@ -2394,6 +2432,41 @@ public final class RegionThreadingEngine implements RegionThreading {
             return false;
         }
         return this.recordBorderUpdate(level, new RegionBorderUpdates.BlockEntityChange(pos.immutable()));
+    }
+
+    /**
+     * Records the block event of a region worker for the server thread's block event phase.
+     * <p>
+     * {@code ServerLevel.blockEvent} adds the event to one level-wide ordered set, and the body of a piston
+     * move or a note block plays through the level and can write the next region. The event is recorded in the
+     * worker batch's server-owned mutation queue, so the set is mutated only on the server thread, in the order
+     * the worker produced the event. The queue is drained at the batch barrier, before vanilla's block event
+     * phase, so the event still runs in the same tick.
+     *
+     * @return {@code true} when the caller has to skip the inline add
+     */
+    @ApiStatus.Internal
+    public boolean deferBlockEvent(ServerLevel level, BlockPos pos, Block block, int eventId, int eventParam) {
+        final Queue<Runnable> mutations = this.currentRegionTickMutations.get();
+        if (mutations == null || this.shutdown) {
+            return false;
+        }
+        final BlockPos immutablePos = pos.immutable();
+        mutations.add(() -> level.blockEvent(immutablePos, block, eventId, eventParam));
+        this.deferredBlockEvents.incrementAndGet();
+        return true;
+    }
+
+    /** {@return the block events region workers deferred to the server thread's block event phase} */
+    @ApiStatus.Internal
+    public long deferredBlockEvents() {
+        return this.deferredBlockEvents.get();
+    }
+
+    /** {@return the block entity reads a region group made against a quiescent foreign region} */
+    @ApiStatus.Internal
+    public long foreignBlockEntityReads() {
+        return this.foreignBlockEntityReads.get();
     }
 
     /**
@@ -4986,6 +5059,14 @@ public final class RegionThreadingEngine implements RegionThreading {
             region.endOwnership();
             region.clearRunning();
             this.regionizer.removeIfEmpty(region);
+        }
+        // The task ran under a region lease outside a batch: a neighbour, shape, comparator or block-entity
+        // update it sent to another region was captured for the fixpoint, and no batch barrier follows this
+        // call. Flush the fixpoint here so a block event or a server-thread fallback tick still converges in
+        // the tick it runs in. The fixpoint is not entered from a native worker: a worker's target region is
+        // queued, not leased inline.
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            this.runBorderUpdateFixpoint(level);
         }
         return true;
     }

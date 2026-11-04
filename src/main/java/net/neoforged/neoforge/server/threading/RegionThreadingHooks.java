@@ -897,11 +897,15 @@ public final class RegionThreadingHooks {
     }
 
     /**
-     * {@return true when a region tick worker is executing and the current thread owns the region
-     * containing {@code pos}}
+     * {@return true when a region execution context is running on the current thread and that context
+     * holds the lease of the region containing {@code pos}}
      * <p>
-     * Used by the block-entity lookup so scheduled tick and random tick callbacks can read a block entity
-     * of their own region. Cross-region and other off-thread access still returns {@code null}.
+     * Used by the block-entity lookup so every region group - a scheduled tick, a random tick, a block
+     * entity tick, an entity tick and a border propagation pass - can read a block entity of its own
+     * region. The check is the lease, not the random source of one slice, because a border propagation
+     * pass runs comparator and piston reads without a scheduled tick random. Cross-region and other
+     * off-thread access still returns {@code null} unless
+     * {@link #isForeignRegionBlockEntityReadable} proves the owning region is quiescent.
      */
     public static boolean isRegionTickOwnedByCurrentThread(net.minecraft.world.level.Level level, BlockPos pos) {
         if (!(level instanceof ServerLevel serverLevel)) {
@@ -909,8 +913,43 @@ public final class RegionThreadingHooks {
         }
         final RegionThreading threading = RegionThreadingManager.currentOrNull();
         return threading instanceof RegionThreadingEngine engine
-                && engine.currentRegionTickRandom() != null
                 && engine.isOwnedByCurrentRegion(serverLevel, pos);
+    }
+
+    /**
+     * {@return true when the current region context may read a block entity of another region because the
+     * owning region holds no execution lease}
+     * <p>
+     * A comparator reads the analog output of the block behind it and a piston reads the moving block
+     * entity in front of it; that block can be in the next region. A region of one phase is leased on the
+     * server thread before the phase's groups are submitted and released when its group ends, so a region
+     * without a lease cannot start another group before the current phase finishes. The read therefore
+     * observes a state that its owner is not mutating. The block entity lookup returns {@code null} when
+     * the region is running, because only its own worker may read it then.
+     */
+    public static boolean isForeignRegionBlockEntityReadable(net.minecraft.world.level.Level level, BlockPos pos) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.isForeignRegionBlockEntityReadable(serverLevel, pos);
+    }
+
+    /**
+     * Defers the block event of a region worker to the server thread's block event queue.
+     * <p>
+     * {@code ServerLevel.blockEvent} adds the event to one level-wide ordered set, and the event body of a
+     * piston move or a note block plays through the level and can write the next region. A worker must not
+     * mutate that set or run the body, so the event is recorded in the worker batch's server-owned mutation
+     * queue and re-added on the server thread at the batch barrier, before vanilla's block event phase. The
+     * event therefore still runs in the same tick and keeps its recording order.
+     *
+     * @return {@code true} when the caller must skip the inline add, because the barrier re-adds the event
+     */
+    public static boolean deferBlockEvent(ServerLevel level, BlockPos pos, net.minecraft.world.level.block.Block block, int eventId,
+            int eventParam) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine && engine.deferBlockEvent(level, pos, block, eventId, eventParam);
     }
 
     /**

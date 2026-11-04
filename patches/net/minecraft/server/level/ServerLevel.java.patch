@@ -458,6 +458,19 @@
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215052_, p_215053_, p_215054_);
      }
  
+@@ -1136,6 +_,12 @@
+ 
+     @Override
+     public void blockEvent(BlockPos p_8746_, Block p_8747_, int p_8748_, int p_8749_) {
++        // Neo: a region worker may not mutate the level-wide ordered event set, and a piston move or a note
++        // block plays through the level and can write the next region. The worker batch records the event and
++        // the server thread re-adds it at the batch barrier, before the vanilla block event phase.
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBlockEvent(this, p_8746_, p_8747_, p_8748_, p_8749_)) {
++            return;
++        }
+         this.blockEvents.add(new BlockEventData(p_8746_, p_8747_, p_8748_, p_8749_));
+     }
+ 
 @@ -1145,19 +_,21 @@
          while (!this.blockEvents.isEmpty()) {
              BlockEventData blockeventdata = this.blockEvents.removeFirst();
