@@ -118,6 +118,7 @@ final class RegionThreadingCommand {
                 + ", unleasedChunkTicks=" + diagnostics.unleasedChunkTicks()
                 + ", chunkTickLightningStrikes=" + diagnostics.chunkTickLightningStrikes()
                 + ", deferredBlockUpdates=" + diagnostics.deferredBlockUpdates()
+                + ", tickFailures=" + diagnostics.tickFailures()
                 + ", deferredUpdateBudgetChunkTicks=" + diagnostics.deferredUpdateBudgetChunkTicks()
                 + ", nonPartitionedChunkTicks=" + diagnostics.nonPartitionedChunkTicks()
                 + ", spawnChunksOnWorkers=" + diagnostics.spawnChunksOnWorkers()

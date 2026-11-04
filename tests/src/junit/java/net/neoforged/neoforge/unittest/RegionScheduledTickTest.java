@@ -54,6 +54,7 @@ import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
+import net.neoforged.neoforge.server.threading.region.RegionTickSlice;
 import net.neoforged.neoforge.server.threading.region.ScheduledTickPhase;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -563,6 +564,9 @@ class RegionScheduledTickTest {
             throw new IllegalStateException("boom");
         }), dispatcher));
 
+        // The failure was recorded on the worker and reported by the server thread, counted once for the slice.
+        assertEquals(1L, this.engine.diagnostics().tickFailures().recorded(RegionTickSlice.SCHEDULED_TICK));
+        assertEquals(0L, this.engine.diagnostics().tickFailures().recorded(RegionTickSlice.ENTITY_TICK));
         assertEquals(0, this.engine.diagnostics().runningRegionCount());
         assertEquals(0, this.engine.diagnostics().submittedRegionCount());
     }
@@ -948,6 +952,8 @@ class RegionScheduledTickTest {
         doReturn(InactiveProfiler.INSTANCE).when(level).getProfiler();
         // Region coordinates are part of worker task descriptions, which must not call into the level.
         doReturn("test-level").when(level).toString();
+        // The game time is part of the context a worker records with a failing tick.
+        doReturn(0L).when(level).getGameTime();
         setLevelFieldUnchecked(level, "random", random);
         final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
         doAnswer(invocation -> {

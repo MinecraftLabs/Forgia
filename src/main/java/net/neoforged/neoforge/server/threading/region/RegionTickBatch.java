@@ -14,9 +14,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.levelgen.RandomSupport;
 import org.jetbrains.annotations.ApiStatus;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Shared lifecycle of one level tick that is executed on region workers.
@@ -35,6 +37,11 @@ import org.jetbrains.annotations.ApiStatus;
  * any slice - block entity, entity, chunk or scheduled tick - records the light rechecks and the block update
  * publications of the blocks it writes instead of driving the level-wide light engine and the level-wide block
  * update publication itself, and the completion chain of the batch applies them on the server thread.
+ * <p>
+ * A worker group that catches a failing tick records it through {@link #recordTickFailure(RegionCoordinate,
+ * Entity, Throwable)} and stops; the batch keeps that record bounded and {@link #throwIfFailed()} reports it on
+ * the server thread, so the crash report of a failing tick is never built by a worker the server thread is
+ * waiting for. See {@link RegionTickFailure}.
  */
 @ApiStatus.Internal
 abstract class RegionTickBatch {
@@ -57,6 +64,21 @@ abstract class RegionTickBatch {
     private final ServerLevel level;
     private final RegionTickSlice slice;
     private final RegionDeferredBlockUpdates blockUpdates;
+    /**
+     * Bound of the tick failures this batch keeps for its server-thread report.
+     * <p>
+     * A worker group stops at its first failure, so a batch records at most one failure per group. The bound
+     * keeps the record cheap even when a tick fails in many regions at once; the failures past the bound are
+     * still counted in the diagnostics and are not reported, because the default crash path reports the first
+     * one and aborts the tick.
+     */
+    private static final int MAX_RECORDED_TICK_FAILURES = 8;
+    /**
+     * Tick failures the worker groups of this batch caught, in record order. Filled from the workers and drained
+     * once by {@link #reportTickFailures()} on the server thread, so it stays bounded by
+     * {@link #MAX_RECORDED_TICK_FAILURES} and no failure is ever reported twice.
+     */
+    private final List<RegionTickFailure> tickFailures = new ArrayList<>();
     private final RegionTaskBatch tasks = new RegionTaskBatch();
     private final RegionTaskBatch.Barrier groupBarrier = RegionTaskBatch.Barrier.open();
     private final CountDownLatch finished = new CountDownLatch(1);
@@ -383,9 +405,56 @@ abstract class RegionTickBatch {
     }
 
     /**
-     * Rethrows the first failure of any group.
+     * Records one tick failure a worker group of this batch caught, for the server thread to report.
+     * <p>
+     * Called on the worker thread that caught the failure, so it only stores the throwable and the context the
+     * caller already holds: one record, no crash report and no log line. See {@link RegionTickFailure} for why
+     * the report may not be built here.
+     *
+     * @param coordinate the region whose group failed
+     * @param entity     the entity whose tick failed, or {@code null} for a unit vanilla reports without one
+     * @param throwable  the failure
+     */
+    final void recordTickFailure(RegionCoordinate coordinate, @Nullable Entity entity, Throwable throwable) {
+        synchronized (this.tickFailures) {
+            if (this.tickFailures.size() >= MAX_RECORDED_TICK_FAILURES) {
+                return;
+            }
+            this.tickFailures.add(new RegionTickFailure(this.slice, coordinate, this.level.getGameTime(), entity,
+                    Thread.currentThread().getName(), throwable));
+        }
+    }
+
+    /**
+     * Reports the tick failures the workers of this batch recorded, on the calling server thread.
+     * <p>
+     * Called after the barrier and after the server-thread handoff of the batch, so the report of a failing
+     * worker tick is built by the thread that owns the level. The record is drained before the first failure is
+     * reported: a second call reports nothing, and a failure that throws - the default crash path - leaves no
+     * copy behind that a later caller could report again. A failure recorded after the level closed is reported
+     * like any other, because closing the level does not change what vanilla would have reported.
+     */
+    final void reportTickFailures() {
+        final List<RegionTickFailure> failures;
+        synchronized (this.tickFailures) {
+            if (this.tickFailures.isEmpty()) {
+                return;
+            }
+            failures = List.copyOf(this.tickFailures);
+            this.tickFailures.clear();
+        }
+        for (final RegionTickFailure failure : failures) {
+            failure.report();
+        }
+    }
+
+    /**
+     * Reports the tick failures the workers of this batch recorded and rethrows the first failure of any group.
+     * <p>
+     * Called on the server thread at the end of the level tick that published this batch, after the handoff.
      */
     final void throwIfFailed() {
+        this.reportTickFailures();
         this.groupBarrier.throwIfFailed();
     }
 

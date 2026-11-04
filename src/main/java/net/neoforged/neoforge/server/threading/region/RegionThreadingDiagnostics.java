@@ -80,6 +80,12 @@ import java.util.Map;
  * dropped because its level closed and the units it refused before their body because the batch could not
  * reserve them.
  * <p>
+ * {@link TickFailureCounters} reports the tick failures the worker groups of each slice recorded, counted per
+ * slice. A worker that catches a failing tick records the throwable and the context and stops its group; the
+ * server thread reports it after the barrier and after the handoff of the batch, so the crash report of a
+ * failing tick is never built on a worker that the server thread is waiting for. A counted failure is one
+ * failure, counted on the worker and reported once by the server thread.
+ * <p>
  * The four block-entity chunk counters report the chunks the chunk-indexed plan did not hand to a worker, by
  * reason. A non-ticking chunk is out of block ticking range or the tick rate is frozen, a chunk whose entities
  * are still loading keeps the vanilla skip, and a chunk that is no longer loaded has no snapshot at all; none
@@ -194,6 +200,7 @@ public record RegionThreadingDiagnostics(
         long unleasedChunkTicks,
         long chunkTickLightningStrikes,
         BlockUpdateCounters deferredBlockUpdates,
+        TickFailureCounters tickFailures,
         long deferredUpdateBudgetChunkTicks,
         long nonPartitionedChunkTicks,
         long spawnChunksOnWorkers,
@@ -298,6 +305,36 @@ public record RegionThreadingDiagnostics(
                         .append('=').append(this.applied(slice))
                         .append('/').append(this.dropped(slice))
                         .append('/').append(this.refused(slice));
+            }
+            return summary.toString();
+        }
+    }
+
+    /**
+     * The tick failures the worker groups of each slice recorded, counted per slice.
+     * <p>
+     * A counted failure is one tick a region worker caught and stopped its group at. It is counted on the worker
+     * and reported by the server thread after the barrier, so the count is observable even though the report
+     * itself is built by another thread. A failure is counted once, and it is counted whether or not the batch
+     * kept it in its bounded record, so a tick that fails in many regions at once is counted in full. The counts
+     * are indexed by {@link RegionTickSlice#ordinal()}.
+     *
+     * @param recorded the tick failures each slice recorded
+     */
+    public record TickFailureCounters(long[] recorded) {
+        /** {@return the tick failures the workers of {@code slice} recorded} */
+        public long recorded(RegionTickSlice slice) {
+            return this.recorded[slice.ordinal()];
+        }
+
+        @Override
+        public String toString() {
+            final StringBuilder summary = new StringBuilder();
+            for (final RegionTickSlice slice : RegionTickSlice.values()) {
+                if (!summary.isEmpty()) {
+                    summary.append(", ");
+                }
+                summary.append(slice.name().toLowerCase(java.util.Locale.ROOT)).append('=').append(this.recorded(slice));
             }
             return summary.toString();
         }

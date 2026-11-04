@@ -49,6 +49,7 @@ import net.neoforged.neoforge.server.threading.RegionScheduler;
 import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingContext;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.timings.TimeTracker;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.ApiStatus;
@@ -231,14 +232,20 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Deferred light rechecks and block update publications the barrier of each slice applied, indexed by
      * {@link RegionTickSlice#ordinal()}.
      */
-    private final AtomicLong[] appliedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
+    private final AtomicLong[] appliedDeferredBlockUpdates = newSliceCounters();
     /** Deferred light rechecks and block updates of each slice that were never applied, indexed by slice. */
-    private final AtomicLong[] droppedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
+    private final AtomicLong[] droppedDeferredBlockUpdates = newSliceCounters();
     /**
      * Units of each slice that were refused before their body because the deferred block-update budget of their
      * batch was exhausted, indexed by slice.
      */
-    private final AtomicLong[] refusedDeferredBlockUpdates = newDeferredBlockUpdateCounters();
+    private final AtomicLong[] refusedDeferredBlockUpdates = newSliceCounters();
+    /**
+     * Tick failures the worker groups of each slice recorded for the server thread, indexed by slice. A failure is
+     * counted once, on the worker that caught it, and reported once by
+     * {@link RegionTickBatch#reportTickFailures()}.
+     */
+    private final AtomicLong[] workerTickFailures = newSliceCounters();
     /**
      * Chunks the plan kept on the server thread because the deferred update budget of the batch was exhausted,
      * so their block writes would have had nowhere to be recorded.
@@ -1685,11 +1692,9 @@ public final class RegionThreadingEngine implements RegionThreading {
      * <p>
      * Only the entity worker diagnostics benchmark calls this. Every failing tick is reported to the
      * observer and the group continues with its next entity, so one run collects every blocked operation
-     * instead of only the first one. A tick that fails under an observer also skips the vanilla crash-report
-     * wrapper, which would build a crash report - and with it a system hardware enumeration - per rejection.
-     * Without an observer the worker body has no catch: the first failure reaches {@code guardEntityTick}
-     * (which turns it into a {@code ReportedException}), fails the group, and
-     * {@code RegionTickBatch#throwIfFailed()} rethrows it on the server thread.
+     * instead of only the first one. The worker entity body builds no crash report at all: without an
+     * observer the failure is recorded for the server thread and the group stops, with an observer it reaches
+     * the observer and the group continues, see {@link RegionTickFailure}.
      */
     @ApiStatus.Internal
     public void setEntityTickFailureObserverForTesting(@Nullable BiConsumer<Entity, Throwable> observer) {
@@ -2364,30 +2369,32 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     this.countRefusedDeferredBlockUpdate(RegionTickSlice.ENTITY_TICK);
                                     continue;
                                 }
-                                if (failureObserver == null) {
-                                    try {
-                                        if (tickOwnedEntity(level, entity)) {
-                                            ++ticked[0];
-                                        }
-                                    } catch (Throwable throwable) {
-                                        if (!handOffRefusedChunk(group, entity, throwable)) {
-                                            throw throwable;
-                                        }
-                                    }
+                                if (!prepareOwnedEntityTick(entity)) {
                                     continue;
                                 }
                                 try {
-                                    if (tickOwnedEntityForDiagnostics(level, entity)) {
-                                        ++ticked[0];
-                                    }
+                                    // The guarded part of the vanilla pass is exactly the non-passenger tick:
+                                    // a failure of the despawn check or of the discard predicate above keeps
+                                    // propagating like vanilla lets it propagate.
+                                    tickEntityBody(level, entity);
                                 } catch (Throwable throwable) {
                                     if (handOffRefusedChunk(group, entity, throwable)) {
                                         continue;
                                     }
-                                    // Diagnostics only: the observer records the rejected operation and the group
-                                    // keeps ticking its remaining entities instead of aborting the batch.
-                                    failureObserver.accept(entity, throwable);
+                                    if (failureObserver != null) {
+                                        // Diagnostics only: the observer records the rejected operation and the
+                                        // group keeps ticking its remaining entities instead of stopping at the
+                                        // first one.
+                                        failureObserver.accept(entity, throwable);
+                                        continue;
+                                    }
+                                    // The failure is recorded for the server thread instead of being turned into
+                                    // a crash report on this worker; the group stops here, exactly like the
+                                    // vanilla entity pass stops at its first failing entity.
+                                    this.recordWorkerTickFailure(group.batch(), coordinate, entity, throwable);
+                                    return;
                                 }
+                                ++ticked[0];
                             }
                         });
                     } finally {
@@ -2480,30 +2487,32 @@ public final class RegionThreadingEngine implements RegionThreading {
                                     this.countRefusedDeferredBlockUpdate(RegionTickSlice.ENTITY_TICK);
                                     continue;
                                 }
-                                if (failureObserver == null) {
-                                    try {
-                                        if (tickSelfDrivenEntity(level, entity, activation, group)) {
-                                            ++ticked[0];
-                                        }
-                                    } catch (Throwable throwable) {
-                                        if (!handOffRefusedChunk(group, entity, throwable)) {
-                                            throw throwable;
-                                        }
-                                    }
+                                if (!this.prepareSelfDrivenEntityTick(level, entity, activation, group)) {
                                     continue;
                                 }
                                 try {
-                                    if (tickSelfDrivenEntity(level, entity, activation, group)) {
-                                        ++ticked[0];
-                                    }
+                                    // The guarded part of the vanilla pass is exactly the non-passenger tick:
+                                    // a failure of the discard predicate, the despawn check or the riding
+                                    // stack above keeps propagating like vanilla lets it propagate.
+                                    tickEntityBody(level, entity);
                                 } catch (Throwable throwable) {
                                     if (handOffRefusedChunk(group, entity, throwable)) {
                                         continue;
                                     }
-                                    // Diagnostics only: the observer records the rejected operation and the
-                                    // group keeps ticking its remaining entities instead of aborting.
-                                    failureObserver.accept(entity, throwable);
+                                    if (failureObserver != null) {
+                                        // Diagnostics only: the observer records the rejected operation and the
+                                        // group keeps ticking its remaining entities instead of stopping at the
+                                        // first one.
+                                        failureObserver.accept(entity, throwable);
+                                        continue;
+                                    }
+                                    // The failure is recorded for the server thread instead of being turned into
+                                    // a crash report on this worker; the group stops here, exactly like the
+                                    // vanilla entity pass stops at its first failing entity.
+                                    this.recordWorkerTickFailure(group.batch(), coordinate, entity, throwable);
+                                    return;
                                 }
+                                ++ticked[0];
                             }
                         });
                     } finally {
@@ -2525,20 +2534,25 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Runs the vanilla entity body of one entity of a leased region on the worker.
+     * Runs the vanilla preconditions of one entity of a leased region on the worker.
      * <p>
-     * The body is the vanilla {@code ServerLevel} entity pass: the discard predicate, the frozen predicate, the
-     * despawn check, the entity ticking range of the entity's chunk, the riding stack and the non-passenger
-     * tick. The two server-owned reads of that body - the ticking range and the entity-load neighborhood of the
-     * chunk guard - are answered from the activation snapshot the server thread built before the lease.
+     * The preconditions are the ones the vanilla {@code ServerLevel} entity pass runs before it ticks: the
+     * discard predicate, the frozen predicate, the despawn check, the entity ticking range of the entity's
+     * chunk and the riding stack. The two server-owned reads of that pass - the ticking range and the
+     * entity-load neighborhood of the chunk guard - are answered from the activation snapshot the server
+     * thread built before the lease.
      * <p>
      * An entity whose chunk cannot be decided from the snapshot, or whose chunk guard would need an unloaded
      * chunk, is handed to the server thread instead of being dropped. The entity body has not run for it at
      * that point, so the handoff runs all of it.
+     * <p>
+     * The non-passenger tick itself is not run here: it is the part of the vanilla pass that
+     * {@code Level#guardEntityTick} wraps, so the caller runs it and decides what a failure of it means - a
+     * recorded failure for the server thread, or a rejected operation for the diagnostics observer.
      *
-     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
+     * @return {@code true} when the caller has to run the vanilla non-passenger tick for {@code entity}
      */
-    private boolean tickSelfDrivenEntity(ServerLevel level, Entity entity, RegionEntityTickActivation activation, RegionEntityTickBatch.Group group) {
+    private boolean prepareSelfDrivenEntityTick(ServerLevel level, Entity entity, RegionEntityTickActivation activation, RegionEntityTickBatch.Group group) {
         if (entity.isRemoved()) {
             return false;
         }
@@ -2589,8 +2603,23 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (entity.isRemoved() || entity instanceof PartEntity<?>) {
             return false;
         }
-        level.guardEntityTick(level::tickNonPassenger, entity);
         return true;
+    }
+
+    /**
+     * Runs the part of the vanilla entity pass that {@code Level#guardEntityTick} wraps - the non-passenger tick -
+     * on the worker, with the entity timing that the guard records around it.
+     * <p>
+     * The guard's crash report is not built here: a failure propagates to the caller, which records it for the
+     * server thread instead, see {@link RegionTickFailure}.
+     */
+    private static void tickEntityBody(ServerLevel level, Entity entity) {
+        TimeTracker.ENTITY_UPDATE.trackStart(entity);
+        try {
+            level.tickNonPassenger(entity);
+        } finally {
+            TimeTracker.ENTITY_UPDATE.trackEnd(entity);
+        }
     }
 
     /**
@@ -2604,37 +2633,6 @@ public final class RegionThreadingEngine implements RegionThreading {
     private static boolean ridesLiveVehicle(Entity entity) {
         final Entity vehicle = entity.getVehicle();
         return vehicle != null && !vehicle.isRemoved() && vehicle.hasPassenger(entity);
-    }
-
-    /**
-     * Ticks one entity of a worker group: the vanilla despawn check followed by the non-passenger tick.
-     *
-     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
-     */
-    private static boolean tickOwnedEntity(ServerLevel level, Entity entity) {
-        if (!prepareOwnedEntityTick(entity)) {
-            return false;
-        }
-        level.guardEntityTick(level::tickNonPassenger, entity);
-        return true;
-    }
-
-    /**
-     * Diagnostics counterpart of {@link #tickOwnedEntity(ServerLevel, Entity)}: the same despawn check and
-     * non-passenger tick, but without the vanilla crash-report wrapper.
-     * <p>
-     * Building a crash report enumerates the system hardware through external processes, which costs tens of
-     * milliseconds per rejected tick and would dominate the diagnostic window; the failure itself reaches the
-     * observer unchanged.
-     *
-     * @return {@code true} when {@code level.tickNonPassenger} ran for {@code entity}
-     */
-    private static boolean tickOwnedEntityForDiagnostics(ServerLevel level, Entity entity) {
-        if (!prepareOwnedEntityTick(entity)) {
-            return false;
-        }
-        level.tickNonPassenger(entity);
-        return true;
     }
 
     /**
@@ -3015,7 +3013,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         // ticker is ticked on the server thread after the batch instead of aborting
                                         // the group.
                                         if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
-                                            throw throwable;
+                                            // The failure is recorded for the server thread instead of failing the
+                                            // group with it; the group stops at its first failing ticker.
+                                            this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
+                                            return;
                                         }
                                         group.batch().addFallback(admission);
                                         this.fallbackBlockEntityTicks.incrementAndGet();
@@ -3309,7 +3310,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                 try {
                     this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
                         for (final ScheduledTick<T> tick : ticks) {
-                            callback.accept(tick.pos(), tick.type());
+                            try {
+                                callback.accept(tick.pos(), tick.type());
+                            } catch (Throwable throwable) {
+                                // The failure is recorded for the server thread instead of failing the group with
+                                // it; the group stops at its first failing tick, like every other worker group.
+                                this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
+                                return;
+                            }
                             ++ticked[0];
                         }
                     });
@@ -3689,7 +3697,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         ++spawned[0];
                                     } catch (Throwable throwable) {
                                         if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
-                                            throw throwable;
+                                            // The failure is recorded for the server thread instead of failing the
+                                            // group with it; the group stops at its first failing chunk.
+                                            this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
+                                            return;
                                         }
                                         // The spawns this body already deferred stay deferred; the rest of the
                                         // chunk's spawn attempt is lost and counted.
@@ -3883,7 +3894,10 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         // A chunk request the chunk source refused is a truncation, not a
                                         // failure: the random ticks that already ran must not run again.
                                         if (!RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable)) {
-                                            throw throwable;
+                                            // The failure is recorded for the server thread instead of failing the
+                                            // group with it; the group stops at its first failing chunk.
+                                            this.recordWorkerTickFailure(group.batch(), coordinate, null, throwable);
+                                            return;
                                         }
                                         this.truncatedChunkTicks.incrementAndGet();
                                     } finally {
@@ -4106,12 +4120,25 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /** {@return one counter per {@link RegionTickSlice}, indexed by the ordinal of the slice} */
-    private static AtomicLong[] newDeferredBlockUpdateCounters() {
+    private static AtomicLong[] newSliceCounters() {
         final AtomicLong[] counters = new AtomicLong[RegionTickSlice.values().length];
         for (int index = 0; index < counters.length; ++index) {
             counters[index] = new AtomicLong();
         }
         return counters;
+    }
+
+    /**
+     * Counts one tick failure of a worker group of {@code batch} and records it for the server thread.
+     * <p>
+     * Called on the worker thread that caught the failure, right before the group stops. The count is per slice,
+     * so the diagnostics separate a failing entity tick from a failing block-entity, chunk, scheduled or spawn
+     * body, and it counts every failure including the ones past the bound of the record. The record itself
+     * carries the context and is reported by {@link RegionTickBatch#reportTickFailures()} on the server thread.
+     */
+    private void recordWorkerTickFailure(RegionTickBatch batch, RegionCoordinate coordinate, @Nullable Entity entity, Throwable throwable) {
+        this.workerTickFailures[batch.slice().ordinal()].incrementAndGet();
+        batch.recordTickFailure(coordinate, entity, throwable);
     }
 
     /** Counts one chunk whose vanilla spawn gate refused it, so vanilla spawns nothing for it either. */
@@ -4214,6 +4241,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                 snapshot(this.appliedDeferredBlockUpdates),
                 snapshot(this.droppedDeferredBlockUpdates),
                 snapshot(this.refusedDeferredBlockUpdates));
+    }
+
+    /** {@return the per-slice worker tick failure counters of the diagnostics snapshot} */
+    private RegionThreadingDiagnostics.TickFailureCounters tickFailureCounters() {
+        return new RegionThreadingDiagnostics.TickFailureCounters(snapshot(this.workerTickFailures));
     }
 
     private static void throwUnchecked(Throwable throwable) {
@@ -5771,6 +5803,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 this.unleasedChunkTicks.get(),
                 this.chunkTickLightningStrikes.get(),
                 this.deferredBlockUpdateCounters(),
+                this.tickFailureCounters(),
                 this.deferredUpdateBudgetChunkTicks.get(),
                 this.nonPartitionedChunkTicks.get(),
                 this.spawnChunksOnWorkers.get(),
