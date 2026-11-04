@@ -129,8 +129,20 @@ public final class RegionLayout {
      * {@link RegionCoordinate} per call.
      */
     public boolean isInRegion(ServerLevel level, BlockPos pos, RegionCoordinate coordinate) {
+        return this.isInRegion(level, Math.floorDiv(pos.getX(), CHUNK_BLOCK_SIZE), Math.floorDiv(pos.getZ(), CHUNK_BLOCK_SIZE), coordinate);
+    }
+
+    /**
+     * {@return true when the chunk column {@code (chunkX, chunkZ)} of {@code level} belongs to
+     * {@code coordinate}}
+     * <p>
+     * The chunk-coordinate counterpart of {@link #isInRegion(ServerLevel, BlockPos, RegionCoordinate)}, for a
+     * caller that already has the column - the game event dispatcher decides per column whether a worker may
+     * visit it.
+     */
+    public boolean isInRegion(ServerLevel level, int chunkX, int chunkZ, RegionCoordinate coordinate) {
         return coordinate.level() == level
-                && this.regionX(Math.floorDiv(pos.getX(), CHUNK_BLOCK_SIZE)) == coordinate.regionX()
-                && this.regionZ(Math.floorDiv(pos.getZ(), CHUNK_BLOCK_SIZE)) == coordinate.regionZ();
+                && this.regionX(chunkX) == coordinate.regionX()
+                && this.regionZ(chunkZ) == coordinate.regionZ();
     }
 }

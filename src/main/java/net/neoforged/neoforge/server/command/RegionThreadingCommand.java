@@ -79,6 +79,7 @@ final class RegionThreadingCommand {
                 + ", spawnWorkerDispatchEffective=" + diagnostics.spawnWorkerDispatchEffective()
                 + ", borderUpdateEnabled=" + NeoForgeConfig.SERVER.enableRegionThreadingBorderUpdates.get()
                 + ", borderUpdates=" + diagnostics.borderUpdates()
+                + ", gameEvents=" + diagnostics.gameEvents()
                 + ", entityTicksOnWorkers=" + diagnostics.entityTicksOnWorkers()
                 + ", skippedEntityTicks=" + diagnostics.skippedEntityTicks()
                 + ", fallbackEntityTicks=" + diagnostics.fallbackEntityTicks()

@@ -1118,6 +1118,23 @@ public class ProductionSoakGameTests {
                             - (engine.borderUpdates().dropped() - start.borderUpdates().dropped()),
                     0L));
             invariants.add(Invariant.of("foreignChunkReads", engine.borderUpdates().foreignReads() - start.borderUpdates().foreignReads() > 0 ? 1 : 0, 1));
+            // The cross-region game event capture: a section column of a game event dispatch that belongs to
+            // another region is replayed by that region or dropped and counted, so a captured column is never
+            // lost. The soak world has no vibration listener, so a replayed column has nothing to deliver to;
+            // the invariant is about the accounting, and the counters themselves are printed with the others.
+            final long gameEventColumnsDeferred = engine.gameEvents().deferredSections() - start.gameEvents().deferredSections();
+            final long gameEventColumnsDelivered = engine.gameEvents().deliveredSections() - start.gameEvents().deliveredSections();
+            final long gameEventColumnsRefused = engine.gameEvents().refusedSections() - start.gameEvents().refusedSections();
+            final long gameEventColumnsDropped = engine.gameEvents().droppedSections() - start.gameEvents().droppedSections();
+            final long gameEventColumnsDroppedNoRegion = engine.gameEvents().droppedNoRegionSections()
+                    - start.gameEvents().droppedNoRegionSections();
+            final long gameEventColumnsDroppedNoChunk = engine.gameEvents().droppedNoChunkSections()
+                    - start.gameEvents().droppedNoChunkSections();
+            invariants.add(Invariant.of("gameEventColumnsLost",
+                    gameEventColumnsDeferred - gameEventColumnsDelivered - gameEventColumnsRefused - gameEventColumnsDropped, 0L));
+            invariants.add(Invariant.of("gameEventColumnsDropped", gameEventColumnsDropped, 0L));
+            invariants.add(Invariant.of("gameEventColumnsDroppedNoRegion", gameEventColumnsDroppedNoRegion, 0L));
+            invariants.add(Invariant.of("gameEventColumnsDroppedNoChunk", gameEventColumnsDroppedNoChunk, 0L));
             // The deferred cross-region block write: the relaxed admission rule hands boundary chunks to workers, and
             // every write of their bodies that lands in the neighbouring region is recorded here and applied by the
             // region that owns the position. A recorded write that was neither applied nor counted as dropped would

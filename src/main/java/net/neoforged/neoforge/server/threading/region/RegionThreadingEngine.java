@@ -90,6 +90,17 @@ import org.jetbrains.annotations.Nullable;
  * flushing per event and faithful to the inline run: an event body reads back what it wrote, so a piston that
  * pushes across a border resolves its structure against the moved blocks and queues the single block event
  * vanilla queues, not a second one from a stale read.
+ * <p>
+ * The game event dispatch is the one cross-region write that is not a block write: {@code GameEventDispatcher.post}
+ * reaches every listener of the event's notification radius - 16 blocks for the common events, 32 for
+ * {@code shriek} - and a listener writes its own block entity, so with a 3-chunk region the dispatch crosses a
+ * border in the common case. {@link #captureCrossRegionGameEvent} records a section column whose listeners belong
+ * to another region instead of visiting it, and {@link #runCrossRegionGameEvents} replays the recorded columns on
+ * the owning region's worker in the same tick, in recording order, after the border fixpoint of the batch. The
+ * replay uses the vanilla listener registry of the target column, so the candidate a sculk sensor records carries
+ * the same source position, distance and game time as the inline run, and the sensor activates on the same tick.
+ * The switch is off by default: with it off the dispatch is exactly vanilla and therefore races as before, which
+ * is the documented baseline of the feature.
  */
 public final class RegionThreadingEngine implements RegionThreading {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -346,6 +357,39 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final ThreadLocal<BlockEventPhase> blockEventPhase = new ThreadLocal<>();
     /** Block entity reads a region group made against a quiescent foreign region. */
     private final AtomicLong foreignBlockEntityReads = new AtomicLong();
+    /**
+     * The captured game event columns of each level. A region worker records a section column of a game event
+     * dispatch whose listeners belong to another region here instead of visiting it; the server thread drains
+     * the queue after the worker phase and replays it on the owning region's worker. The map is empty for a
+     * level without a captured column and for a server whose switch is off.
+     */
+    private final Map<ServerLevel, RegionBorderGameEvents> borderGameEvents = new ConcurrentHashMap<>();
+    /**
+     * Whether the installed engine captures the game events whose listeners belong to another region. It is the
+     * engine's copy of {@code enableRegionThreadingGameEvents}, taken at construction so a dispatch never
+     * re-reads the config.
+     */
+    private volatile boolean crossRegionGameEventsEnabled = RegionThreadingConfig.crossRegionGameEventsEnabled();
+    /** Entries one game event capture queue of a level admits; the production bound unless a test lowers it. */
+    private volatile int gameEventCapacity = RegionBorderGameEvents.MAX_ENTRIES;
+    /** Game events posted while a region batch of their level was in flight. */
+    private final AtomicLong gameEventsPosted = new AtomicLong();
+    /** Section columns of a dispatch the posting worker visited itself, because it owns them. */
+    private final AtomicLong gameEventSectionsLocal = new AtomicLong();
+    /** Section columns a worker recorded for the region that owns them. */
+    private final AtomicLong gameEventSectionsDeferred = new AtomicLong();
+    /** Captured columns the owning region replayed on its own worker. */
+    private final AtomicLong gameEventSectionsDelivered = new AtomicLong();
+    /** Captured columns the capture bound refused at the call site, i.e. the event of that column was dropped. */
+    private final AtomicLong gameEventSectionsRefused = new AtomicLong();
+    /** Captured columns that were never replayed: the target region retired, its chunk unloaded or the bound cut them. */
+    private final AtomicLong gameEventSectionsDropped = new AtomicLong();
+    /** The dropped columns whose target region did not exist or was retired when the delivery ran. */
+    private final AtomicLong gameEventSectionsDroppedNoRegion = new AtomicLong();
+    /** The dropped columns whose target chunk was no longer loaded when the delivery ran. */
+    private final AtomicLong gameEventSectionsDroppedNoChunk = new AtomicLong();
+    /** Delivery rounds the server thread ran after a worker phase. */
+    private final AtomicLong gameEventDeliveryPasses = new AtomicLong();
 
     /**
      * One block event phase of one level on the server thread.
@@ -976,6 +1020,33 @@ public final class RegionThreadingEngine implements RegionThreading {
         return this.regionizer.get(coordinate) == region;
     }
 
+    /**
+     * {@return true when the current thread holds the lease of the region that owns the chunk column
+     * {@code (chunkX, chunkZ)}}
+     * <p>
+     * The chunk-column counterpart of {@link #isOwnedByCurrentRegion(ServerLevel, BlockPos)}, for a caller that
+     * has a chunk coordinate rather than a position. The game event dispatcher decides per chunk column whether a
+     * worker may visit its listener registries, and it must not allocate a position per column to ask.
+     */
+    boolean isOwnedByCurrentRegion(ServerLevel level, int chunkX, int chunkZ) {
+        final RegionThreadingContext context = this.currentContext();
+        if (!(context instanceof BasicRegionThreadingContext basicContext)
+                || basicContext.kind() != RegionThreadingContext.Kind.REGION
+                || basicContext.regionCoordinate == null) {
+            return false;
+        }
+
+        final RegionState region = basicContext.regionState;
+        if (region == null || !region.isOwnedByCurrentThread()) {
+            return false;
+        }
+        if (region.coordinate().equals(basicContext.regionCoordinate)
+                && this.layout.isInRegion(level, chunkX, chunkZ, basicContext.regionCoordinate)) {
+            return true;
+        }
+        return this.regionizer.get(this.layout.regionAt(level, chunkX, chunkZ)) == region;
+    }
+
     @Override
     public boolean isOwnedByCurrentRegion(Entity entity) {
         final RegionEntityTickBatch.Group group = this.currentEntityTickGroup();
@@ -1450,6 +1521,19 @@ public final class RegionThreadingEngine implements RegionThreading {
                         failure.addSuppressed(throwable);
                     }
                 }
+                // The game events the workers of the batch posted for another region follow the border
+                // updates: the deferred writes of the source are applied first, exactly where the inline run
+                // would have applied them before the listener body ran. The delivery repeats while its own
+                // listener bodies post further events or write further borders.
+                try {
+                    this.runCrossRegionGameEvents(level);
+                } catch (Throwable throwable) {
+                    if (failure == null) {
+                        failure = throwable;
+                    } else {
+                        failure.addSuppressed(throwable);
+                    }
+                }
             } finally {
                 this.endRegionPhase(level);
             }
@@ -1517,7 +1601,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
         this.delayBorderUpdates(level, overflow);
 
-        final int budget = this.borderUpdateBudget(level);
+        final int budget = this.chainedUpdateBudget(level);
         final RegionTickBarrier barrier = borderFixpointBarrier(level);
         int passes = 0;
         int applied = 0;
@@ -1745,13 +1829,29 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
-     * Runs one propagation-only pass of one region and waits for it.
+     * Runs one propagation-only pass of one region for the captured border updates of that region.
      *
      * @return {@code true} when the region was leased and the pass ran; {@code false} when the region retired
      *         or the level closed before the lease, so the caller has to fall back to the next tick
      */
     private boolean runBorderPropagationPass(ServerLevel level, RegionState region, List<RegionBorderUpdates.BorderUpdate> updates,
             RegionTickBarrier barrier) {
+        return this.runPropagationPass(level, region, batch -> this.borderPropagationGroup(batch, region, updates), barrier);
+    }
+
+    /**
+     * Runs one propagation-only pass of one region and waits for it.
+     * <p>
+     * The pass is a batch of exactly one group, published before its lease is acquired, so a concurrent shutdown
+     * or level unload cannot retire the region the pass holds. The batch's completion applies the deferred block
+     * writes and the scheduled ticks its group recorded, exactly like the completion of a tick batch.
+     *
+     * @param body the group body, built once the region is leased so it can bind the batch it runs in
+     * @return {@code true} when the region was leased and the pass ran; {@code false} when the region retired
+     *         or the level closed before the lease, so the caller has to fall back to the next tick
+     */
+    private boolean runPropagationPass(ServerLevel level, RegionState region,
+            java.util.function.Function<RegionBorderPropagationBatch, Runnable> body, RegionTickBarrier barrier) {
         final RegionBorderPropagationBatch batch = new RegionBorderPropagationBatch(level, this.deferredBlockUpdateBudget);
         final TickBatchPublication publication = this.publishTickBatch(batch, level);
         if (publication != TickBatchPublication.PUBLISHED) {
@@ -1763,7 +1863,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         try {
             if (this.acquireRegionLease(region, barrier)) {
                 ran = true;
-                this.addLeasedGroup(region, () -> batch.addGroup(region, this.borderPropagationGroup(batch, region, updates)));
+                this.addLeasedGroup(region, () -> batch.addGroup(region, body.apply(batch)));
                 this.beginRegionPhase(level);
                 try {
                     batch.submitAndAwait(this.workerPool, barrier);
@@ -1803,6 +1903,39 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     private Runnable borderPropagationGroup(RegionBorderPropagationBatch batch, RegionState region,
             List<RegionBorderUpdates.BorderUpdate> updates) {
+        return this.propagationGroup(batch, region, "border propagation", level -> {
+            for (final RegionBorderUpdates.BorderUpdate update : updates) {
+                this.currentPropagationOrigin.set(update.pos());
+                try {
+                    update.apply(level);
+                } catch (Throwable throwable) {
+                    if (!RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
+                        throw throwable;
+                    }
+                } finally {
+                    this.currentPropagationOrigin.remove();
+                }
+                this.borderUpdatesApplied.incrementAndGet();
+                if (update instanceof RegionBorderUpdates.BlockWrite) {
+                    this.borderBlockWritesApplied.incrementAndGet();
+                }
+            }
+        });
+    }
+
+    /**
+     * Wraps one propagation body into the worker body of one region group.
+     * <p>
+     * The group holds the lease of its region, enters the region execution context and the neighbor update scope
+     * of a tick group and installs the scheduled-tick mutation queue, so a body that writes blocks or schedules a
+     * tick behaves exactly like a tick body of that region. It ticks nothing itself: a propagation pass only runs
+     * the work the caller captured.
+     *
+     * @param label the name of the pass in the long-tick warning
+     * @param work  the captured work, run inside the context of the region's lease
+     */
+    private Runnable propagationGroup(RegionBorderPropagationBatch batch, RegionState region, String label,
+            java.util.function.Consumer<ServerLevel> work) {
         final RegionCoordinate coordinate = region.coordinate();
         final ServerLevel level = batch.level();
         return () -> {
@@ -1813,24 +1946,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 try {
                     final RegionNeighborUpdateScope previousNeighbors = RegionNeighborUpdateScope.enter(new RegionNeighborUpdateScope());
                     try {
-                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
-                            for (final RegionBorderUpdates.BorderUpdate update : updates) {
-                                this.currentPropagationOrigin.set(update.pos());
-                                try {
-                                    update.apply(level);
-                                } catch (Throwable throwable) {
-                                    if (!RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
-                                        throw throwable;
-                                    }
-                                } finally {
-                                    this.currentPropagationOrigin.remove();
-                                }
-                                this.borderUpdatesApplied.incrementAndGet();
-                                if (update instanceof RegionBorderUpdates.BlockWrite) {
-                                    this.borderBlockWritesApplied.incrementAndGet();
-                                }
-                            }
-                        });
+                        this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null),
+                                () -> work.accept(level));
                     } finally {
                         RegionNeighborUpdateScope.exit(previousNeighbors);
                     }
@@ -1842,16 +1959,19 @@ public final class RegionThreadingEngine implements RegionThreading {
                 region.clearRunning();
                 final long duration = System.nanoTime() - start;
                 region.tickMetrics().recordTick(duration);
-                RegionTickWatchdog.warnIfLongTick("border propagation " + coordinate, duration);
+                RegionTickWatchdog.warnIfLongTick(label + " " + coordinate, duration);
                 this.regionizer.removeIfEmpty(region);
             }
         };
     }
 
     /**
-     * {@return the fixpoint bound of {@code level}, i.e. vanilla's own chained-update limit}
+     * {@return the chained-update bound of {@code level}, i.e. vanilla's own limit for one cascade}
+     * <p>
+     * The border fixpoint bounds its passes and its applied updates by it, and the game event delivery bounds
+     * its cascade rounds by it, so neither can spin on a cycle the inline run would have recursed into.
      */
-    private int borderUpdateBudget(ServerLevel level) {
+    private int chainedUpdateBudget(ServerLevel level) {
         if (this.borderUpdateBudgetForTesting >= 0) {
             return this.borderUpdateBudgetForTesting;
         }
@@ -1872,6 +1992,142 @@ public final class RegionThreadingEngine implements RegionThreading {
                 LockSupport.parkNanos(100_000L);
             }
         };
+    }
+
+    /**
+     * Replays the game event columns the workers of the batch that just ended captured for other regions, and
+     * repeats until no captured column and no border update remains or the chained-update bound is reached.
+     * <p>
+     * <strong>Why here.</strong> The replay runs on the server thread after the worker phase returned and before
+     * the next slice of the level tick, so no worker of the batch runs and the target region's worker is the only
+     * thread that touches the target state. That is the same point the border fixpoint runs at, and the game
+     * events follow it, because the deferred block writes of the source are applied before the listener body
+     * reads the world - the order the inline run has, where the write and the dispatch are in one call stack.
+     * <p>
+     * <strong>The ordering requirement.</strong> A vibration listener records a candidate with the level's game
+     * time and {@code VibrationSelector} only compares candidates of the same game time: a candidate of another
+     * tick is refused outright, and {@code chosenCandidate} selects a candidate only in a later game time than
+     * the one it was recorded in. The activation tick of a sculk sensor is therefore fixed by the game time of
+     * the recording and by the distance the candidate carries, and both are decided by the vanilla dispatch - the
+     * source position is captured and the distance is re-measured against the listener's own position on the
+     * target worker. Replaying in the same tick reproduces the recording tick; replaying one tick later would
+     * move every activation by one tick. Within a tick the selector's tie-break (nearest distance, then highest
+     * frequency) is order independent except for the degenerate tie of equal distance and equal frequency, where
+     * the first recorded candidate wins; the delivery keeps the recording order, so the first candidate is the
+     * one the inline dispatch would have recorded first.
+     * <p>
+     * <strong>Order.</strong> A pass groups the pending columns by the region that owns them, in first-seen order,
+     * and replays one region after another, so a listener of the second region sees the state the first region's
+     * listener bodies left. Within one region the columns are replayed in recording order, and the replay of one
+     * column keeps the vanilla iteration order of the column. The listener bodies of a pass can post further game
+     * events for another region and write blocks whose neighbor updates cross a border, so the pass runs the
+     * border fixpoint again and the next pass replays what that produced.
+     * <p>
+     * <strong>Bound.</strong> A pass replays at least one column, so the chained-update bound bounds the rounds
+     * the same way it bounds the border fixpoint's passes. Vanilla has no bound at all here - a chain of listeners
+     * that each post a new event recurses until the stack runs out - so the bound is the engine's safety net
+     * against a cycle, and every column it cuts off is counted as dropped.
+     */
+    private void runCrossRegionGameEvents(ServerLevel level) {
+        if (!this.crossRegionGameEventsEnabled) {
+            return;
+        }
+        final RegionBorderGameEvents queue = this.borderGameEvents.get(level);
+        if (queue == null || queue.isEmpty()) {
+            return;
+        }
+        if (this.regionizer.isLevelClosed(level) || this.shutdown) {
+            this.gameEventSectionsDropped.addAndGet(queue.drain().size());
+            queue.discard();
+            return;
+        }
+        final int budget = this.chainedUpdateBudget(level);
+        final RegionTickBarrier barrier = borderFixpointBarrier(level);
+        int passes = 0;
+        while (passes < budget) {
+            final List<RegionBorderGameEvents.SectionColumn> pending = queue.drain();
+            if (pending.isEmpty()) {
+                return;
+            }
+            passes++;
+            this.gameEventDeliveryPasses.incrementAndGet();
+            for (final Map.Entry<RegionState, List<RegionBorderGameEvents.SectionColumn>> entry : this
+                    .groupGameEventsByRegion(level, pending).entrySet()) {
+                final RegionState region = entry.getKey();
+                final List<RegionBorderGameEvents.SectionColumn> columns = entry.getValue();
+                if (!this.runGameEventDeliveryPass(level, region, columns, barrier)) {
+                    // The region retired or the level closed before its lease: the columns have no owner to
+                    // replay them, and replaying them anywhere else would write another region's state.
+                    this.gameEventSectionsDropped.addAndGet(columns.size());
+                }
+            }
+            // The listener bodies of the pass wrote blocks and posted further events: their cross-region
+            // neighbor updates are the next thing the inline run would have applied.
+            this.runBorderUpdateFixpoint(level);
+        }
+        final int leftover = queue.drain().size();
+        if (leftover > 0) {
+            this.gameEventSectionsDropped.addAndGet(leftover);
+        }
+    }
+
+    /**
+     * Groups the pending columns by the live region that owns them, in first-seen order.
+     * <p>
+     * A column whose target region does not exist or is retired is counted as dropped: no region will ever
+     * replay it, and handing it to a different region would write a listener of the wrong region.
+     */
+    private Map<RegionState, List<RegionBorderGameEvents.SectionColumn>> groupGameEventsByRegion(ServerLevel level,
+            List<RegionBorderGameEvents.SectionColumn> columns) {
+        final Map<RegionState, List<RegionBorderGameEvents.SectionColumn>> byRegion = new LinkedHashMap<>();
+        for (final RegionBorderGameEvents.SectionColumn column : columns) {
+            final RegionState region = this.regionizer.get(this.layout.regionAt(level, column.chunkX(), column.chunkZ()));
+            if (region == null || region.isDead()) {
+                this.gameEventSectionsDropped.incrementAndGet();
+                this.gameEventSectionsDroppedNoRegion.incrementAndGet();
+                continue;
+            }
+            byRegion.computeIfAbsent(region, key -> new ArrayList<>()).add(column);
+        }
+        return byRegion;
+    }
+
+    /**
+     * Replays one region's captured columns on that region's own worker and waits for it.
+     *
+     * @return {@code true} when the region was leased and the pass ran; {@code false} when the region retired
+     *         or the level closed before the lease, so the caller counts the columns as dropped
+     */
+    private boolean runGameEventDeliveryPass(ServerLevel level, RegionState region, List<RegionBorderGameEvents.SectionColumn> columns,
+            RegionTickBarrier barrier) {
+        return this.runPropagationPass(level, region, batch -> this.gameEventDeliveryGroup(batch, region, columns), barrier);
+    }
+
+    /**
+     * The worker body of one game event delivery group.
+     * <p>
+     * The group holds the lease of the target region and replays the captured columns in recording order with the
+     * vanilla dispatcher of the level, so the listener registries, the distance filter, the delivery mode and the
+     * {@code handleGameEvent} body are the vanilla ones. It ticks nothing else.
+     */
+    private Runnable gameEventDeliveryGroup(RegionBorderPropagationBatch batch, RegionState region,
+            List<RegionBorderGameEvents.SectionColumn> columns) {
+        return this.propagationGroup(batch, region, "game event delivery", level -> {
+            final net.minecraft.world.level.gameevent.GameEventDispatcher dispatcher = new net.minecraft.world.level.gameevent.GameEventDispatcher(
+                    level);
+            for (final RegionBorderGameEvents.SectionColumn column : columns) {
+                if (dispatcher.postCaptured(column.event(), column.source(), column.context(), column.chunkX(), column.chunkZ(),
+                        column.minSectionY(), column.maxSectionY())) {
+                    this.gameEventSectionsDelivered.incrementAndGet();
+                } else {
+                    // The target chunk unloaded between the capture and the replay. Vanilla would have delivered
+                    // to the listeners of that chunk; there are none left to deliver to, so the column is
+                    // counted as dropped instead of being replayed into another chunk.
+                    this.gameEventSectionsDropped.incrementAndGet();
+                    this.gameEventSectionsDroppedNoChunk.incrementAndGet();
+                }
+            }
+        });
     }
 
     /**
@@ -2905,6 +3161,89 @@ public final class RegionThreadingEngine implements RegionThreading {
     /** {@return the capture queue of {@code level}, created with the configured capacity} */
     private RegionBorderUpdates borderQueue(ServerLevel level) {
         return this.borderUpdates.computeIfAbsent(level, key -> new RegionBorderUpdates(this.borderUpdateCapacity));
+    }
+
+    /**
+     * Enables or disables the cross-region game event capture of this engine.
+     * <p>
+     * Production reads the switch from the server config at construction. The setter is the mechanics seam the
+     * cross-region tests use, so a test does not have to load the config.
+     */
+    @ApiStatus.Internal
+    public void setCrossRegionGameEventsEnabledForTesting(boolean enabled) {
+        this.crossRegionGameEventsEnabled = enabled;
+    }
+
+    /**
+     * Lowers the number of game event columns one capture pass admits, so a mechanics test can observe the
+     * capture bound without producing {@link RegionBorderGameEvents#MAX_ENTRIES} columns.
+     * <p>
+     * The capacity is read when the queue of a level is created, so a test has to call this before the first
+     * column of the level is recorded.
+     *
+     * @param capacity the columns one capture queue admits; must be positive
+     */
+    @ApiStatus.Internal
+    public void setGameEventCapacityForTesting(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("The game event capture capacity has to admit at least one column: " + capacity);
+        }
+        this.gameEventCapacity = capacity;
+    }
+
+    /** {@return the game event capture queue of {@code level}, created with the configured capacity} */
+    private RegionBorderGameEvents gameEventQueue(ServerLevel level) {
+        return this.borderGameEvents.computeIfAbsent(level, key -> new RegionBorderGameEvents(this.gameEventCapacity));
+    }
+
+    /**
+     * Counts one game event posted on {@code level} while a region batch of it was in flight.
+     * <p>
+     * Runs at the head of {@code GameEventDispatcher.post}, so it is one volatile read and one phase lookup for a
+     * post the engine does not capture. With the switch off it counts nothing: the dispatch is then the vanilla
+     * one and the counters of the feature stay at zero.
+     *
+     * @param level the level the event was posted on
+     */
+    @ApiStatus.Internal
+    public void recordGameEventPost(ServerLevel level) {
+        if (this.crossRegionGameEventsEnabled && this.levelTickPhase(level) == LevelTickPhase.REGION) {
+            this.gameEventsPosted.incrementAndGet();
+        }
+    }
+
+    /**
+     * Captures one section column of a game event dispatch whose listeners belong to another region.
+     * <p>
+     * Only a region lease captures: the server thread outside a region batch, the global region and the quiescent
+     * block event phase deliver inline, because no region is ticked by another thread while they run. A worker
+     * that owns the column delivers it inline too. A column of another region is recorded for the region that
+     * owns it and never visited by this thread, so neither the listener registry nor the block entity of the
+     * foreign section is read or written here.
+     *
+     * @return {@code true} when the caller has to skip the column, whether it was recorded or refused
+     */
+    @ApiStatus.Internal
+    public boolean captureCrossRegionGameEvent(ServerLevel level, net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event,
+            net.minecraft.world.phys.Vec3 source, net.minecraft.world.level.gameevent.GameEvent.Context context, int chunkX, int chunkZ,
+            int minSectionY, int maxSectionY) {
+        if (!this.crossRegionGameEventsEnabled || this.levelTickPhase(level) != LevelTickPhase.REGION) {
+            return false;
+        }
+        if (this.isOwnedByCurrentRegion(level, chunkX, chunkZ)) {
+            this.gameEventSectionsLocal.incrementAndGet();
+            return false;
+        }
+        final RegionBorderGameEvents.SectionColumn column = new RegionBorderGameEvents.SectionColumn(event, source, context, chunkX, chunkZ,
+                minSectionY, maxSectionY);
+        if (this.gameEventQueue(level).record(column)) {
+            this.gameEventSectionsDeferred.incrementAndGet();
+        } else {
+            // The capture bound refused the column. The worker still must not visit it, so the event of this
+            // column is dropped and counted; a next-tick replay would record a candidate in the wrong game time.
+            this.gameEventSectionsRefused.incrementAndGet();
+        }
+        return true;
     }
 
     /**
@@ -6349,6 +6688,13 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.borderUpdatesDropped.addAndGet(borderUpdates.drain().size() + borderUpdates.drainOverflow().size());
                         borderUpdates.discard();
                     }
+                    // The captured game events of the level die with its regions: no region is left to replay
+                    // them, so they are dropped and counted instead of waiting for a tick that never comes.
+                    final RegionBorderGameEvents gameEvents = this.borderGameEvents.remove(level);
+                    if (gameEvents != null) {
+                        this.gameEventSectionsDropped.addAndGet(gameEvents.drain().size());
+                        gameEvents.discard();
+                    }
                     for (final EntityRegionScheduledTask task : this.entityTaskSnapshot()) {
                         if (task.isOwnedBy(level)) {
                             task.cancel();
@@ -7726,6 +8072,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.blockEventPhaseLeaseFallbacks.get(),
                         this.blockEventPhaseNanos.get(),
                         this.blockEventPhaseMaxNanos.get()),
+                new RegionThreadingDiagnostics.GameEventCounters(
+                        this.gameEventsPosted.get(),
+                        this.gameEventSectionsLocal.get(),
+                        this.gameEventSectionsDeferred.get(),
+                        this.gameEventSectionsDelivered.get(),
+                        this.gameEventSectionsRefused.get(),
+                        this.gameEventSectionsDropped.get(),
+                        this.gameEventSectionsDroppedNoRegion.get(),
+                        this.gameEventSectionsDroppedNoChunk.get(),
+                        this.gameEventDeliveryPasses.get()),
                 RegionPoiCounters.snapshot(),
                 this.workerDispatchCounters(),
                 RegionMetricsSummary.summarize(regionTicks),
@@ -7804,6 +8160,11 @@ public final class RegionThreadingEngine implements RegionThreading {
                     borderUpdates.discard();
                 }
                 this.borderUpdates.clear();
+                for (final RegionBorderGameEvents gameEvents : this.borderGameEvents.values()) {
+                    this.gameEventSectionsDropped.addAndGet(gameEvents.drain().size());
+                    gameEvents.discard();
+                }
+                this.borderGameEvents.clear();
                 // The global region has no coordinate and is not part of the region metrics, so its window is
                 // released here: a shut-down engine holds no metric buffer at all.
                 this.globalRegion.tickMetrics().release();

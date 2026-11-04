@@ -60,6 +60,19 @@ final class RegionThreadingConfig {
                 : NeoForgeConfig.SERVER.enableRegionThreadingBorderUpdates.getDefault();
     }
 
+    /**
+     * {@return true when a region context captures the game events whose listeners belong to another region}
+     * <p>
+     * The switch is off by default. When it is off the dispatch is exactly vanilla: the posting worker visits
+     * every listener of the event's radius, including the listeners of other regions, and therefore writes a
+     * foreign block entity while its owner may tick it - the documented racy baseline.
+     */
+    static boolean crossRegionGameEventsEnabled() {
+        return NeoForgeConfig.isServerConfigLoaded()
+                ? NeoForgeConfig.SERVER.enableRegionThreadingGameEvents.get()
+                : NeoForgeConfig.SERVER.enableRegionThreadingGameEvents.getDefault();
+    }
+
     static NeoForgeConfig.RegionThreadingOwnershipViolationMode ownershipViolationMode() {
         return NeoForgeConfig.isServerConfigLoaded()
                 ? NeoForgeConfig.SERVER.regionThreadingOwnershipViolationMode.get()

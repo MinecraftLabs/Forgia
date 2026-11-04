@@ -54,6 +54,8 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingBorderUpdates;
 
+        public final BooleanValue enableRegionThreadingGameEvents;
+
         public final BooleanValue enableRegionThreadingPersistentWorkers;
 
         public final BooleanValue enableRegionThreadingPackedRegionLeases;
@@ -166,6 +168,13 @@ public class NeoForgeConfig {
                     .translation("neoforge.configgui.enableRegionThreadingBorderUpdates")
                     .worldRestart()
                     .define("enableRegionThreadingBorderUpdates", false);
+
+            enableRegionThreadingGameEvents = builder
+                    .comment(
+                            "EXPERIMENTAL: Captures a game event whose listeners belong to another region and delivers it on that region's own worker in the same tick, in posting order, instead of writing the foreign block entity from the posting worker. A game event reaches every listener within its notification radius (16 blocks for the common events, 32 for shriek), and a listener writes its own block entity, so with 3-chunk regions the dispatch crosses a border in the common case. A captured section column is replayed by the target region's worker with the vanilla listener registry, before the next slice of the level tick, so a sculk sensor records the vibration in the same game time and activates on the same tick as inline. Requires enableRegionThreadingBridge. The counters report every posted event, the columns delivered locally, deferred and delivered, and every refusal and drop. With the switch off the dispatch is exactly vanilla and therefore races as before: the posting worker visits every listener of the event's radius itself, including the listeners of other regions, and writes their block entities inline.")
+                    .translation("neoforge.configgui.enableRegionThreadingGameEvents")
+                    .worldRestart()
+                    .define("enableRegionThreadingGameEvents", false);
 
             enableRegionThreadingPersistentWorkers = builder
                     .comment(

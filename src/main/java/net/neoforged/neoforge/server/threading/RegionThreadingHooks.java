@@ -1099,6 +1099,69 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * {@return the chunk a game event dispatch visits, or {@code null} when it is not available}
+     * <p>
+     * The vanilla dispatch asks {@code ServerChunkCache.getChunkNow}, which answers {@code null} on every thread
+     * but the server thread: a region worker that asked it would visit no listener at all and silently drop the
+     * event. A worker therefore asks the chunk source for a chunk that is already available, which is the answer
+     * the server thread gives too and never loads a chunk - the server thread is waiting at the batch barrier
+     * while the worker runs, so a load could not complete.
+     *
+     * @param level  the level the event was posted on
+     * @param chunkX the chunk column's X coordinate
+     * @param chunkZ the chunk column's Z coordinate
+     */
+    public static net.minecraft.world.level.chunk.ChunkAccess gameEventChunk(ServerLevel level, int chunkX, int chunkZ) {
+        if (isNativeRegionWorkerThread()) {
+            return level.getChunkSource().getChunk(chunkX, chunkZ, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, false);
+        }
+        return level.getChunkSource().getChunkNow(chunkX, chunkZ);
+    }
+
+    /**
+     * Counts one game event the level dispatches while a region batch of it is in flight.
+     * <p>
+     * {@code GameEventDispatcher.post} reaches every listener of the event's notification radius and every
+     * listener writes its own block entity, so the dispatch is the one place where a region worker can reach
+     * the state of another region without a block write. The count is the denominator of the capture counters
+     * of {@link #captureCrossRegionGameEvent}; with the cross-region game event switch off it stays zero and
+     * the dispatch is the vanilla one.
+     */
+    public static void recordGameEventPost(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.recordGameEventPost(level);
+        }
+    }
+
+    /**
+     * Captures one section column of a game event dispatch whose listeners belong to another region.
+     * <p>
+     * The dispatcher asks once per chunk column of the notification radius, before it reads the column's chunk
+     * or its listener registries. A {@code true} answer means the column is not this worker's to visit: the
+     * dispatcher skips it and the target region's worker replays it in the same tick, in recording order. The
+     * caller must not read the column at all, because the listener registry of a foreign section is mutable
+     * state of the region that owns it.
+     *
+     * @param level       the level the event was posted on
+     * @param event       the posted game event
+     * @param source      the position the event was posted from
+     * @param context     the context of the post
+     * @param chunkX      the chunk column's X coordinate
+     * @param chunkZ      the chunk column's Z coordinate
+     * @param minSectionY the lowest section of the dispatch's Y range
+     * @param maxSectionY the highest section of the dispatch's Y range
+     * @return {@code true} when the caller must skip the column, because the owning region delivers it
+     */
+    public static boolean captureCrossRegionGameEvent(ServerLevel level, net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event,
+            net.minecraft.world.phys.Vec3 source, net.minecraft.world.level.gameevent.GameEvent.Context context, int chunkX, int chunkZ,
+            int minSectionY, int maxSectionY) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        return threading instanceof RegionThreadingEngine engine
+                && engine.captureCrossRegionGameEvent(level, event, source, context, chunkX, chunkZ, minSectionY, maxSectionY);
+    }
+
+    /**
      * Runs {@code task} in the current level tick bridge context.
      */
     public static void runLevelTickTask(ServerLevel level, Runnable task) {

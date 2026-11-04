@@ -259,6 +259,7 @@ enableRegionThreadingRandomTicks = ${regionThreading}
 enableRegionThreadingSpawning = ${regionThreading}
 enableRegionThreadingPoi = ${regionThreading}
 enableRegionThreadingBorderUpdates = ${regionThreading}
+enableRegionThreadingGameEvents = ${regionThreading}
 enableRegionThreadingPersistentWorkers = ${regionThreading}
 enableRegionThreadingPackedRegionLeases = ${regionThreading}
 regionThreadingWorkerThreads = ${regionThreading ? 4 : 0}

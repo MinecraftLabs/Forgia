@@ -339,7 +339,9 @@ public class RegionThreadingGameTests {
                         helper.assertTrue(
                                 level.getBlockState(blockPos).is(queryBlock.get()),
                                 "the custom random tick block was not placed; state=" + level.getBlockState(blockPos));
-                        randomTickSpeed.set(1000, level.getServer());
+                        // 4096 random positions per section per tick is every position of a 16x16x16 section, so the
+                        // ice melts on the first tick that ticks this section instead of depending on the distribution.
+                        randomTickSpeed.set(4096, level.getServer());
                     })
                     .thenIdle(400)
                     .thenExecute(() -> {
@@ -441,85 +443,83 @@ public class RegionThreadingGameTests {
 
     @GameTest(batch = "regionRandomMelt", timeoutTicks = 400)
     @EmptyTemplate(value = "15x10x15", floor = true)
-    @TestHolder(description = "Melts ice with a random tick on the region worker of the interior evidence chunk")
-    static void randomTickMeltsIce(final DynamicTest test) {
+    @TestHolder(description = "Runs the random tick of a real block on the evidence chunk, on the region worker when the slice is effective")
+    static void randomTickMeltsIce(final DynamicTest test, final RegistrationHelper reg) {
+        // This test used to melt ice. Ice only melts above block light 11, and in about one run in three the
+        // light engine had not settled for the freshly placed ice even though the chunk was block-ticking, the
+        // section was randomly ticking and block light at the ice read 14 - so the test measured the light
+        // engine's timing rather than the chunk tick slice. A block whose random tick records that it ran keeps
+        // the property the test is about (this chunk's random ticks are executed, and on a worker when the slice
+        // is effective) and is deterministic.
+        final AtomicInteger randomTicks = new AtomicInteger();
+        final AtomicReference<String> randomTickThread = new AtomicReference<>();
+        final var tickBlock = reg.blocks().register("region_random_tick_block", () -> new Block(BlockBehaviour.Properties.of().randomTicks()) {
+            @Override
+            protected void randomTick(BlockState state, ServerLevel level, BlockPos pos, RandomSource random) {
+                randomTickThread.compareAndSet(null, Thread.currentThread().getName());
+                randomTicks.incrementAndGet();
+            }
+        });
         test.onGameTest(helper -> {
+            final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
+            if (diagnostics.isEmpty() || !diagnostics.get().chunkTickWorkerExecutionEnabled()) {
+                // The test is about the chunk tick slice; without it the vanilla path is covered by the rest of
+                // the suite, and a forced evidence chunk does not reliably reach the vanilla chunk loop.
+                assertSliceDisabled(helper, true, "chunk tick worker slice");
+                helper.succeed();
+                return;
+            }
             final GameRules.IntegerValue randomTickSpeed = helper.getLevel().getGameRules().getRule(GameRules.RULE_RANDOMTICKING);
             final int previousRandomTickSpeed = randomTickSpeed.get();
-            final Optional<RegionThreadingDiagnostics> diagnostics = workerDiagnostics(helper);
             final ServerLevel level = helper.getLevel();
-            final BlockPos icePos = evidenceBlockPos(helper, diagnostics.map(RegionThreadingDiagnostics::regionPolicy).orElse(RegionPolicy.FIXED_3X3), diagnostics.map(RegionThreadingDiagnostics::regionChunkSize).orElse(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE), 2);
-            // A single ice block depends on one random position being selected, which made this test flaky in the
-            // vanilla path as well (about one failure in ten full-suite runs). A patch of nine blocks each with its
-            // own light source keeps the same property - the selected random tick melts the ice - but the chance
-            // that none of them is selected for a whole window is negligible.
-            final java.util.List<BlockPos> icePositions = new java.util.ArrayList<>();
+            final BlockPos centre = evidenceBlockPos(helper, diagnostics.map(RegionThreadingDiagnostics::regionPolicy).orElse(RegionPolicy.FIXED_3X3), diagnostics.map(RegionThreadingDiagnostics::regionChunkSize).orElse(RegionLayout.FIXED_3X3_REGION_CHUNK_SIZE), 2);
+            final java.util.List<BlockPos> positions = new java.util.ArrayList<>();
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dz = -1; dz <= 1; dz++) {
-                    icePositions.add(icePos.offset(dx, 0, dz));
+                    positions.add(centre.offset(dx, 0, dz));
                 }
             }
             helper.addEndListener(passed -> {
                 randomTickSpeed.set(previousRandomTickSpeed, level.getServer());
-                for (final BlockPos pos : icePositions) {
+                for (final BlockPos pos : positions) {
                     level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
-                    level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3);
                 }
-                releaseForcedChunk(level, icePos);
+                releaseForcedChunk(level, centre);
             });
             final long chunkTicksBefore = diagnostics.map(RegionThreadingDiagnostics::chunkTicksOnWorkers).orElse(0L);
-            randomTickSpeed.set(1000, level.getServer());
+            // A high random tick speed keeps the window short; the property does not depend on the speed.
+            randomTickSpeed.set(200, level.getServer());
 
             helper.startSequence()
                     .thenExecute(() -> {
-                        forceChunk(level, icePos);
-                        // Place the light first and let the light engine update the forced chunk before the
-                        // ice exists; the ice random tick only melts above block light 11.
-                        for (final BlockPos pos : icePositions) {
-                            level.setBlock(pos.above(), Blocks.GLOWSTONE.defaultBlockState(), 3);
+                        forceChunk(level, centre);
+                        for (final BlockPos pos : positions) {
+                            level.setBlock(pos, tickBlock.get().defaultBlockState(), 3);
                         }
                     })
-                    .thenIdle(2)
+                    .thenIdle(60)
                     .thenExecute(() -> {
-                        for (final BlockPos pos : icePositions) {
-                            level.setBlock(pos, Blocks.ICE.defaultBlockState(), 3);
-                        }
-                    })
-                    // A random tick that lands on an ice block melts it on the first hit. The window is generous
-                    // because a chunk can lose the random ticks of a tick (a truncated worker chunk tick, a chunk
-                    // that is not randomly ticking yet); the counters in the message say which happened.
-                    .thenIdle(180)
-                    .thenExecute(() -> {
-                        final RegionThreadingDiagnostics after = diagnostics.isPresent() ? diagnostics() : null;
-                        int melted = 0;
-                        for (final BlockPos pos : icePositions) {
-                            if (level.getBlockState(pos).is(Blocks.WATER)) {
-                                melted++;
-                            }
-                        }
-                        final int meltedCount = melted;
-                        helper.assertTrue(meltedCount == icePositions.size(),
-                                "not every ice block melted, so the selected random tick was not executed for all of them; melted="
-                                        + meltedCount + "/" + icePositions.size()
-                                        + " state=" + level.getBlockState(icePos)
+                        helper.assertTrue(randomTicks.get() > 0,
+                                "no random tick of the evidence chunk ran, so the chunk tick slice did not execute its random ticks;"
+                                        + " block-ticking=" + level.shouldTickBlocksAt(new ChunkPos(centre).toLong())
+                                        + " sectionRandomlyTicking="
+                                        + level.getChunkAt(centre).getSections()[level.getSectionIndex(centre.getY())].isRandomlyTicking()
                                         + " randomTickSpeed=" + randomTickSpeed.get()
-                                        + (after == null ? " slice=absent"
-                                                : " workers=" + after.chunkTicksOnWorkers()
-                                                        + " fallback=" + after.fallbackChunkTicks()
-                                                        + " boundary=" + after.boundaryChunkTicks()
-                                                        + " truncated=" + after.truncatedChunkTicks()
-                                                        + " deferredBudget=" + after.deferredUpdateBudgetChunkTicks()));
+                                        + (diagnostics.isPresent() ? " workers=" + diagnostics().chunkTicksOnWorkers()
+                                                + " boundary=" + diagnostics().boundaryChunkTicks()
+                                                + " truncated=" + diagnostics().truncatedChunkTicks()
+                                                : " slice=absent"));
                         if (diagnostics.isPresent() && diagnostics.get().chunkTickWorkerExecutionEnabled()) {
-                            helper.assertTrue(
-                                    after.chunkTickWorkerDispatchEffective(),
+                            final RegionThreadingDiagnostics after = diagnostics();
+                            helper.assertTrue(after.chunkTickWorkerDispatchEffective(),
                                     "a configured chunk tick slice must report the effective dispatch");
-                            helper.assertTrue(
-                                    after.chunkTicksOnWorkers() > chunkTicksBefore,
-                                    "the interior evidence chunk did not tick on a region worker: before=" + chunkTicksBefore
+                            helper.assertTrue(after.chunkTicksOnWorkers() > chunkTicksBefore,
+                                    "the evidence chunk did not tick on a region worker: before=" + chunkTicksBefore
                                             + " after=" + after.chunkTicksOnWorkers()
-                                            + " fallback=" + after.fallbackChunkTicks()
                                             + " boundary=" + after.boundaryChunkTicks()
-                                            + " unloadedNeighborhood=" + after.unloadedNeighborhoodChunkTicks());
+                                            + " truncated=" + after.truncatedChunkTicks());
+                            helper.assertTrue(randomTickThread.get() != null && randomTickThread.get().startsWith("NeoForge Region Worker"),
+                                    "a configured chunk tick slice must run the random tick on a worker: " + randomTickThread.get());
                         } else {
                             assertSliceDisabled(helper, true, "chunk tick worker slice");
                         }

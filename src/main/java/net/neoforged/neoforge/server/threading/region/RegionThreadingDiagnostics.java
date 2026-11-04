@@ -171,6 +171,15 @@ import java.util.Map;
  * server thread resolved and applied in that same tick; refused is one it could not apply (the engine shut
  * down, the level identity closed, the entity was removed or left the level). A refused transition is never
  * lost: the entity keeps its portal state, so a later tick records it again.
+ * <p>
+ * {@link GameEventCounters} reports the cross-region game event capture. The unit of its counters is one chunk
+ * column of one dispatch, because the vanilla dispatch iterates the chunks of an event's notification radius and
+ * the sections of each chunk, and a listener writes its own block entity: with a 3-chunk region a worker's
+ * dispatch crosses a region border in the common case. A posted event is counted while a region batch of the
+ * level is in flight, a local column is one the posting worker visited itself, a deferred column one it recorded
+ * for the owning region, a delivered column one that region replayed on its own worker, a refused column one the
+ * capture bound refused at the call site, and a dropped column one that was never replayed. Every column reaches
+ * exactly one of visited, replayed or dropped.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -297,6 +306,7 @@ public record RegionThreadingDiagnostics(
         long mailboxDeliveryFailures,
         BorderUpdateCounters borderUpdates,
         BlockEventPhaseCounters blockEventPhase,
+        GameEventCounters gameEvents,
         PoiCounters poiCounters,
         WorkerDispatchCounters workerDispatch,
         RegionMetricsSummary regionMetrics,
@@ -452,6 +462,46 @@ public record RegionThreadingDiagnostics(
                     + "/leaseFallbacks=" + this.leaseFallbacks
                     + "/nanos=" + this.nanos
                     + "/maxNanos=" + this.maxNanos;
+        }
+    }
+
+    /**
+     * The counters of the cross-region game event capture of a level.
+     * <p>
+     * A game event reaches every listener of its notification radius, and a listener writes its own block entity,
+     * so with a 3-chunk region a worker's dispatch crosses a region border in the common case. The engine
+     * captures the section columns of another region and replays them on the owning region's worker in the same
+     * tick. The unit of every counter is one chunk column of one dispatch - the vanilla dispatch iterates the
+     * chunks of the radius and the sections of each chunk, and the capture decides per chunk column.
+     * <p>
+     * {@code posted} counts the game events posted while a region batch of the level was in flight, so it is the
+     * denominator of the capture; it is zero with the switch off, because then the dispatch is vanilla.
+     * {@code localSections} counts the columns the posting worker visited itself, {@code deferredSections} the
+     * columns it recorded for the region that owns them, and {@code deliveredSections} the recorded columns the
+     * owning region replayed. {@code refusedSections} counts the columns the capture bound refused at the call
+     * site: the worker still does not visit them, so the event of that column is dropped and the count is the
+     * only trace of it. {@code droppedSections} counts the recorded columns that were never replayed - the target
+     * region retired, its chunk unloaded, the level closed or the delivery bound cut the cascade - so every column
+     * reaches exactly one of visited, replayed or dropped. {@code droppedNoRegionSections} and
+     * {@code droppedNoChunkSections} split that count by cause: the target region did not exist or retired before
+     * the replay, or the target chunk was no longer loaded when the replay ran. {@code passes} counts the delivery
+     * rounds the server thread ran after a worker phase; a cascade that posts further events or writes further
+     * borders needs another round.
+     */
+    public record GameEventCounters(long posted, long localSections, long deferredSections, long deliveredSections,
+            long refusedSections, long droppedSections, long droppedNoRegionSections, long droppedNoChunkSections,
+            long passes) {
+        @Override
+        public String toString() {
+            return "posted=" + this.posted
+                    + "/local=" + this.localSections
+                    + "/deferred=" + this.deferredSections
+                    + "/delivered=" + this.deliveredSections
+                    + "/refused=" + this.refusedSections
+                    + "/dropped=" + this.droppedSections
+                    + "/droppedNoRegion=" + this.droppedNoRegionSections
+                    + "/droppedNoChunk=" + this.droppedNoChunkSections
+                    + "/passes=" + this.passes;
         }
     }
 
