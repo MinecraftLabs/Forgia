@@ -1,147 +1,131 @@
-# Forgia — Minecraft 1.21.1
+# Forgia
 
-A NeoForge fork porting [Folia](https://github.com/PaperMC/Folia)'s regionized multithreaded server model natively into the NeoForge modding ecosystem.
+**A regionized, multithreaded Minecraft server for NeoForge 1.21.1.**
 
-## What It Does
+Forgia ports [Folia](https://github.com/PaperMC/Folia)'s region model into NeoForge natively: the world is
+partitioned into regions, each region owns its chunks, entities, block entities and points of interest, and
+the regions tick in parallel on worker threads. It is a NeoForge fork, not a plugin platform — scheduling and
+ownership are exposed through native NeoForge API, and mods keep running as mods.
 
-Enables Minecraft servers running NeoForge mods to distribute world tick processing across multiple threads organized by region, instead of running all world logic on a single server thread. This can significantly improve server performance when many players are spread across a world.
+> **Project status: independent.** Forgia started as a fork of an earlier Forgia port. That upstream stopped
+> updating, so this repository is now the continuation: it tracks NeoForge 21.1.x as its base, but the
+> regionized runtime is developed here. See [region-threading/STATUS.md](region-threading/STATUS.md) for what works, what is
+> measured, and what is still missing.
 
-**This is not a Paper/Bukkit plugin.** The runtime stays NeoForge/FML — scheduling and ownership are exposed through native NeoForge API interfaces, not Bukkit or Paper APIs.
+---
 
-## Status
+## What works today
 
-Currently at **stage 2** of the port (a gated entity tick vertical slice, a bounded block-entity tick slice, and bounded scheduled/random tick batch mechanics whose production dispatch is gated to the vanilla inline path). `ThreadedRegionizer` implements a minimal fixed-radius adjacency, merge, split, and empty-region retirement facade for the legacy `DYNAMIC` policy; Folia's full regionizer algorithm still needs to be ported.
+Everything below is implemented, tested and measured on this repository. All region threading is **off by
+default** and every slice fails closed: work that cannot be proven safe runs on the server thread and is
+counted.
 
-The default region policy for new installations is `FIXED_3X3`: a non-overlapping global grid where `regionX = floorDiv(chunkX, N)` and `regionZ = floorDiv(chunkZ, N)`, so each region is NxN chunks (N*16 blocks) and negative chunks map to the region that actually contains them. `N` is the `regionThreadingFixedRegionChunks` server config value (3..32, default 3), so the default is the 3x3-chunk (48x48-block) grid and a larger `N` keeps more neighboring chunks inside one region. Fixed regions never merge, split, or change their grid coordinates. Loading one ticking chunk activates its region without force-loading the other chunks of that region; the region retires once its last tracked chunk, entity, and queued task are gone, and a later activation creates a fresh live state at the same fixed coordinate. The legacy 16x16-chunk `DYNAMIC` policy with merge/split recalculation remains selectable for compatibility.
+| Area | What it does | Measured |
+|---|---|---|
+| **Entity ticks** | Regions tick their own entities; the server thread no longer walks the entity list | **2.5–4.5×** on 1024 mobs (4 workers) |
+| **Chunk ticks** | Random ticks, ice/snow, thunder on the region that owns the chunk | 1.15–1.27× with 9-chunk regions |
+| **Natural spawning** | Per-region spawn bodies against the vanilla level-wide mob cap | spawn slice 4.6 → 2.8–3.9 ms |
+| **Points of interest** | Region-partitioned storage with published snapshots; queries identical to vanilla | villagers **2.1–2.4×**, zombies **3.4×** |
+| **Block entities** | Furnace/hopper family admitted on workers with a per-chunk admission cache | at parity |
+| **Redstone** | Cross-region updates converge in the **same tick** through a fixpoint | 98 layouts, 5 880 tick comparisons, identical to vanilla |
+| **Cross-region reads** | Seqlock chunk versions; a stale read re-runs the region that made it | 0 torn reads, 0 stale takes |
+| **Global state** | Explicit global phase + bounded cross-region mailbox | weather/time writes from a region fail closed |
+| **Failures** | A worker tick failure is reported by the server thread, never built on the worker | barrier wait 200 ms → **1.25 ms** |
 
-The fixed grid reduces how often work crosses a region boundary; it does not eliminate cross-region ownership. It does not parallelize natural spawning, block events, or the whole world, and it does not bind regions to physical CPU cores: region work still runs on the existing worker pool. The chunk tick slice below parallelizes only the chunks that pass its interior and loaded-neighborhood rules.
+Correctness is the acceptance criterion throughout: the POI manager, the redstone components and the chunk
+random tick are compared against **real vanilla implementations**, tick by tick, not against expectations.
 
-The bridge drains scheduled tasks on the server tick loop by default, with experimental worker execution available behind the worker config options. On top of that, `enableRegionThreadingEntityTicks` adds a bounded, experimental entity tick slice:
+## What is not done yet
 
-- **the vanilla section/index storage is single-threaded and owned by the server thread, so entity ticks currently stay on the server thread.** An entity tick moves, removes and spawns entities, which mutates the section map, the section id tree and the by-id/by-uuid lookup. Region ownership of that storage is not implemented yet, so the config option and the worker slice mechanics stay in place for when it lands, and all entities tick inline on the server thread while the slice is gated. `RegionEntityStorageMode.REGION_OWNED` is only an internal mechanics-test assumption; spatial partitioning does not establish region ownership and production always selects `MAIN_THREAD_ONLY`;
-- the server thread iterates the level entity tick list and applies the vanilla inclusion, discard and frozen checks; the plan itself only re-evaluates the entity ticking range and the vehicle/passenger stack, and everything it does not accept is ticked inline by the unchanged vanilla loop. Accepted entities are ticked after that pass instead of interleaved with the inline ones, so the relative order between an accepted and an inline entity can differ from vanilla;
-- accepted entities are grouped by their current owning region, one worker task per region, so different regions tick in parallel and a region never ticks against itself;
-- each worker task holds the region lease for the whole batch and runs `checkDespawn` plus `tickNonPassenger` (passengers and NeoForge entity tick pre/post included); an entity that moves to another region while it ticks stays with the region that snapshotted it instead of leasing a second region. Moves and removals publish after the batch, and work for entities outside the group's membership runs on the server thread rather than under a foreign lease;
-- the server thread waits for the batch before `tickBlockEntities`, `entityManager.tick`, and the rest of the level tick continue. While it waits it keeps servicing chunk source tasks, because chunk requests from entity code are dispatched back to the server thread. The wait has no timeout: the server thread never continues while a worker still mutates level state. Merge/split recalculation is deferred around leased regions, and level unload and engine shutdown wait for all published batches, their handoffs, and worker termination;
-- the plan is only used while the server profiler is inactive, because the profiler is a single stack based filler. Otherwise the tick falls back to the server thread.
+Forgia is not a finished Folia replacement. The honest list:
 
-On top of the entity slice, `enableRegionThreadingBlockEntityTicks` adds a bounded block-entity tick slice:
+- **Light loads do not win yet.** A 2048-hopper line is at parity, 4096 furnaces are slower. The per-tick
+  barrier costs 0.4–0.8 ms while the work is 1–2 ms.
+- **The production soak shows no speedup at 3-chunk regions.** Only the centre chunk of a 3×3 region has all
+  eight neighbours inside it, so 89 % of chunk ticks and 94 % of block-entity ticks still fall back. The fix
+  (deferred cross-region block writes, then relaxing the interior rule) is the milestone in progress.
+- **Structures are not region-aware.** A piston that moves blocks across a border, and Create-style
+  contraptions, still run on the server thread.
+- **Cross-region game events (sculk) are not regionized.**
+- **Players are not regionized.** Teleport, portals and player entities stay on the server thread.
+- **No long-run or multiplayer validation yet**, and **no mod-pack validation yet** — a 170-mod pack is
+  prepared for that stage.
+- **Region size is static.** Dynamic regions (split/merge by load) and continuous region ticking (a tick clock
+  instead of a per-tick barrier) are designed but not built.
 
-- **the slice only runs block entity types whose compatibility declaration proves region-local, storage-free work; every other type stays on the server thread.** `RegionTickCompatibility` is an allowlist of the furnace family, and only away from a region boundary (the furnace, blast furnace and smoker write their own block with neighbor updates that stay inside the region and never touch entity storage). A type that queries entity storage and then consumes or mutates the result (beacon, conduit, bell, shulker box openers, enchanting table, vault, trial spawner), or that spawns/removes entities (brewing stand, hopper, dispenser, crafter, spawner, campfire), is not declared safe, and neither is any unknown or modded type. The brewing stand is excluded because its patched completion can call `Containers.dropItemStack` for a leftover crafting remainder, which spawns an item entity; an interior-only rule cannot make entity creation safe. A region that contains at least one undeclared ticker keeps all of its tickers on the server thread, so a query consumer never runs on a worker and the order inside the region is preserved;
-- `Level.tickBlockEntities` keeps its vanilla preparation and finalization on the server thread: pending fresh block entities are merged and loaded, pending tickers are merged into the ticker list, and removed tickers are dropped before any worker runs. Only the tickers the vanilla loop would tick are snapshotted;
-- the entity-load eligibility of a snapshot ticker is decided on the server thread before the ticker is admitted. The vanilla block ticking range does not prove that the chunk's entities finished loading, and the entity section status is server-owned storage that a worker may not read, so `RegionBlockEntityTickPlan.accept` evaluates `areEntitiesLoaded` for the ticker's chunk on the server thread. A chunk that is block-ticking while its asynchronous entity load is still pending therefore keeps the vanilla inline path, which skips the tick exactly like vanilla. The current server phase excludes entity-manager tick, save, unload and close during an active batch; its barrier services chunk-source tasks. Manager `tick`, `autoSave` and `saveAll` can all process chunk unloads and remove `LOADED` status, so this admission does not establish safety for arbitrary future reentrant saving. The batch carries immutable admissions containing the identical level, ticker, validated position and captured wrapper/delegate binding. A rebind (even back to the same delegate) invalidates the capture. Each invocation rechecks that capture before its body; stale admissions run through server-thread eligibility revalidation after the batch, without worker execution or replay after side effects. The worker-side replacement for the one manager read is `RegionBlockEntityTickScope`: it opens around one invocation, admits only its exact ticker and bound delegate under the current region lease, and restores the previous scope in `finally`. A sibling, same-position replacement, unrelated pool task, another level or position, and server-thread fallback all keep the guarded read. Every other check of `LevelChunk.isTicking` (world border, full chunk status) stays where it was;
-- the snapshot is grouped by the owning region of each ticker, one worker task per region, so different regions tick in parallel and a region never ticks against itself. Each worker task holds the region lease for the whole group and calls the real `TickingBlockEntity.tick()` in the snapshot order of that region; the block ticking range and tick-rate checks stay on the server thread, and a ticker removed by an earlier ticker of the same region is skipped;
-- tickers whose region cannot be leased safely, and tickers that are not declared region-safe, are ticked on the server thread after the worker batch instead of being dropped. Region ownership is re-resolved before leasing, so a merge or split between collection and execution is handled by the authoritative successor. Ticker additions made while ticking (including from workers) keep the vanilla pending semantics and are merged on the next tick under a lock;
-- the server thread waits for all groups before finalization and before `entityManager.tick` continue, servicing chunk source tasks while it waits. Level unload and engine shutdown wait for block-entity batches like they do for entity batches. A block-entity batch never overlaps a region task or entity batch on the same region;
-- the slice is only used while the server profiler is inactive and the level is not closed. Otherwise the whole block-entity tick stays on the server thread.
-
-On top of the block-entity slice, `enableRegionThreadingRandomTicks` runs the **chunk tick** of a level on region workers, and `enableRegionThreadingScheduledTicks` keeps the bounded scheduled tick batch machinery, whose production dispatch stays gated:
-
-- the chunk tick slice ticks the chunks of a level on the worker of their own region: random block and fluid ticks, ice and snow, and thunder. `ServerChunkCache.tickChunks` keeps every global decision on the server thread - the loaded chunk filter, `Util.shuffle`, the natural spawning gate, `incrementInhabitedTime`, `shouldTickBlocksAt`, the custom spawners and the per-chunk broadcast - and only hands the chunks it would tick to `RegionChunkTickPlan`. Natural spawning has its own slice below;
-- a chunk is handed over only when all eight neighboring chunks belong to the same region (so a random tick that writes into a neighbor writes into the lease the worker holds) and are loaded (so a random tick cannot force-load a chunk from a worker). Every other chunk keeps the server-thread body and is counted by reason: `boundaryChunkTicks`, `unloadedNeighborhoodChunkTicks`, `unleasedChunkTicks` and `lateChunkTicks`;
-- each chunk draws from its own random source, derived from the world seed, the game time, the dimension and the chunk position. Chunk selection, the thunder roll, the precipitation rolls and the position selection are therefore per-chunk deterministic: they do not depend on the other chunks of the tick, on the region layout, on the worker count or on the thread that ticks the chunk, which is why a chunk that falls back to the server thread produces the same selection as a chunk that is dispatched. This is not the vanilla sequence: vanilla selects positions from one level-wide `randValue` and draws the rolls from one level-wide random source;
-- cross-region effects are deferred to the barrier. A lightning strike is rolled on the worker and resolved on the server thread (`tickLightning`), because its target comes from the POI manager and from entity storage and can be in another region. A random tick that queries, spawns, moves or removes an entity reaches it through the same lease grants as an entity tick (region-scoped query, deferred admission, deferred section update, deferred removal), and a scheduled block or fluid tick it starts goes through the shared `LevelTicks` mutation queue;
-- the two level-wide structures a block write reaches are deferred as well. `LevelChunk.setBlockState` drives the light engine of the level (`LevelLightEngine`, one engine with one set of queues and one light thread for the whole level) and `ServerLevel.sendBlockUpdated` publishes a write into the level-wide path type cache and the navigating mobs of the whole level, which can live in any region. Every region batch - block entity, entity, chunk and scheduled tick - owns one `RegionDeferredBlockUpdates` queue, installed for the whole worker group by the shared batch base, so a worker of any slice records the light section status change, the light recheck and the block update publication of every write in the order its body produced them, and the server thread applies them at the barrier of the batch that recorded them. Heightmaps, the sky light sources, the per-chunk auxiliary light manager, the block-entity lists and the neighbour-update collection are per chunk or per region and stay on the worker; the POI manager is already deferred by the vanilla block-state hook. The deferred queue is bounded per batch: a unit is admitted only while the batch can still reserve its `RegionTickSlice` reservation (`RegionDeferredBlockUpdates.MAX_ENTRIES` in total, 32 entries per chunk, 8 per block-entity ticker, 8 per entity and 8 per scheduled tick), and a unit that does not fit is refused before its body and runs on the server thread instead, where its writes need no record. A refused chunk keeps the server-thread body and is counted in `deferredUpdateBudgetChunkTicks`; the other slices count their refusals per slice in `deferredBlockUpdates`;
-- a chunk tick that needs a chunk the worker may not load cannot be re-run, because the random ticks that already ran would run twice: the chunk's tick stops where the refusal happened and is counted in `truncatedChunkTicks`;
-- the configured request and the effective dispatch are separate. Both switches default to `false`. `beginScheduledTickDispatcher` still returns `null` in production because no scheduled callback class is admitted as entity-storage safe, so `LevelTicks` keeps the unchanged vanilla inline loop; the chunk tick slice is dispatched as soon as `enableRegionThreadingRandomTicks` is set, and `/neoforge regionthreading status` reports both halves;
-- an entity range query issued by a worker is **rejected** unless the worker holds a lease: a completed handoff still returns live entity references and runs caller predicates/consumers. `RegionAwareEntityGetter` and the `Level.getEntities` entry paths reject a native worker before the predicate, consumer or result escapes. Non-worker callers, including the whole server thread and installations without region threading, run inline and keep vanilla semantics. The `RegionTickBatch.runOnServerThread` transport and its exact-result/exception tests remain as transport machinery behind an internal mechanics-only seam; an arbitrary supplier or scalar handoff is not by itself a world-access contract, and production never enables the seam;
-- block-entity ticks run production work for the compatibility-declared furnace family away from a region boundary, and the chunk tick runs the chunks that pass the interior and loaded-neighborhood rules. Every other block entity type stays on the server thread; the policy is not expanded by this milestone.
-
-**Chunk mutation and foreign-read contract.** Region workers provide **no torn or foreign mutation through the supported entry points**: `Level`/`LevelChunk` block writes, block-entity membership mutation and promotion, `ChunkAccess` NBT and heightmap setters, and `Heightmap` writes. Interior-chunk admission is a pre-filter; the unconditional ownership guard refuses an out-of-lease mutation before it starts and counts it in `RegionWorkerChunkUnavailableException.foreignWriteRefusalCount()`. The refused effect is lost; the callback is not replayed. Deferred cross-region block writes need a separate design covering block entities, heightmaps and multi-position operations.
-
-Foreign block/fluid scalar reads and heightmap values validate an odd/even chunk seqlock. A stable read is a consistent scalar observation, not a transaction snapshot for the callback or the world. Propagation origins are retained independently of successful writes and reevaluated when foreign dependencies change. An unstable read that exhausts the bounded retry budget, or a versionless `ProtoChunk` read, abandons the current unit without replaying its earlier effects. Regular ticking units may run next tick; consumed scheduled callbacks are not rescheduled as a whole. Unowned `LevelChunk` instances still have a seqlock and remain readable. `unstableReadRefusalCount()`, `readOfVersionlessChunk` and `readOfUnownedChunk` distinguish these paths. Mutable block-entity internals are outside the seqlock; foreign object access requires a quiescent owner.
-
-Raw internal mutation is **not covered**: `LevelChunk.getBlockEntities()` exposes a map, `ChunkAccess.getSections()` exposes sections with direct `LevelChunkSection.setBlockState`, and `Heightmap.getRawData()` exposes an array. Closing those paths requires ownership-aware container wrappers, section backreferences and preventing escaped raw arrays, with raw access declared or rejected by the mod compatibility layer. Native-worker acquisition of the raw block-entity map or heightmap array is counted by `RegionThreadingHooks.rawChunkInternalsAccessCount()` and reported in the soak heartbeat; acquisition alone does not prove mutation. Section retrieval is also on vanilla's hot scalar-access path, so distinguishing third-party raw writes there requires the follow-up design rather than an atomic counter on every ordinary section read. See `.pi/tasks/modded-chunk-mutation-contract.md` for that follow-up. A per-chunk shared/exclusive lock remains a separate milestone if bounded seqlock refusals become measurable.
-
-On top of the chunk tick slice, `enableRegionThreadingSpawning` runs the **natural spawning** of a level on the worker of the region that owns the chunk:
-
-- `ServerChunkCache.tickChunks` keeps the per-chunk decisions on the server thread - the natural spawning gate (`isNaturalSpawningAllowed`, `anyPlayerCloseEnoughForSpawning`, `shouldForceTicks`), the `doMobSpawning` rule, the friends/enemies switches, the world border, `incrementInhabitedTime`, the custom spawners and the broadcast - and hands every chunk that may spawn to `RegionSpawnPlan`. The vanilla level-wide `SpawnState` is only built for the chunks that stay on the server thread, on demand, so a tick that hands every chunk over never builds it; the level-wide mob count of the same tick is still counted once, because the cap is the level's;
-- **the mob cap is the level-wide cap of vanilla.** The server thread counts the level's mobs per `MobCategory` once per tick, at the point where vanilla builds its `SpawnState`, with the predicates of `NaturalSpawner.createState` (a persistent mob is skipped, a `MISC` mob is skipped, a mob counts only if the full-chunk getter answers for its chunk), and publishes the result as `LevelSpawnCapCounter`. Every region's `NaturalSpawner.SpawnState` is still built from the entities the region owns - they are its spawn potential and its per-player cap - but `canSpawnForCategory` asks the shared counter and compares it with `maxInstancesPerChunk * levelSpawnableChunks / 289`, and `afterSpawn` counts the mob it spawned there. A mob that walks into the neighbouring region therefore keeps its slot instead of freeing capacity where it came from, and a region no longer truncates the cap to its own share. The check reserves the slot for the body it admits and the body releases it when it ends, so two regions cannot both take the last slot of the level; a body that spawns a cluster of `k` mobs can still take the level `k - 1` past the limit, exactly like the vanilla body, and the counter reconciles with the level at the next tick. The per-player cap is still scoped to the region: it counts the mobs of the region a player is close to;
-- **the spawn random of a chunk is derived, not drawn.** A chunk's spawn body draws from a source seeded with the world seed, the dimension, the game time, the region coordinate and the chunk position, so a region's spawn sequence does not depend on the other regions, the worker count, the dispatch order or the thread. This is not the vanilla sequence, which spawns the whole level from one source in one shuffled order; the distribution of every draw is the same;
-- **every spawn is admitted by the server thread.** A spawn body constructs and configures the mob on the worker and records the whole riding graph; the barrier runs the unmodified `ServerLevel.addEntity` for it. A spawn position may land in the region next to the one that decided it - vanilla picks it without regard to the region border - so a spawn admission is not required to lie inside the lease, unlike an entity tick's admission; the barrier commits the entity to whichever region stores its position;
-- a chunk is handed over when its eight neighboring chunks are loaded and the batch could reserve its block writes. Every other chunk spawns on the server thread from the vanilla level-wide state and is counted by reason: `gateRefusedSpawnChunks`, `unloadedNeighborhoodSpawnChunks`, `deferredUpdateBudgetSpawnChunks`, `lateSpawnChunks`, `unleasedSpawnChunks` and `skippedSpawnChunks`. A cap refusal is counted as `capRefusedSpawns`, a spawn body a chunk source refusal truncated as `truncatedSpawnChunks`, and an admission that could not be recorded as `refusedSpawnAdditions`. None of these is dropped: every chunk that keeps the server thread spawns there;
-- the slice is only used while the profiler is inactive, the level is open and the level's entity sections are partitioned per region (a fixed layout). Otherwise the vanilla path runs unchanged;
-- measured on a 289-chunk dark spawn platform, 200 warmup + 600 measured ticks, ZGC, two repeats: the spawning slice is 3.47-3.93 ms/tick on 2 workers and 2.79-2.93 ms/tick on 4 workers, against 4.13-4.62 ms/tick for the vanilla path on the server thread, and the spawned population is 73-81 monsters against 79-79 for vanilla, i.e. within -7.6%..+2.5% of the vanilla population. The slice is much closer to vanilla than it used to be because the level-wide cap makes the regions run the bodies vanilla runs: the former per-region cap refused about 5.9 of the 6 category bodies of every chunk, so it ran about 3% of the bodies the level-wide cap runs and still let the total population exceed the level cap. The counting itself costs almost nothing: the plan segment, which contains the level-wide count, moves from 0.12-0.15 to 0.14-0.18 ms/tick. The remaining excess over the cap is the cluster a body spawns after its check, exactly as in vanilla.
-
-**Physical entity section partitions.** A persistent server level constructed while the installed bridge selects `FIXED_3X3` stores sections in independent fixed-region buckets whose edge length is the one the installed engine ticks with (`RegionLayout.regionChunkSize()`), so a manager never partitions sections into different regions than the engine that ticks them. Each bucket owns its authoritative section map and sorted section-ID tree; the fixed backend has no global section map or tree. Vertical section coordinates remain intact, and an empty bucket retires immediately. Queries merge temporary section-ID candidates in vanilla signed packed-ID order, preserving bounds, visibility, typed filtering and abort order. Chunk streams materialize IDs when requested and resolve sections when consumed, so they do not retain retired buckets; structural mutation while a stream or query is being traversed is not a supported iteration contract. The generic constructors, transient/client storage, `DYNAMIC`, and levels constructed before bridge installation retain legacy storage for their lifetime. Installing or removing the bridge does not migrate existing storage. The normal server lifecycle installs the bridge before creating levels. This partitions only spatial storage: entity objects, lazy typed caches, ID/UUID lookup, tracking, load/save/unload and all mutations remain server-owned. No worker access or entity tick gate is enabled by the presence of partitions.
-
-**Entity storage boundary enforcement.** The server thread is the only permitted writer of the real entity storage:
-
-- the worker pool marks the native worker origin in a static thread local that is set around every pool task and cleared in `finally`. The marker is independent of the installed engine or `RegionThreadingManager`, so it still applies while a worker unwinds after the manager was removed;
-- `ServerLevel.addEntity`, `addPlayer` and `tryAddFreshEntityWithPassengers` reject a native worker before join events, duplicate-UUID prechecks or registration. The persistent `PersistentEntitySectionManager` receives an optional owner check that rejects worker add, status, load, unload, save, move and remove entry points before they mutate shared state, and rejects its public read surface as well: `isLoaded`, `areEntitiesLoaded`, `canPositionTick`, `gatherStats`, `count`, `dumpSections`, and `getEntityGetter()` both when the getter is obtained and on every operation of it, so a getter captured on the server thread before a native worker started still rejects the worker. That also covers the public level status and watchdog accessors (`areEntitiesLoaded`, `isPositionEntityTicking`, `isNaturalSpawningAllowed`, `getWatchdogStats`, `gatherChunkSourceStats`). The generic constructor keeps the no-op check for tests and other users, and the client transient manager is unchanged. A level constructed before the engine is installed is still guarded;
-- `Entity.setPosRaw`, `setPos` through `BlockAttachedEntity`, `setRemoved`, `discard`, `remove`, `move`, `absMoveTo`, `moveTo` and `teleportTo(ServerLevel, ...)` reject a native worker before changing server-level entity state. Removal is guarded on every vanilla override that runs work before `super.remove` (`LivingEntity`, `Slime`, `Boat`, `ChestBoat`, `AbstractMinecartContainer`, `FishingHook`), so removal effect callbacks, the active-effect clear, slime split preparation and container drops cannot run before the rejection. Player teleports are guarded on the `ServerPlayer` overloads (including `dismountTo` and `teleportRelative`) and on the common `ServerGamePacketListenerImpl.teleport`, before the destination ticket, the camera switch, the riding stop, the sleep wake and the awaiting-teleport bookkeeping. Hanging entities are guarded before the attachment anchor write, not only inside `setPosRaw`. This is a bounded, named seam: it does not claim that every mutable `Entity` field is guarded, and it deliberately does not use `isAddedToLevel()` as a membership test;
-- rejection is unconditional and independent of `regionThreadingOwnershipViolationMode`; `WARN` and `DISABLED` cannot permit a storage race. The rejection increments the ownership violation counter, names the operation, is logged once per operation, and throws. Work is never queued, invented, retried or replayed.
-
-This is **not** full regionized world ticking: random ticks of region-boundary chunks, chunk spawning, weather, raids, natural spawners, block events, entity tracking/registration, and cross-region lookups still run through the unmodified single-threaded structures. Entity ticks stay on the server thread because the vanilla section/index storage is not region-owned; block-entity ticks only run the compatibility-declared, storage-free subset on workers and keep every other type on the server thread. All slices are default-off and experimental.
-
-## Requirements
-
-- **Java 21**
-- **Minecraft 1.21.1**
-- **NeoForm** 20240808.144430
+The full remaining plan is in [region-threading/STATUS.md](region-threading/STATUS.md#roadmap).
 
 ## Configuration
 
-Region threading is gated behind experimental server config switches, **all defaulting to off**. The region policy defaults to `FIXED_3X3`, but it has no effect until the bridge is enabled:
+All switches live in `config/neoforge-server.toml` and are **`false` by default**. A server that wants the
+full stack sets:
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enableRegionThreadingBridge` | boolean | `false` | Enables the bridge that exposes the scheduling API and drains global/region queues from the existing server tick loop |
-| `enableRegionThreadingWorkers` | boolean | `false` | Drains due region queues on native worker threads instead of the level tick bridge; requires the bridge |
-| `enableGlobalRegionThreadingWorker` | boolean | `false` | Drains the global-region queue on the native worker pool; requires the bridge |
-| `enableRegionThreadingEntityTicks` | boolean | `false` | Enables the bounded entity tick slice. The section/index storage is owned by the server thread, so entity ticks currently stay on the server thread. Every legacy entity query issued by a native region worker is rejected before its predicate, consumer or result escapes; non-worker callers run inline. Requires the bridge |
-| `enableRegionThreadingBlockEntityTicks` | boolean | `false` | Enables the bounded block-entity tick slice. Only block entity types declared region-safe by `RegionTickCompatibility` run on workers; every other type stays on the server thread. Requires the bridge |
-| `enableRegionThreadingScheduledTicks` | boolean | `false` | Requests the bounded scheduled block/fluid tick slice; requires the bridge. In production the effective dispatch stays gated and the vanilla inline loop runs, because no scheduled callback class is admitted as entity-storage safe. Diagnostics report the request separately from the effective dispatch |
-| `enableRegionThreadingRandomTicks` | boolean | `false` | Ticks the chunks of a level on their owning region worker (random block and fluid ticks, ice and snow, thunder); requires the bridge. Only chunks whose eight neighbors belong to the same region and are loaded run on a worker; natural spawning and every other global decision stay on the server thread, and every refusal is counted |
-| `enableRegionThreadingSpawning` | boolean | `false` | Runs the natural spawning of a level on the worker of the region that owns the chunk; requires the bridge and a fixed region policy. The mob cap is the level-wide cap: the server thread counts the level's mobs per category once per tick and every region reserves its slot there, so a mob that walks into the neighbouring region still holds its slot. Each region spawns from a per-chunk random source, and every mob it spawns is admitted by the server thread at the barrier. The spawn gate, the custom spawners and the broadcast stay on the server thread, and every refusal is counted by reason |
-| `regionThreadingWorkerThreads` | int (0–512) | `0` | Number of native region worker threads; `0` means `max(1, availableProcessors - 1)` |
-| `regionThreadingMode` | enum | `FIXED_3X3` | Region coordinate policy. `FIXED_3X3` uses the non-overlapping global fixed-chunk grid whose edge length is `regionThreadingFixedRegionChunks`; `DYNAMIC` keeps the legacy 16x16-chunk grid with merge/split recalculation |
-| `regionThreadingFixedRegionChunks` | int (3–32) | `3` | Edge length in chunks of one fixed region. `3` reproduces the original 3x3-chunk grid. Larger regions keep more neighboring chunks in the same region, at the cost of coarser parallelism and longer region leases. Ignored by `DYNAMIC`; a value outside 3–32 is clamped into that range when the config loads, and `RegionLayout.fixed(int)` rejects it with an `IllegalArgumentException` |
-
-## API Surface
-
-The public API lives in `net.neoforged.neoforge.server.threading`:
-
-| Interface | Purpose |
-|-----------|---------|
-| `RegionThreading` | Entry point: global/region/entity schedulers, ownership assertions, `executeOrSchedule` helpers |
-| `GlobalRegionScheduler` | Schedule work on the global region |
-| `RegionScheduler` | Schedule work on the region owning a block position |
-| `EntityRegionScheduler` | Schedule work on the region owning an entity |
-| `RegionThreadingContext` | Describes current execution context (`NONE`, `GLOBAL_REGION`, `REGION`, `ASYNC`) |
-| `ScheduledRegionTask` | Cancellable/completable handle for scheduled work |
-
-Internal implementation is in `net.neoforged.neoforge.server.threading.region`.
-
-## Diagnostics
-
-```
-/neoforge regionthreading status
-/neoforge regionthreading regions [count]
+```toml
+enableRegionThreadingBridge = true
+enableRegionThreadingWorkers = true
+enableRegionThreadingEntityTicks = true            # selects region-owned entity storage
+enableRegionThreadingBlockEntityTicks = true
+enableRegionThreadingRandomTicks = true
+enableRegionThreadingSpawning = true
+enableRegionThreadingPoi = true                    # implied by entity ticks
+enableRegionThreadingBorderUpdates = true
+regionThreadingMode = "FIXED_3X3"
+regionThreadingFixedRegionChunks = 3
+regionThreadingWorkerThreads = 4
 ```
 
-`status` prints region count, region policy, running regions, sections, tracked entities, entity tasks, worker threads, entity ticks executed on workers, skipped entity ticks, block-entity ticks executed on workers, skipped block-entity ticks, scheduled tick worker execution requested vs effective dispatch, random tick worker execution requested vs effective dispatch, scheduled ticks executed on workers, skipped scheduled ticks, fallback scheduled ticks, random ticks executed on workers, skipped random ticks, fallback random ticks, the ownership violation count, global tick count, and last tick duration. Requires permission level 2.
+`regionThreadingWorkerThreads = 0` means "one less than the CPU count". Entity ticks, spawning and POI
+require the fixed layout; everything else degrades to the vanilla path when its requirement is missing.
 
-`status` adds one `Region metrics:` line with the region count, the number of regions behind, the mean region MSPT, the total region work of one server tick and the worst region. `regions [count]` lists the `count` slowest live regions (default 10) by their p99 region MSPT with their coordinate, dimension, sample count, observed TPS and classification. Both lines are added next to the existing diagnostics line, which stays unchanged.
-
-**Per-region MSPT and TPS.** Each region keeps a rolling window of the last 100 server ticks (five seconds at the 20 ticks per second target), one slot per server tick holding the sum of the group durations the region recorded in that tick - the entity, block-entity, scheduled, random and region drain groups. Region MSPT is that per-tick wall time, reported as mean, p95, p99, maximum and last tick; the percentiles are nearest-rank percentiles of the window. A server tick in which the region was not leased closes a slot of `0`: it contributes nothing to MSPT and it is not a missed tick, because the region owed no work in it. Region TPS is the wall clock rate the window shows, so a region ticking once per 50 ms server tick reports `20` and one delivering every other tick reports `10`; it is classified `ok` at 95% of the target and `behind` below it, and a window with fewer than two closed ticks has no observable rate yet and stays `ok`. A tick the region was live for without being offered at all is reported as a missed tick. Recording is O(1) and allocation-free per region tick; the percentiles are computed only when a snapshot is requested. A retired or merged region releases its window, and a server without region threading collects no region metrics at all.
-
-## Port Roadmap
-
-1. ~~Port Folia's region data primitives and tick scheduler internals without Bukkit/Paper API exposure~~ *(in progress)*
-2. Wire regionized server/global tick loops into `MinecraftServer` and `ServerLevel`
-3. ~~Move entity and position scheduling behind the native NeoForge API skeleton~~ *(entity tick slice in progress)*
-4. Convert NeoForge tick and gameplay event dispatch to run on the owning context
-5. Add hard ownership checks for unsafe off-region access
-6. Add optional mod metadata declaring support for regionized execution
+Diagnostics: `/neoforge regionthreading status` prints the per-region MSPT/TPS, every slice's worker and
+fallback counters, the border-update and foreign-read counters, and the reason each refusal happened. Nothing
+is silently dropped.
 
 ## Building
 
-```bash
-./gradlew setup
-./gradlew build
+```
+./gradlew --offline :neoforge:setup          # apply patches into projects/
+./gradlew --offline build                    # build the loader
+./gradlew --offline :tests:junitTest         # 676 unit tests
+./gradlew --offline :tests:runGameTestServer # 166 in-game tests
 ```
 
-## License
+JDK 21 is required. The repository is a patched-source NeoForge tree: vanilla sources live in
+`projects/neoforge/src/main/java` (generated), the patch set in `patches/`, and the Forgia runtime in
+`src/main/java/net/neoforged/neoforge/server/threading`.
 
-LGPL v2.1 — see [LICENSE.txt](LICENSE.txt).
+Benchmarks and soaks:
+
+```
+./gradlew --offline :tests:runGameTestServer -PserverBenchmark=true \
+    -PgameTestFilter=benchmarkEntity -PserverBenchmarkZombies=1024
+./gradlew --offline :tests:runSoakGameTestServer        # 6000-tick production soak
+./gradlew --offline :tests:runSoakGameTestServerReference
+```
+
+Measure with a low-pause collector (`-XX:+UseZGC -XX:+ZGenerational`): the default G1 on a 2 GiB heap spends
+seconds in pauses on this workload and hides every effect.
+
+## Architecture in one page
+
+- **Regions** are a fixed, non-overlapping grid of N×N chunks (`regionThreadingFixedRegionChunks`). Each
+  region has a lease; only the lease holder may tick its chunks, entities, block entities, spawns and POIs.
+- **The server thread** builds the plan, leases every region, submits one task per region, waits at a barrier
+  and runs the handoff: deferred section updates, removals, admissions, block updates, portal transitions,
+  border updates and the propagation fixpoint.
+- **Workers** own their region for the duration of a task and enumerate their own entities, tickers, chunks
+  and POIs instead of receiving a per-unit list.
+- **Everything cross-region is deferred**, never raced: neighbour updates, block writes, reads, POI queries,
+  game events. Each has a bounded queue, a counter and a fallback.
+- **Fail closed**: any work that cannot be proven safe — an unknown modded callback, a level without
+  region-owned storage, a region that cannot be leased — runs on the server thread.
+
+Deeper notes live next to the code (`src/main/java/net/neoforged/neoforge/server/threading/region/*.java`)
+and in the task records under `.pi/tasks/`, which document the design and the evidence for each milestone.
+
+## Licence and lineage
+
+Forgia is a fork of NeoForge (LGPL-2.1) and of the earlier Forgia port; the regionized runtime added here is
+under the same licence. Upstream NeoForge attribution is kept in the source headers and in
+[NOTICE](NOTICE) where present. This repository no longer tracks the upstream Forgia project, which stopped
+updating.
