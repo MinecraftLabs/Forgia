@@ -80,7 +80,11 @@ class RegionThreadingConflictsTest {
 
     @Test
     void anEntityStorageConflictLeavesOnlyTheEntitySliceOff() {
-        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("create"));
+        // The shipped table marks create as measured compatible, so the fail-closed entity action is exercised
+        // with a table of its own.
+        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("create"),
+                false, List.of(new RegionThreadingConflicts.Conflict("create",
+                        RegionThreadingConflicts.Kind.ENTITY_STORAGE, "test row")));
 
         assertTrue(plan.installEngine(), "the rest of the engine does not reach the entity tick list");
         assertFalse(plan.entityTickWorkers(), "the entity slice changes the semantics the mod patches");
@@ -95,7 +99,9 @@ class RegionThreadingConflictsTest {
 
     @Test
     void aLevelWideStateConflictLeavesOnlyTheSpawningSliceOff() {
-        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("mobspawncontroller"));
+        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("mobspawncontroller"),
+                false, List.of(new RegionThreadingConflicts.Conflict("mobspawncontroller",
+                        RegionThreadingConflicts.Kind.LEVEL_WIDE_STATE, "test row")));
 
         assertTrue(plan.installEngine());
         assertTrue(plan.entityTickWorkers());
@@ -106,7 +112,9 @@ class RegionThreadingConflictsTest {
 
     @Test
     void aSliceTheConfigurationDidNotAskForIsNotReportedAsLeftOff() {
-        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, false, false, loaded("create"));
+        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, false, false, loaded("create"),
+                false, List.of(new RegionThreadingConflicts.Conflict("create",
+                        RegionThreadingConflicts.Kind.ENTITY_STORAGE, "test row")));
 
         assertTrue(plan.installEngine());
         assertFalse(plan.entityTickWorkers());
@@ -129,30 +137,45 @@ class RegionThreadingConflictsTest {
     void everyTableRowIsWellFormedAndNamesAKnownHazard() {
         final Set<String> modIds = new HashSet<>();
         final Set<RegionThreadingConflicts.Action> coveredActions = new HashSet<>();
+        final Set<RegionThreadingConflicts.Kind> coveredKinds = new HashSet<>();
         for (final RegionThreadingConflicts.Conflict conflict : RegionThreadingConflicts.table()) {
             assertNotNull(conflict.kind(), conflict.modId());
             assertNotNull(conflict.action(), conflict.modId());
             assertFalse(conflict.reason().isBlank(), conflict.modId());
             assertTrue(modIds.add(conflict.modId()), "duplicate table row for " + conflict.modId());
             coveredActions.add(conflict.action());
-            assertEquals(conflict.kind().action(), conflict.action(),
-                    "the action of a row is the fail-closed action of its kind, not a per row choice");
+            coveredKinds.add(conflict.kind());
+            // A row either carries the fail-closed action of its kind, or it is REPORT_ONLY because the
+            // compatibility harness ran that mod with the engine and saw no violation - in which case the reason
+            // has to say so, so a downgraded row can never be mistaken for an unanalysed one.
+            if (conflict.action() == RegionThreadingConflicts.Action.REPORT_ONLY) {
+                assertTrue(conflict.reason().contains("measured compatible"),
+                        "a report-only row has to say it was measured: " + conflict.modId());
+            } else {
+                assertEquals(conflict.kind().action(), conflict.action(),
+                        "the action of a row is the fail-closed action of its kind unless it was measured");
+            }
         }
-        assertEquals(Set.of(RegionThreadingConflicts.Action.values()), coveredActions,
-                "every action is reachable from a row of the table");
+        // The rows the harness verified carry REPORT_ONLY, so the per-kind fail-closed actions are covered by the
+        // kind tests instead; what the table itself has to cover is every kind of hazard.
+        assertEquals(Set.of(RegionThreadingConflicts.Kind.values()), coveredKinds,
+                "every kind of hazard is reachable from a row of the table");
+        assertTrue(coveredActions.contains(RegionThreadingConflicts.Action.DISABLE_ENGINE),
+                "the table still blocks the mods the evidence did not clear");
     }
 
     @Test
     void theCommandReportsTheConflictsTheActionAndTheSlicesLeftOff() {
-        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("create"));
-        RegionThreadingCompatReport.record(true, true, null, plan, RegionThreadingDeclarations.Report.empty());
+        // c2me is the one row the evidence still blocks, so it is what the command report is checked against.
+        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("c2me"));
+        RegionThreadingCompatReport.record(true, plan.installEngine(), null, plan, RegionThreadingDeclarations.Report.empty());
 
         final List<String> lines = RegionThreadingCompatReport.lines();
-        assertTrue(lines.get(0).contains("engineInstalled=true"), lines.get(0));
+        assertTrue(lines.get(0).contains("engineInstalled=false"), lines.get(0));
         assertTrue(lines.get(0).contains("conflicts=1"), lines.get(0));
-        assertTrue(lines.get(0).contains("leftOffSlices=[entityTicks]"), lines.get(0));
-        assertTrue(lines.stream().anyMatch(line -> line.contains("create (ENTITY_STORAGE")
-                && line.contains("the entity tick worker slice stays on the server thread")),
+        assertTrue(lines.get(0).contains("leftOffSlices=[engine]"), lines.get(0));
+        assertTrue(lines.stream().anyMatch(line -> line.contains("c2me (CHUNK_SOURCE")
+                && line.contains("the region threading engine is not installed")),
                 lines.toString());
         assertEquals(RegionThreadingConflicts.DETECTION_LIMITS, lines.get(lines.size() - 1),
                 "the report ends with what it cannot detect");
@@ -161,7 +184,7 @@ class RegionThreadingConflictsTest {
     @Test
     void theCommandOfAServerWithoutConflictsStillStatesTheDetectionLimits() {
         final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, NO_MODS);
-        RegionThreadingCompatReport.record(true, true, null, plan, RegionThreadingDeclarations.Report.empty());
+        RegionThreadingCompatReport.record(true, plan.installEngine(), null, plan, RegionThreadingDeclarations.Report.empty());
 
         final List<String> lines = RegionThreadingCompatReport.lines();
         assertEquals(2, lines.size(), lines.toString());

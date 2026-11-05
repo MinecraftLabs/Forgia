@@ -108,6 +108,18 @@ Same harness, all 169 jars (everything but c2me), engine forced on, a flat world
 So modernfix, moonlight, sable, byepregen, ftbchunks, alltheleaks, create, spawn and mobspawncontroller all
 coexist with the engine in this run - the static table is far more conservative than the evidence.
 
+Those nine rows now carry a `REPORT_ONLY` action: they are still detected and reported by
+`/neoforge regionthreading compat`, but they no longer remove a slice, because a run with the engine and all of
+them produced no violation. **c2me keeps `DISABLE_ENGINE`**, which makes the pack usable with the engine on:
+
+```
+enableRegionThreadingBridge = true
+enableRegionThreadingEntityTicks = true
+...                            # every slice
+# and c2me removed from mods/
+```
+
+
 Two things this run does **not** prove, and the harness cannot prove yet: chunk ticks on workers stayed at zero
 in the flat world with only force-loaded chunks, so the chunk slice is still unverified there; and an idle world
 with 32 mobs is not a loaded server.

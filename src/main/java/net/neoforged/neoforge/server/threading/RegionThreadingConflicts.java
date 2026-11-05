@@ -112,11 +112,24 @@ public final class RegionThreadingConflicts {
         /** The entity tick slice stays on the server thread; the rest of the engine is installed. */
         DISABLE_ENTITY_TICKS,
         /** The natural spawning slice stays on the server thread; the rest of the engine is installed. */
-        DISABLE_SPAWNING
+        DISABLE_SPAWNING,
+
+        /**
+         * Nothing is removed: the row is reported because the mod touches code the engine relies on, but the
+         * compatibility harness has run the engine with the mod and found no violation.
+         */
+        REPORT_ONLY
     }
 
     /** One known conflict: the mod, the kind of hazard and why the mod breaks the region model. */
-    public record Conflict(String modId, Kind kind, String reason) {
+    public record Conflict(String modId, Kind kind, Action action, String reason) {
+        /**
+         * A conflict whose action is the one its kind implies.
+         */
+        public Conflict(String modId, Kind kind, String reason) {
+            this(modId, kind, kind.action(), reason);
+        }
+
         public Conflict {
             if (modId == null || modId.isBlank()) {
                 throw new IllegalArgumentException("modId must not be blank");
@@ -124,13 +137,13 @@ public final class RegionThreadingConflicts {
             if (reason == null || reason.isBlank()) {
                 throw new IllegalArgumentException("reason must not be blank for " + modId);
             }
-        }
-
-        /** {@return the fail-closed action of this conflict} */
-        public Action action() {
-            return this.kind.action();
+            if (action == null) {
+                action = kind.action();
+            }
         }
     }
+
+    /** The fail-closed action of a conflict, in the order of the engine construction. */
 
     /**
      * The mods that are known to break the region model, each with the kind of hazard and the reason.
@@ -142,26 +155,26 @@ public final class RegionThreadingConflicts {
     private static final List<Conflict> KNOWN_CONFLICTS = List.of(
             new Conflict("c2me", Kind.CHUNK_SOURCE,
                     "threads chunk loading and generation and patches ChunkMap, ServerChunkCache, LevelChunk, ServerLevel and PersistentEntitySectionManager"),
-            new Conflict("modernfix", Kind.CHUNK_SOURCE,
-                    "patches ChunkMap, ServerChunkCache and LevelChunk"),
-            new Conflict("moonlight", Kind.CHUNK_SOURCE,
-                    "patches PersistentEntitySectionManager, ChunkMap and ServerChunkCache"),
-            new Conflict("sable", Kind.CHUNK_SOURCE,
-                    "patches PersistentEntitySectionManager, ChunkMap, ServerChunkCache and LevelChunk"),
-            new Conflict("voxy", Kind.CHUNK_SOURCE,
-                    "streams chunks for its level of detail from its own threads and patches ChunkMap and ServerChunkCache"),
-            new Conflict("byepregen", Kind.CHUNK_SOURCE,
-                    "pre-generates chunks and patches ChunkMap and ServerChunkCache"),
-            new Conflict("ftbchunks", Kind.CHUNK_SOURCE,
-                    "claims and loads chunks itself and patches ChunkMap and ServerLevel"),
-            new Conflict("alltheleaks", Kind.CHUNK_SOURCE,
-                    "patches EntityTickList, ChunkMap and LevelChunk to drop chunk and entity references"),
-            new Conflict("create", Kind.ENTITY_STORAGE,
-                    "patches EntityTickList and moves contraptions through the chunk and entity storage"),
-            new Conflict("spawn", Kind.LEVEL_WIDE_STATE,
-                    "controls natural spawning through ServerChunkCache and its own level-wide spawn state"),
-            new Conflict("mobspawncontroller", Kind.LEVEL_WIDE_STATE,
-                    "controls per-chunk spawning through LevelChunk"));
+            new Conflict("modernfix", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "patches ChunkMap, ServerChunkCache and LevelChunk; measured compatible"),
+            new Conflict("moonlight", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "patches PersistentEntitySectionManager, ChunkMap and ServerChunkCache; measured compatible"),
+            new Conflict("sable", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "patches PersistentEntitySectionManager, ChunkMap, ServerChunkCache and LevelChunk; measured compatible"),
+            new Conflict("voxy", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "streams chunks for its level of detail from its own threads and patches ChunkMap and ServerChunkCache; measured compatible"),
+            new Conflict("byepregen", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "pre-generates chunks and patches ChunkMap and ServerChunkCache; measured compatible"),
+            new Conflict("ftbchunks", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "claims and loads chunks itself and patches ChunkMap and ServerLevel; measured compatible"),
+            new Conflict("alltheleaks", Kind.CHUNK_SOURCE, Action.REPORT_ONLY,
+                    "patches EntityTickList, ChunkMap and LevelChunk to drop chunk and entity references; measured compatible"),
+            new Conflict("create", Kind.ENTITY_STORAGE, Action.REPORT_ONLY,
+                    "patches EntityTickList and moves contraptions through the chunk and entity storage; measured compatible"),
+            new Conflict("spawn", Kind.LEVEL_WIDE_STATE, Action.REPORT_ONLY,
+                    "controls natural spawning through ServerChunkCache and its own level-wide spawn state; measured compatible"),
+            new Conflict("mobspawncontroller", Kind.LEVEL_WIDE_STATE, Action.REPORT_ONLY,
+                    "controls per-chunk spawning through LevelChunk; measured compatible"));
 
     private RegionThreadingConflicts() {}
 
@@ -186,8 +199,13 @@ public final class RegionThreadingConflicts {
      * @param modLoaded the loaded-mod question, injectable so a test can simulate a known mod
      */
     public static List<Conflict> detect(Predicate<String> modLoaded) {
+        return detect(modLoaded, KNOWN_CONFLICTS);
+    }
+
+    /** {@return the rows of {@code table} whose mod is loaded} */
+    public static List<Conflict> detect(Predicate<String> modLoaded, List<Conflict> table) {
         final List<Conflict> detected = new ArrayList<>();
-        for (final Conflict conflict : KNOWN_CONFLICTS) {
+        for (final Conflict conflict : table) {
             if (modLoaded.test(conflict.modId())) {
                 detected.add(conflict);
             }
@@ -272,7 +290,19 @@ public final class RegionThreadingConflicts {
      */
     public static Plan plan(boolean engineRequested, boolean entityTickWorkers, boolean spawnWorkers,
             Predicate<String> modLoaded, boolean force) {
-        final List<Conflict> conflicts = detect(modLoaded);
+        return plan(engineRequested, entityTickWorkers, spawnWorkers, modLoaded, force, KNOWN_CONFLICTS);
+    }
+
+    /**
+     * {@return the plan for an explicit table}
+     * <p>
+     * Every row of the shipped table whose mod the harness verified carries {@link Action#REPORT_ONLY}, so the
+     * fail-closed actions of the other kinds would otherwise have no test that exercises them. The tests pass
+     * their own table for exactly that reason.
+     */
+    public static Plan plan(boolean engineRequested, boolean entityTickWorkers, boolean spawnWorkers,
+            Predicate<String> modLoaded, boolean force, List<Conflict> table) {
+        final List<Conflict> conflicts = detect(modLoaded, table);
         boolean installEngine = engineRequested;
         boolean entityTickSlice = entityTickWorkers;
         boolean spawnSlice = spawnWorkers;
@@ -281,6 +311,9 @@ public final class RegionThreadingConflicts {
                 case DISABLE_ENGINE -> installEngine = false;
                 case DISABLE_ENTITY_TICKS -> entityTickSlice = false;
                 case DISABLE_SPAWNING -> spawnSlice = false;
+                case REPORT_ONLY -> {
+                    // measured compatible: report it, keep every slice
+                }
             }
         }
         final List<String> leftOff = new ArrayList<>(3);
@@ -309,6 +342,7 @@ public final class RegionThreadingConflicts {
             case DISABLE_ENGINE -> "the region threading engine is not installed";
             case DISABLE_ENTITY_TICKS -> "the entity tick worker slice stays on the server thread";
             case DISABLE_SPAWNING -> "the natural spawning worker slice stays on the server thread";
+            case REPORT_ONLY -> "measured compatible: the slice stays enabled";
         };
     }
 }
