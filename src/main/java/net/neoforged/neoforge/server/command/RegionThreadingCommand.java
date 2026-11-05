@@ -14,6 +14,7 @@ import net.minecraft.network.chat.Component;
 import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -192,13 +193,73 @@ final class RegionThreadingCommand {
                 + ", wakeUpNanos=" + dispatch.wakeNanos()
                 + ", spinWakeUps=" + dispatch.spinWakeUps()
                 + ", parkWakeUps=" + dispatch.parkWakeUps()
+                + ", steals=" + dispatch.steals()
                 + ", packedTasks=" + dispatch.packedTasks()
                 + ", packedRegions=" + dispatch.packedRegions()
                 + ", regionsPerPackedTask=" + regionsPerPackedTask(dispatch)
                 + ", partialPackFallbacks=" + dispatch.partialPackFallbacks()), false);
-        // A fifth independent line for the player region transitions, so the four lines above keep their shape
+        // A fifth independent line for the per-ticker attribution of the block-entity worker slice. The
+        // accumulators are only filled while the attribution is enabled, which is off by default; the line keeps
+        // its shape either way and reports zeros when nothing was measured.
+        source.sendSuccess(() -> Component.literal(blockEntityAttributionLine()), false);
+        // A sixth independent line for the player region transitions, so the five lines above keep their shape
         // for scripts that match them.
         source.sendSuccess(() -> Component.literal("Region players: " + diagnostics.playerRegions()), false);
+    }
+
+    /**
+     * {@return the status line of the per-ticker attribution of the block-entity worker slice}
+     * <p>
+     * The ticker columns are microseconds per ticker of the measured window: the admission checks, the
+     * reservation of the block-write effects, the entry and exit of the admission scope, the deferred-mutation
+     * registration inside the body and the body itself. The group columns are microseconds per group for the
+     * work the slice adds around the ticker loop, and {@code wrapperMsPerTick} is what is left of the group wall
+     * time after the tickers and those group parts - the dispatch and batch bookkeeping the slice adds to the
+     * tick. {@code tickerRegistrations} is the number of block writes a ticker deferred, so a body whose cost is
+     * registration rather than vanilla work is visible in the numbers.
+     */
+    private static String blockEntityAttributionLine() {
+        final RegionBlockEntityTickAttribution.Snapshot attribution = RegionBlockEntityTickAttribution.snapshot();
+        final RegionBlockEntityTickAttribution.TickerAttribution tickers = attribution.tickers();
+        final RegionBlockEntityTickAttribution.GroupDistribution groups = attribution.groups();
+        final long slices = attribution.sliceCount();
+        // The ticker cost is the whole ticker loop of a group: the admission checks and the reservation run before
+        // the ticker's own scope, so they are part of it and not part of the wrapper.
+        final long wrapperNanos = groups.nanos() - groups.tickerNanos() - tickers.admissionNanos()
+                - tickers.reservationNanos() - tickers.ownershipScopeNanos() - tickers.groupPrepareNanos()
+                - tickers.groupEndNanos() - groups.retireNanos();
+        return "Region block entity attribution: enabled=" + RegionBlockEntityTickAttribution.isEnabled()
+                + ", slices=" + slices
+                + ", groups=" + groups.groups()
+                + ", tickers=" + tickers.tickers()
+                + ", tickerAdmissionUs=" + microsPerUnit(tickers.admissionNanos(), tickers.tickers())
+                + ", tickerReserveUs=" + microsPerUnit(tickers.reservationNanos(), tickers.tickers())
+                + ", tickerScopeUs=" + microsPerUnit(tickers.scopeNanos(), tickers.tickers())
+                + ", tickerQueryUs=" + microsPerUnit(tickers.queryNanos(), tickers.tickers())
+                + ", tickerQueries=" + perUnit(tickers.queries(), tickers.tickers())
+                + ", tickerDeferredRegistrationUs=" + microsPerUnit(tickers.deferredRegistrationNanos(), tickers.tickers())
+                + ", tickerRegistrations=" + perUnit(tickers.deferredRegistrations(), tickers.tickers())
+                + ", tickerBodyUs=" + microsPerUnit(tickers.bodyNanos(), tickers.tickers())
+                + ", tickerTotalUs=" + microsPerUnit(groups.tickerNanos(), tickers.tickers())
+                + ", ownershipScopeUsPerGroup=" + microsPerUnit(tickers.ownershipScopeNanos(), groups.groups())
+                + ", groupPrepareUsPerGroup=" + microsPerUnit(tickers.groupPrepareNanos(), groups.groups())
+                + ", groupEndUsPerGroup=" + microsPerUnit(tickers.groupEndNanos(), groups.groups())
+                + ", wrapperMsPerTick=" + millisPerTick(wrapperNanos, slices);
+    }
+
+    /** {@return {@code nanos} per {@code units} in microseconds, or {@code 0.000} when nothing was measured} */
+    private static String microsPerUnit(long nanos, long units) {
+        return units <= 0L ? "0.000" : String.format(Locale.ROOT, "%.3f", nanos / (double) units / 1_000.0);
+    }
+
+    /** {@return {@code count} per {@code units}, or {@code 0.00} when nothing was measured} */
+    private static String perUnit(long count, long units) {
+        return units <= 0L ? "0.00" : String.format(Locale.ROOT, "%.2f", count / (double) units);
+    }
+
+    /** {@return {@code nanos} per tick of the measured window in milliseconds} */
+    private static String millisPerTick(long nanos, long ticks) {
+        return ticks <= 0L ? "0.0000" : String.format(Locale.ROOT, "%.4f", nanos / (double) ticks / 1_000_000.0);
     }
 
     /** {@return the average number of regions a packed task held, formatted for the diagnostics line} */

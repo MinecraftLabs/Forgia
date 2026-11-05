@@ -106,6 +106,17 @@ public final class RegionBlockEntityTickAttribution {
     private static final LongAdder groupTicked = new LongAdder();
     private static final LongAdder tickerNanos = new LongAdder();
     private static final LongAdder tickerCount = new LongAdder();
+    private static final LongAdder tickerAdmissionNanos = new LongAdder();
+    private static final LongAdder tickerReservationNanos = new LongAdder();
+    private static final LongAdder tickerScopeNanos = new LongAdder();
+    private static final LongAdder tickerBodyNanos = new LongAdder();
+    private static final LongAdder tickerQueryNanos = new LongAdder();
+    private static final LongAdder tickerQueries = new LongAdder();
+    private static final LongAdder deferredRegistrationNanos = new LongAdder();
+    private static final LongAdder deferredRegistrations = new LongAdder();
+    private static final LongAdder ownershipScopeNanos = new LongAdder();
+    private static final LongAdder groupPrepareNanos = new LongAdder();
+    private static final LongAdder groupEndNanos = new LongAdder();
     private static final LongAdder emptyGroups = new LongAdder();
     private static final LongAdder idleGroups = new LongAdder();
     private static final LongAdder stalledGroups = new LongAdder();
@@ -222,6 +233,17 @@ public final class RegionBlockEntityTickAttribution {
         groupTicked.reset();
         tickerNanos.reset();
         tickerCount.reset();
+        tickerAdmissionNanos.reset();
+        tickerReservationNanos.reset();
+        tickerScopeNanos.reset();
+        tickerBodyNanos.reset();
+        tickerQueryNanos.reset();
+        tickerQueries.reset();
+        deferredRegistrationNanos.reset();
+        deferredRegistrations.reset();
+        ownershipScopeNanos.reset();
+        groupPrepareNanos.reset();
+        groupEndNanos.reset();
         emptyGroups.reset();
         idleGroups.reset();
         stalledGroups.reset();
@@ -477,6 +499,96 @@ public final class RegionBlockEntityTickAttribution {
     }
 
     /**
+     * Adds the time one ticker spent in the checks that admit it to the worker: the removed check, the level and
+     * position revalidation of its admission and the ownership check of its region.
+     */
+    public static void recordTickerAdmission(long durationNanos) {
+        if (enabled) {
+            tickerAdmissionNanos.add(durationNanos);
+        }
+    }
+
+    /**
+     * Adds the time one ticker spent reserving the block-write effects of its body against the bound of its
+     * batch, which is the per-ticker half of the deferred-mutation admission.
+     */
+    public static void recordTickerReservation(long durationNanos) {
+        if (enabled) {
+            tickerReservationNanos.add(durationNanos);
+        }
+    }
+
+    /**
+     * Adds the time one ticker spent entering and leaving its admission scope, which is what lets the body replace
+     * the server-owned entity-load read of its own block entity.
+     */
+    public static void recordTickerScope(long durationNanos) {
+        if (enabled) {
+            tickerScopeNanos.add(durationNanos);
+        }
+    }
+
+    /**
+     * Adds the time one ticker spent inside {@code tick()} itself. The deferred-mutation registration of the
+     * blocks it wrote is part of this time and is reported separately by
+     * {@link #recordDeferredRegistration(long)}.
+     */
+    public static void recordTickerBody(long durationNanos) {
+        if (enabled) {
+            tickerBodyNanos.add(durationNanos);
+        }
+    }
+
+    /**
+     * Adds the time one region-scoped entity query spent inside a ticker body. That query is the worker's
+     * replacement for the level-wide entity section storage the server thread reads, so its cost is the part of
+     * the ticker body the region model adds rather than the vanilla tick.
+     */
+    public static void recordTickerQuery(long durationNanos) {
+        if (enabled) {
+            tickerQueryNanos.add(durationNanos);
+            tickerQueries.increment();
+        }
+    }
+
+    /**
+     * Adds the time one block write of a block-entity worker group spent recording its light recheck and its block
+     * update publication for the barrier, including the re-run seed of the written position.
+     */
+    public static void recordDeferredRegistration(long durationNanos) {
+        if (enabled) {
+            deferredRegistrationNanos.add(durationNanos);
+            deferredRegistrations.increment();
+        }
+    }
+
+    /**
+     * Adds the time one group spent opening and closing the entity ownership lease of its region.
+     */
+    public static void recordOwnershipScope(long durationNanos) {
+        if (enabled) {
+            ownershipScopeNanos.add(durationNanos);
+        }
+    }
+
+    /**
+     * Adds the time one group spent ordering its tickers, claiming its region and installing the per-group state
+     * (the group random, the deferred mutation queue and the batch markers) before its ticker loop.
+     */
+    public static void recordGroupPrepare(long durationNanos) {
+        if (enabled) {
+            groupPrepareNanos.add(durationNanos);
+        }
+    }
+
+    /** Adds the time one group spent releasing its region (the end of its ownership and the clear of its run). */
+    public static void recordGroupEnd(long durationNanos) {
+        if (enabled) {
+            groupEndNanos.add(durationNanos);
+        }
+    }
+
+    /**
      * Adds one finished worker group.
      * <p>
      * Called on the worker that ran the group, after the group released its region.
@@ -555,6 +667,10 @@ public final class RegionBlockEntityTickAttribution {
                         tickerNanos.sum(), tickerCount.sum(),
                         emptyGroups.sum(), idleGroups.sum(), stalledGroups.sum(), stalledGroupNanos.sum(),
                         new LatencyDistribution(LATENCY_BUCKET_NANOS, buckets, groupNanosHistogramOverflow.sum()), loads),
+                new TickerAttribution(tickerCount.sum(), tickerAdmissionNanos.sum(), tickerReservationNanos.sum(),
+                        tickerScopeNanos.sum(), tickerBodyNanos.sum(), tickerQueryNanos.sum(), tickerQueries.sum(),
+                        deferredRegistrationNanos.sum(), deferredRegistrations.sum(), ownershipScopeNanos.sum(),
+                        groupPrepareNanos.sum(), groupEndNanos.sum()),
                 fallbacks);
     }
 
@@ -575,6 +691,7 @@ public final class RegionBlockEntityTickAttribution {
      * @param batchTailNanos        the summed time from the last group's end to the end of the wait
      * @param handoffSteps          the split of {@code handoffNanos} into the steps of the deferred work
      * @param groups                what the worker groups of the measured slices did
+     * @param tickers               the split of the per-ticker and per-group overhead of the worker groups
      * @param fallbackTickers       the tickers that ticked on the server thread after the batch, indexed by
      *                              {@link FallbackReason#ordinal()}
      */
@@ -595,6 +712,7 @@ public final class RegionBlockEntityTickAttribution {
             long batchTailNanos,
             HandoffSteps handoffSteps,
             GroupDistribution groups,
+            TickerAttribution tickers,
             long[] fallbackTickers) {
         /**
          * {@return the tickers that ticked on the server thread after the batch for {@code reason}}
@@ -715,6 +833,44 @@ public final class RegionBlockEntityTickAttribution {
             return this.buckets.length * this.bucketNanos;
         }
     }
+
+    /**
+     * The split of the worker-side time of the block-entity slice into the tickers and the group wrapper.
+     * <p>
+     * The ticker part is the cost of one {@code tick()} invocation as the worker sees it: the checks that admit
+     * it, the reservation of the block-write effects of its body, the entry and exit of its admission scope, and
+     * the body itself. The body includes the deferred-mutation registration of the blocks it wrote, which is
+     * reported as its own figure because it is work the inline path does not do at all. The group part is what
+     * the slice adds around the ticker loop: ordering the tickers of the group, claiming the region and
+     * installing the group state, the entity ownership lease of the group, and releasing the region again. What
+     * is left of the group wall time after both is the wrapper the dispatch and the batch bookkeeping add.
+     *
+     * @param tickers                   the tickers the accumulators measured
+     * @param admissionNanos            summed time of the admission checks of one ticker
+     * @param reservationNanos          summed time of the deferred-mutation reservation of one ticker
+     * @param scopeNanos                summed time of the entry and the exit of one ticker's admission scope
+     * @param bodyNanos                 summed time of {@code tick()}, deferred registration included
+     * @param queryNanos                summed time of the region-scoped entity queries inside the bodies
+     * @param queries                   the region-scoped entity queries the bodies issued
+     * @param deferredRegistrationNanos summed time of the block-write registrations inside the bodies
+     * @param deferredRegistrations     the block-write registrations the bodies recorded
+     * @param ownershipScopeNanos       summed time of opening and closing the ownership lease of one group
+     * @param groupPrepareNanos         summed time one group spent before its ticker loop
+     * @param groupEndNanos             summed time one group spent releasing its region
+     */
+    public record TickerAttribution(
+            long tickers,
+            long admissionNanos,
+            long reservationNanos,
+            long scopeNanos,
+            long bodyNanos,
+            long queryNanos,
+            long queries,
+            long deferredRegistrationNanos,
+            long deferredRegistrations,
+            long ownershipScopeNanos,
+            long groupPrepareNanos,
+            long groupEndNanos) {}
 
     /**
      * The groups one worker thread ran.

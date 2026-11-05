@@ -7,7 +7,7 @@ package net.neoforged.neoforge.server.threading.region;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -24,12 +24,22 @@ import org.jetbrains.annotations.Nullable;
  * Worker pool reserved for native region execution.
  * <p>
  * The pool has two dispatch paths. The default path hands a task to a fixed thread pool; the persistent path
- * hands it to one worker's own slot instead: the submitting thread appends the task to the slot of the worker it
- * selected, publishes the sequence number of the slot and unparks that worker, which runs the task and then
- * spins a bounded number of iterations before it parks again. The persistent path removes the shared queue
- * lock, the executor's worker publication and most of the wake-up latency of a per-tick batch, which is what a
- * light workload pays for in full. The executor path is kept and is used whenever the persistent path is not
- * installed, so a shutdown or a configuration that cannot use it falls back to the unchanged behaviour.
+ * gives every worker its own deque instead: the submitting thread pushes a task onto the deque of an idle worker,
+ * or of the worker with the least work pending when none is idle, that worker pops its own tasks from the back of
+ * its deque, and a worker that runs out of its own work steals from the front of another worker's deque. The
+ * owner end and the thief end are opposite, so an idle worker takes the task that has waited longest while the
+ * owner keeps the task it pushed last, and a worker with nothing to do never waits for the worker that happens to
+ * be busy with the slowest region of the batch. The persistent path removes the shared queue lock, the executor's
+ * worker publication and most of the wake-up latency of a per-tick batch, which is what a light workload pays for
+ * in full. The executor path is kept and is used whenever the persistent path is not installed, so a shutdown or
+ * a configuration that cannot use it falls back to the unchanged behaviour.
+ * <p>
+ * The dispatch handshake is spin-then-park. A worker spins on the sequence number of its own deque, then scans
+ * the deques of the other workers once per spin period, and only then parks with a bounded park. A submission
+ * advances a pool-wide work epoch and unparks one parked worker (the worker it pushed to, or another one that
+ * then steals the task), and a worker reads that epoch after it published its parked flag, so an offer that
+ * races the park decision is either seen by the worker that decided to park or by the scan of the submitter.
+ * No wake-up is lost and an idle worker is never woken without work to take.
  * <p>
  * {@link #close()} only returns after every worker thread terminated. Work that was accepted before the close
  * is always executed (it holds region leases and batch barriers that other threads wait for), and an interrupt
@@ -46,7 +56,7 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
      * an idle worker parks after at most this many iterations and costs no CPU.
      */
     private static final int SPIN_ATTEMPTS = 128;
-    /** Longest a parked worker sleeps before it re-checks its slot. */
+    /** Longest a parked worker sleeps before it re-checks its own and the other deques. */
     private static final long PARK_NANOS = 1_000_000L;
     /**
      * Bounded parks an idle worker runs before it parks without a timeout. An idle worker of a pool that is no
@@ -62,15 +72,15 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     private final int threadCount;
     private final AtomicInteger nextWorker = new AtomicInteger();
     /**
-     * The tasks no idle worker could take, drained by whichever worker finishes next.
+     * Counts every task a submitter offered to a worker.
      * <p>
-     * A per-worker slot is only handed a task when its worker has nothing pending, so a saturated batch would be
-     * split between the workers before it runs and could not be balanced any more: a region of hoppers that
-     * transfers this tick costs several times one that does not, and the barrier waits for the slowest worker.
-     * The overflow queue keeps the dynamic balancing of a shared queue for exactly the case - a batch that needs
-     * more tasks than there are workers - while an idle worker still starts its task without any queue at all.
+     * A worker that is about to park reads this epoch after it published its parked flag and before it re-checks
+     * the deques. An offer either advanced the epoch (so the worker looks for work again instead of parking) or
+     * happened before that read, in which case the submitter's scan of the parked flags observes the worker and
+     * unparks it: the two threads cannot both miss each other, so a wake-up is never lost and no worker parks
+     * through an offer.
      */
-    private final ConcurrentLinkedQueue<SubmittedTask> overflow = new ConcurrentLinkedQueue<>();
+    private final AtomicLong workEpoch = new AtomicLong();
     /**
      * Number of submissions that observed the open pool and have not finished enqueuing yet. {@link #close()}
      * sets the closed flag and then waits for this to reach zero, so a task can never be enqueued after the
@@ -83,6 +93,7 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     private final AtomicLong idleWakeUps = new AtomicLong();
     private final AtomicLong spinWakeUps = new AtomicLong();
     private final AtomicLong parkWakeUps = new AtomicLong();
+    private final AtomicLong steals = new AtomicLong();
     private volatile boolean closed;
 
     /**
@@ -95,8 +106,8 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     /**
      * Creates a pool with the selected dispatch path.
      *
-     * @param persistentWorkers {@code true} to dispatch through the per-worker slots of a persistent worker
-     *                          instead of a shared executor queue
+     * @param persistentWorkers {@code true} to dispatch through the per-worker deques of a persistent worker
+     *                          pool instead of a shared executor queue
      */
     RegionWorkerPool(int threadCount, boolean persistentWorkers) {
         if (threadCount <= 0) {
@@ -106,9 +117,12 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
         if (persistentWorkers) {
             this.executor = null;
             this.workers = new Worker[threadCount];
+            // Every worker is created before any of them starts: a worker scans the deques of the other workers
+            // as soon as it runs, so the array it reads must be complete.
             for (int index = 0; index < threadCount; ++index) {
-                final Worker worker = new Worker(index + 1);
-                this.workers[index] = worker;
+                this.workers[index] = new Worker(index);
+            }
+            for (final Worker worker : this.workers) {
                 worker.thread.start();
             }
         } else {
@@ -169,13 +183,13 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     }
 
     /**
-     * Hands {@code task} to an idle worker's slot, or to the shared overflow queue when every worker is busy.
+     * Pushes {@code task} onto the deque of the worker with the least work pending and wakes one parked worker.
      * <p>
-     * The task is enqueued before the sequence number of the slot is published, so a worker that observes the new
-     * sequence always finds the task; exactly one worker consumes a slot and every worker may consume the overflow
-     * queue, whose poll is atomic, so a task is never run twice and never dropped. A submission that races
-     * {@link #close()} is refused: the admission counter keeps the enqueue and the stop of the drain loop ordered,
-     * so no task is enqueued after the workers were told to stop.
+     * The task is enqueued before the sequence number of the deque is published, so a worker that observes the new
+     * sequence always finds the task; the owner pops the task from the back of its deque and every other worker
+     * pops it from the front, and all of those polls are atomic, so a task is never run twice and never dropped.
+     * A submission that races {@link #close()} is refused: the admission counter keeps the enqueue and the stop
+     * of the drain loop ordered, so no task is enqueued after the workers were told to stop.
      */
     private boolean executePersistent(String description, Runnable task) {
         final long start = System.nanoTime();
@@ -185,33 +199,24 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
                 LOGGER.warn("Rejected region worker task after shutdown: {}", description);
                 return false;
             }
-            // An idle worker starts the task immediately and is the only worker that needs a wake-up, so it is
-            // preferred. A task no idle worker can take goes to the overflow queue, which the workers drain when
-            // they finish: that keeps the dynamic balancing of a shared queue instead of pinning the task to one
-            // worker before it runs.
-            final Worker idle = this.selectIdleWorker();
-            // A task that is handed to an idle worker measures the wake-up: the submitter observed no pending
-            // task in the slot. A task that goes to the overflow queue waits behind other work instead, which
-            // the barrier wait already reports, so it is not counted as a wake-up.
-            // The submission time travels with the task, so the wake-up latency of one task is measurable even
-            // when several tasks wait in the same slot.
-            final SubmittedTask submitted = new SubmittedTask(description, task, start, idle != null);
-            if (idle != null) {
-                idle.tasks.add(submitted);
-                idle.published.incrementAndGet();
-                LockSupport.unpark(idle.thread);
-            } else {
-                this.overflow.add(submitted);
-                // Every worker is busy, so one of them drains the queue when it finishes. Only a worker that is
-                // already parked has to be woken - and only one of them, because every worker drains the queue -
-                // so a saturated batch costs no wake-up syscall on the submitting thread at all.
-                for (final Worker worker : this.workers) {
-                    if (worker.parked) {
-                        LockSupport.unpark(worker.thread);
-                        break;
-                    }
-                }
-            }
+            // A task is offered to an idle worker, or to the deque with the least work pending when none is
+            // idle: a saturated pool puts it behind the shortest queue instead of pinning it to a worker that may
+            // be busy with a region many times slower than the task itself, and work stealing then closes
+            // whatever imbalance is left between the workers while the batch runs.
+            final Worker target = this.selectTargetWorker();
+            // A task that is handed to a worker that runs nothing and has nothing pending measures the wake-up:
+            // the submitter observed an idle worker, so the delay to the start of the body is the handshake. A
+            // task that waits behind other work measures that work instead, which the barrier wait and the steal
+            // counter report, so it is not counted as a wake-up. The submission time travels with the task, so the
+            // wake-up latency of one task is measurable even when several tasks wait in the same deque.
+            final SubmittedTask submitted = new SubmittedTask(description, task, start, target.isIdle(), target.index);
+            target.tasks.offerLast(submitted);
+            target.published.incrementAndGet();
+            // Publish the offer before the wake-up: the epoch covers a worker that is deciding to park, and the
+            // parked-flag scan covers one that already is. Both are needed: either one alone can be read one
+            // moment too early.
+            this.workEpoch.incrementAndGet();
+            this.unparkOneParked(target);
             this.submissions.incrementAndGet();
             return true;
         } finally {
@@ -221,22 +226,66 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     }
 
     /**
-     * {@return a worker with nothing pending, or {@code null} when every worker is busy}
+     * {@return the worker to push the next task onto}
      * <p>
-     * A worker that has nothing pending answers in the time of one task, so it is preferred: the task starts
-     * immediately and only that worker needs a wake-up. The scan starts at a round-robin index, so idle workers
-     * are used evenly when the pool is not saturated.
+     * An idle worker - one that runs nothing and has nothing pending - is preferred, because it starts the task
+     * immediately and is the only worker that needs a wake-up: that is the hand-off the pool controls. A pool
+     * whose workers all run something puts the task behind the shortest deque instead, and work stealing
+     * balances whatever is left while the batch runs. The rotating start spreads the choices of an idle pool
+     * over the workers instead of always using the first one.
      */
-    @Nullable
-    private Worker selectIdleWorker() {
-        final int start = Math.floorMod(this.nextWorker.getAndIncrement(), this.workers.length);
-        for (int offset = 0; offset < this.workers.length; ++offset) {
-            final Worker worker = this.workers[(start + offset) % this.workers.length];
-            if (worker.isIdle()) {
-                return worker;
+    private Worker selectTargetWorker() {
+        final Worker[] all = this.workers;
+        final int start = Math.floorMod(this.nextWorker.getAndIncrement(), all.length);
+        Worker best = all[start];
+        long bestPending = best.pending();
+        if (bestPending == 0L && best.isIdle()) {
+            return best;
+        }
+        for (int offset = 1; offset < all.length; ++offset) {
+            final Worker candidate = all[(start + offset) % all.length];
+            final long pending = candidate.pending();
+            if (pending < bestPending) {
+                best = candidate;
+                bestPending = pending;
+            }
+            if (pending == 0L && candidate.isIdle()) {
+                // The first idle worker of the rotating scan; a busy worker with an empty deque (pending 0 but
+                // still running its last task) is not preferred over it.
+                return candidate;
             }
         }
-        return null;
+        return best;
+    }
+
+    /**
+     * Wakes the worker the task was pushed to when it is parked, or another parked worker that then steals it.
+     * <p>
+     * At most one worker is unparked per submission: the target starts the task itself, and a second worker is
+     * only woken when the target keeps running, so a saturated batch costs the submitting thread no wake-up
+     * syscall at all.
+     */
+    private void unparkOneParked(Worker target) {
+        if (target.parked) {
+            LockSupport.unpark(target.thread);
+            return;
+        }
+        for (final Worker worker : this.workers) {
+            if (worker != target && worker.parked) {
+                LockSupport.unpark(worker.thread);
+                return;
+            }
+        }
+    }
+
+    /** {@return true when any worker still has a task pushed onto its deque that nobody took} */
+    private boolean anyPending() {
+        for (final Worker worker : this.workers) {
+            if (worker.pending() != 0L) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -259,8 +308,8 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     /**
      * Runs one accepted task on a persistent worker and keeps the worker alive when the task fails.
      * <p>
-     * A failing task must not retire the worker: the worker owns the slot the pool dispatches to, so its
-     * failure is logged here and the loop continues with the next task of the slot.
+     * A failing task must not retire the worker: the worker owns a deque the pool dispatches to, so its failure
+     * is logged here and the loop continues with the next task of the deques.
      */
     private void runPersistentTask(String description, Runnable task) {
         RegionWorkerScope.enter();
@@ -278,18 +327,20 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
      * <p>
      * {@code submitNanos} is the wall time the submitting threads spent handing tasks to the pool.
      * {@code wakeNanos} is the wall time between that hand-off and the start of the task body, counted only for
-     * the tasks a submitter handed to a worker that had nothing pending - that is the wake-up the pool controls -
-     * and {@code idleWakeUps} counts them. A task that waited behind a running task of the same worker measures
+     * the tasks a submitter handed to an idle worker and that worker then ran itself - that is the wake-up the pool
+     * controls - and {@code idleWakeUps} counts them. A task an idle worker was handed and another one stole is not
+     * a wake-up: it waited for the thief's own task first, which is what {@code steals} reports. A task that waited behind a running task of the same worker measures
      * that task's execution instead, which the batch barrier wait reports. {@code spinWakeUps} and
-     * {@code parkWakeUps} split the wake-ups into the ones a spinning worker took and the ones a parked worker
-     * took.
+     * {@code parkWakeUps} split the task starts into the ones a spinning worker took and the ones a parked worker
+     * took. {@code steals} counts the tasks a worker took from the deque of another worker, so the dynamic
+     * balancing of the persistent path is observable without timing it.
      */
     DispatchSnapshot dispatchSnapshot() {
         return new DispatchSnapshot(this.submissions.get(), this.submitNanos.get(), this.wakeNanos.get(),
-                this.idleWakeUps.get(), this.spinWakeUps.get(), this.parkWakeUps.get());
+                this.idleWakeUps.get(), this.spinWakeUps.get(), this.parkWakeUps.get(), this.steals.get());
     }
 
-    /** {@return true when this pool dispatches through per-worker slots} */
+    /** {@return true when this pool dispatches through per-worker deques} */
     boolean persistentWorkers() {
         return this.workers != null;
     }
@@ -304,7 +355,7 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
         }
         this.closed = true;
         // A submission that observed the open pool has to finish enqueuing before the workers are told to stop,
-        // otherwise its task could be enqueued into a slot whose worker already left the drain loop.
+        // otherwise its task could be pushed onto a deque whose worker already left the drain loop.
         while (this.admissions.get() != 0) {
             Thread.onSpinWait();
         }
@@ -360,90 +411,95 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
     }
 
     /**
-     * One task handed to a worker slot, with the time and the description of the hand-off.
+     * One task pushed onto a worker deque, with the time, the description and the worker of the hand-off.
+     *
+     * @param idleSubmission whether the target worker was idle when the task was pushed
+     * @param target         the index of the worker the task was pushed to
      */
-    private record SubmittedTask(String description, Runnable work, long submittedNanos, boolean idleSubmission) {}
+    private record SubmittedTask(String description, Runnable work, long submittedNanos, boolean idleSubmission, int target) {}
 
     /**
      * Dispatch counters of one pool.
      */
-    record DispatchSnapshot(long submissions, long submitNanos, long wakeNanos, long idleWakeUps, long spinWakeUps, long parkWakeUps) {}
+    record DispatchSnapshot(long submissions, long submitNanos, long wakeNanos, long idleWakeUps, long spinWakeUps, long parkWakeUps, long steals) {}
 
     /**
-     * One persistent worker: its thread, the slot it consumes and the sequence number that publishes a task.
+     * One persistent worker: its thread, the deque it owns and the sequence number that publishes a task.
      * <p>
-     * The queue is single-consumer and is written by the submitting threads. {@link #published} counts the
-     * tasks enqueued into the slot, so the worker can spin on a plain counter instead of polling the queue: it
-     * polls only when the count it has not consumed yet is non-zero, and the count is published after the
-     * enqueue, so a non-zero count always means a task is waiting.
+     * The deque has two consumer ends. The owner polls the back for its own work and every other worker polls the
+     * front, so the tasks that have waited longest are the ones that get stolen. {@link #published} counts the
+     * tasks pushed onto the deque, so the worker can spin on a plain counter instead of polling the deque and the
+     * thieves can tell an empty deque from a loaded one with two reads: it polls only when the count it has not
+     * taken yet is non-zero, and the count is published after the enqueue, so a non-zero count always means a
+     * task is waiting.
      */
     private final class Worker {
-        private final ConcurrentLinkedQueue<SubmittedTask> tasks = new ConcurrentLinkedQueue<>();
+        private final int index;
+        private final ConcurrentLinkedDeque<SubmittedTask> tasks = new ConcurrentLinkedDeque<>();
         private final AtomicLong published = new AtomicLong();
-        private final AtomicLong completed = new AtomicLong();
+        /** Tasks taken from this deque, by the owner and by thieves, so {@code published - taken} is its load. */
+        private final AtomicLong taken = new AtomicLong();
         private final Thread thread;
         private volatile boolean stopping;
-        /** Whether this worker is running a task, of its slot or of the overflow queue. */
+        /** Whether this worker is running a task. */
         private volatile boolean busy;
-        /** Whether this worker is parked; a submission that cannot find an idle worker wakes exactly one. */
+        /** Whether this worker is parked; a submission that cannot hand its task to a running worker wakes one. */
         private volatile boolean parked;
+        /** Rotating start of the theft scan, so a worker does not always steal from the same neighbour. */
+        private int stealCursor;
 
         private Worker(int index) {
-            this.thread = new Thread(this::run, "NeoForge Region Worker #" + index);
+            this.index = index;
+            this.thread = new Thread(this::run, "NeoForge Region Worker #" + (index + 1));
             this.thread.setDaemon(true);
             RegionWorkerPool.this.workerThreads.add(this.thread);
         }
 
-        /** {@return true when this worker runs nothing and has no task pending in its slot} */
+        /** {@return true when this worker runs nothing and has no task pushed onto its deque} */
         private boolean isIdle() {
-            return !this.busy && this.published.get() == this.completed.get();
+            return !this.busy && this.pending() == 0L;
+        }
+
+        /** {@return the number of tasks pushed onto this deque that no worker took yet} */
+        private long pending() {
+            final long pending = this.published.get() - this.taken.get();
+            // A thief takes a task before the submitter published its sequence number, which can make the
+            // difference negative for a moment; that deque is empty for a reader of the counters.
+            return pending < 0L ? 0L : pending;
         }
 
         private void run() {
-            long consumed = 0L;
             int spins = 0;
             int idleParks = 0;
             while (true) {
-                final long published = this.published.get();
-                if (published != consumed) {
-                    final SubmittedTask task = this.tasks.poll();
-                    if (task == null) {
-                        // The sequence number is published after the enqueue, so this only happens when the
-                        // consumer raced itself; re-read instead of dropping the wake-up.
-                        continue;
-                    }
-                    ++consumed;
+                SubmittedTask task = this.takeOwn();
+                if (task == null && (spins == 0 || spins >= SPIN_ATTEMPTS)) {
+                    // The task a worker just finished is the moment the pool is most likely to be imbalanced:
+                    // scan the other deques before spinning, and once per spin period afterwards.
+                    task = this.steal();
+                }
+                if (task != null) {
                     if (spins < SPIN_ATTEMPTS) {
                         RegionWorkerPool.this.spinWakeUps.incrementAndGet();
                     } else {
                         RegionWorkerPool.this.parkWakeUps.incrementAndGet();
                     }
-                    if (task.idleSubmission()) {
+                    if (task.idleSubmission() && task.target() == this.index) {
+                        // Only the worker the task was pushed to measures the handshake. A task a thief takes
+                        // waited for the thief's own work first, which is not a wake-up.
                         RegionWorkerPool.this.idleWakeUps.incrementAndGet();
                         RegionWorkerPool.this.wakeNanos.addAndGet(System.nanoTime() - task.submittedNanos());
                     }
                     spins = 0;
                     idleParks = 0;
                     this.runTask(task);
-                    this.completed.set(consumed);
                     continue;
                 }
-                if (spins >= SPIN_ATTEMPTS) {
-                    // Every worker drains the overflow queue when it finds nothing of its own, so a task that
-                    // arrived while all workers were busy runs on whichever worker finishes next. Its wait is
-                    // reported by the batch barrier, not as a wake-up of this pool.
-                    final SubmittedTask shared = RegionWorkerPool.this.overflow.poll();
-                    if (shared != null) {
-                        spins = 0;
-                        idleParks = 0;
-                        this.runTask(shared);
-                        continue;
-                    }
-                }
                 if (this.stopping) {
-                    // The close waits for this thread; a task published before the stop is still drained,
-                    // because the count is only final after every admission finished enqueuing.
-                    if (this.published.get() == consumed && RegionWorkerPool.this.overflow.isEmpty()) {
+                    // The close waits for this thread; a task pushed before the stop is still drained, because
+                    // the admission counter is only final after every admission finished enqueuing. No worker
+                    // may leave while a deque still holds a task, because the barrier waits for it.
+                    if (!RegionWorkerPool.this.anyPending()) {
                         return;
                     }
                     // Drain what is left without spinning; another worker may take it instead.
@@ -455,12 +511,13 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
                     Thread.onSpinWait();
                     continue;
                 }
-                // Publish the parked state and re-check both work sources before parking: a submitter that hands
-                // a task to the overflow queue wakes a worker only when it sees this flag, and a re-check that
-                // runs after the publication makes a lost wake-up impossible.
+                // Publish the parked state and then re-check every source before parking: the epoch read after
+                // the publication catches a submission that is being pushed right now, and the parked scan of
+                // that submission catches this worker if the read missed it. A lost wake-up is impossible.
                 this.parked = true;
                 try {
-                    if (this.published.get() != consumed || !RegionWorkerPool.this.overflow.isEmpty()) {
+                    final long epoch = RegionWorkerPool.this.workEpoch.get();
+                    if (RegionWorkerPool.this.anyPending() || RegionWorkerPool.this.workEpoch.get() != epoch) {
                         continue;
                     }
                     if (idleParks < BOUNDED_PARKS) {
@@ -477,7 +534,53 @@ final class RegionWorkerPool implements RegionWorkerExecutor, AutoCloseable {
         }
 
         /**
-         * Runs one task of either source and keeps the worker alive when the task fails.
+         * {@return the newest task of this worker's own deque, or {@code null} when it has none}
+         * <p>
+         * The owner pops the task it pushed last, so the tasks that stay behind are the ones the thieves take
+         * from the front: the two ends never fight over the same task.
+         */
+        @Nullable
+        private SubmittedTask takeOwn() {
+            if (this.published.get() == this.taken.get()) {
+                return null;
+            }
+            final SubmittedTask task = this.tasks.pollLast();
+            if (task != null) {
+                this.taken.incrementAndGet();
+            }
+            return task;
+        }
+
+        /**
+         * {@return the oldest task of another worker's deque, or {@code null} when every other deque is empty}
+         * <p>
+         * Every worker scans the same deques, so the poll is the only operation that has to be atomic: exactly
+         * one thief wins a task and the losers find the next one or an empty deque.
+         */
+        @Nullable
+        private SubmittedTask steal() {
+            final Worker[] all = RegionWorkerPool.this.workers;
+            if (all.length == 1) {
+                return null;
+            }
+            final int first = 1 + Math.floorMod(this.stealCursor++, all.length - 1);
+            for (int offset = 0; offset < all.length - 1; ++offset) {
+                final Worker victim = all[(this.index + first + offset) % all.length];
+                if (victim.pending() == 0L) {
+                    continue;
+                }
+                final SubmittedTask task = victim.tasks.pollFirst();
+                if (task != null) {
+                    victim.taken.incrementAndGet();
+                    RegionWorkerPool.this.steals.incrementAndGet();
+                    return task;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Runs one task of any deque and keeps the worker alive when the task fails.
          */
         private void runTask(SubmittedTask task) {
             this.busy = true;

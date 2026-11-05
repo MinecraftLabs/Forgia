@@ -3124,6 +3124,12 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (updates == null) {
             return false;
         }
+        if (updates.attributesRegistrations()) {
+            final long start = System.nanoTime();
+            updates.deferSectionStatus(pos, empty);
+            RegionBlockEntityTickAttribution.recordDeferredRegistration(System.nanoTime() - start);
+            return true;
+        }
         updates.deferSectionStatus(pos, empty);
         return true;
     }
@@ -3140,6 +3146,12 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (updates == null) {
             return false;
         }
+        if (updates.attributesRegistrations()) {
+            final long start = System.nanoTime();
+            updates.deferLightCheck(pos);
+            RegionBlockEntityTickAttribution.recordDeferredRegistration(System.nanoTime() - start);
+            return true;
+        }
         updates.deferLightCheck(pos);
         return true;
     }
@@ -3154,6 +3166,15 @@ public final class RegionThreadingEngine implements RegionThreading {
         final RegionDeferredBlockUpdates updates = RegionTickBatch.currentBlockUpdates();
         if (updates == null) {
             return false;
+        }
+        if (updates.attributesRegistrations()) {
+            // The registration and the re-run seed of the written position are the deferred half of the write:
+            // both are work the same write would not do on the server thread, so they are timed together.
+            final long start = System.nanoTime();
+            updates.deferBlockUpdate(pos, oldState, newState, flags);
+            this.recordRerunSeed(pos);
+            RegionBlockEntityTickAttribution.recordDeferredRegistration(System.nanoTime() - start);
+            return true;
         }
         updates.deferBlockUpdate(pos, oldState, newState, flags);
         // The position is the propagation a re-run of this region has to repeat if a chunk it read changed
@@ -5080,13 +5101,23 @@ public final class RegionThreadingEngine implements RegionThreading {
                 // neighbor update of its own setChanged() is recorded here and applied by the publishing
                 // server thread after the batch, never from a worker.
                 this.currentRegionTickMutations.set(group.batch().regionTickMutations());
+                if (tickerTiming) {
+                    // Everything up to the ownership lease is per-group setup: ordering the tickers, claiming
+                    // the region and installing the group state. It is the group half of the wrapper.
+                    RegionBlockEntityTickAttribution.recordGroupPrepare(System.nanoTime() - start);
+                }
                 try {
                     // The ownership lease covers exactly this worker tick loop: it is opened after the
                     // region lease and closed before it, so a worker task outside the loop never sees it.
+                    final long ownershipStart = tickerTiming ? System.nanoTime() : 0L;
                     final RegionEntityOwnershipScope ownership = RegionEntityOwnershipScope.open(coordinate, group);
+                    if (tickerTiming) {
+                        RegionBlockEntityTickAttribution.recordOwnershipScope(System.nanoTime() - ownershipStart);
+                    }
                     try {
                         this.runWithContext(new BasicRegionThreadingContext(RegionThreadingContext.Kind.REGION, level, coordinate, region, null), () -> {
                             for (final RegionBlockEntityTickAdmission admission : tickers) {
+                                final long tickerLoopStart = tickerTiming ? System.nanoTime() : 0L;
                                 final TickingBlockEntity ticker = admission.ticker();
                                 if (ticker.isRemoved()) {
                                     continue;
@@ -5094,13 +5125,23 @@ public final class RegionThreadingEngine implements RegionThreading {
                                 // Validate before the body: stale admissions are deferred exactly once, never
                                 // recovered by throwing after a ticker could already have produced side effects.
                                 if (admission.level() != level || !admission.isCurrent() || !region.isOwnedByCurrentThread()) {
+                                    if (tickerTiming) {
+                                        RegionBlockEntityTickAttribution.recordTickerAdmission(System.nanoTime() - tickerLoopStart);
+                                    }
                                     group.batch().addFallback(admission);
                                     this.fallbackBlockEntityTicks.incrementAndGet();
                                     RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.STALE_ADMISSION, 1);
                                     continue;
                                 }
+                                if (tickerTiming) {
+                                    RegionBlockEntityTickAttribution.recordTickerAdmission(System.nanoTime() - tickerLoopStart);
+                                }
                                 if (RegionWorkerScope.isNativeWorkerThread()) {
+                                    final long reserveStart = tickerTiming ? System.nanoTime() : 0L;
                                     if (!group.batch().tryReserveBlockUpdates()) {
+                                        if (tickerTiming) {
+                                            RegionBlockEntityTickAttribution.recordTickerReservation(System.nanoTime() - reserveStart);
+                                        }
                                         // The batch cannot reserve the block-write effects of this ticker, so
                                         // the tick is refused before its body starts and runs on the server
                                         // thread after the batch, where its writes need no record.
@@ -5110,9 +5151,25 @@ public final class RegionThreadingEngine implements RegionThreading {
                                         this.countRefusedDeferredBlockUpdate(RegionTickSlice.BLOCK_ENTITY_TICK);
                                         continue;
                                     }
+                                    if (tickerTiming) {
+                                        RegionBlockEntityTickAttribution.recordTickerReservation(System.nanoTime() - reserveStart);
+                                    }
+                                    // The scope is opened and closed explicitly instead of by a try-with-resources
+                                    // so the attribution can time the entry and the exit separately from the body.
                                     final long tickerStart = tickerTiming ? System.nanoTime() : 0L;
-                                    try (RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region)) {
-                                        ticker.tick();
+                                    final RegionBlockEntityTickScope scope = RegionBlockEntityTickScope.open(admission, region);
+                                    final long bodyStart = tickerTiming ? System.nanoTime() : 0L;
+                                    if (tickerTiming) {
+                                        RegionBlockEntityTickAttribution.recordTickerScope(bodyStart - tickerStart);
+                                    }
+                                    try {
+                                        try {
+                                            ticker.tick();
+                                        } finally {
+                                            if (tickerTiming) {
+                                                RegionBlockEntityTickAttribution.recordTickerBody(System.nanoTime() - bodyStart);
+                                            }
+                                        }
                                     } catch (Throwable throwable) {
                                         // A chunk request the chunk source refused is a handoff, not a failure: the
                                         // ticker is ticked on the server thread after the batch instead of aborting
@@ -5129,11 +5186,16 @@ public final class RegionThreadingEngine implements RegionThreading {
                                             RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE, 1);
                                         }
                                         continue;
-                                    }
-                                    if (tickerTiming) {
-                                        // The ticker's own tick, so the group wall time can be split into the
-                                        // vanilla body and the wrapper the slice adds around it.
-                                        RegionBlockEntityTickAttribution.recordTicker(System.nanoTime() - tickerStart);
+                                    } finally {
+                                        final long closeStart = tickerTiming ? System.nanoTime() : 0L;
+                                        scope.close();
+                                        if (tickerTiming) {
+                                            final long closeEnd = System.nanoTime();
+                                            RegionBlockEntityTickAttribution.recordTickerScope(closeEnd - closeStart);
+                                            // The ticker's own tick, so the group wall time can be split into the
+                                            // vanilla body and the wrapper the slice adds around it.
+                                            RegionBlockEntityTickAttribution.recordTicker(closeEnd - tickerStart);
+                                        }
                                     }
                                 } else {
                                     // Executor rejection runs on the server thread and keeps the real load check.
@@ -5143,15 +5205,23 @@ public final class RegionThreadingEngine implements RegionThreading {
                             }
                         });
                     } finally {
+                        final long ownershipCloseStart = tickerTiming ? System.nanoTime() : 0L;
                         ownership.close();
+                        if (tickerTiming) {
+                            RegionBlockEntityTickAttribution.recordOwnershipScope(System.nanoTime() - ownershipCloseStart);
+                        }
                     }
                 } finally {
                     this.currentRegionTickMutations.remove();
                     this.currentBlockEntityTickRandom.remove();
                 }
             } finally {
+                final long groupEndStart = tickerTiming ? System.nanoTime() : 0L;
                 region.endOwnership();
                 region.clearRunning();
+                if (tickerTiming) {
+                    RegionBlockEntityTickAttribution.recordGroupEnd(System.nanoTime() - groupEndStart);
+                }
                 final long duration = System.nanoTime() - start;
                 // The group reports its own wall time and size, so the measured window can tell a barrier
                 // that waits for the slowest group from one that waits for work.
@@ -6383,6 +6453,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 dispatch.idleWakeUps(),
                 dispatch.spinWakeUps(),
                 dispatch.parkWakeUps(),
+                dispatch.steals(),
                 this.packedTasks.get(),
                 this.packedRegions.get(),
                 this.packedLeaseFallbacks.get(),

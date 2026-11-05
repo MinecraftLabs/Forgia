@@ -423,8 +423,8 @@ public class ServerLoadBenchmarkGameTests {
      * The worker dispatch columns of a window measured without an installed engine: every counter of the
      * dispatch path is zero, so the columns keep their shape for a row without region workers.
      */
-    private static final RegionThreadingDiagnostics.WorkerDispatchCounters NO_WORKER_DISPATCH = new RegionThreadingDiagnostics.WorkerDispatchCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
-    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
+    private static final RegionThreadingDiagnostics.WorkerDispatchCounters NO_WORKER_DISPATCH = new RegionThreadingDiagnostics.WorkerDispatchCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
+    static final String FURNACE_CSV_HEADER = "profile,workers,regionSize,furnaces,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,leasedRegions,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks,stealsPerTick";
     /**
      * Columns of the random tick workload row: the profile and its load, the server tick distribution, the chunk
      * tick counters, the segments of the server-thread chunk tick slice and the block state fingerprint of the
@@ -432,9 +432,9 @@ public class ServerLoadBenchmarkGameTests {
      */
     static final String SPAWN_CSV_HEADER = "profile,workers,regionSize,chunks,spawnableChunks,msptAvg,msptP50,msptP95,msptP99,spawnChunksOnWorkers,gateRefusedSpawnChunks,unloadedNeighborhoodSpawnChunks,deferredUpdateBudgetSpawnChunks,lateSpawnChunks,unleasedSpawnChunks,truncatedSpawnChunks,skippedSpawnChunks,capRefusedSpawns,refusedSpawnAdditions,spawnedMonsters,spawnedCreatures,spawnedWaterCreatures,spawnedWaterAmbient,spawnedAmbient,spawnedAxolotls,spawnedUndergroundWaterCreatures,spawnedMisc,mobsInLevel,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples";
     static final String RANDOM_TICK_CSV_HEADER = "profile,workers,regionSize,chunks,blocks,msptAvg,msptP50,msptP95,msptP99,chunkTicksOnWorkers,fallbackChunkTicks,boundaryChunkTicks,unloadedNeighborhoodChunkTicks,truncatedChunkTicks,unleasedChunkTicks,chunkTickLightningStrikes,ownershipViolations,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceP50Ms,sliceSamples,blockStateFingerprint";
-    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
+    static final String HOPPER_CSV_HEADER = "profile,workers,regionSize,hoppers,chunks,msptAvg,msptP50,msptP95,msptP99,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,nonTickingBlockEntityChunks,entitiesLoadingBlockEntityChunks,missingBlockEntityChunks,staleBlockEntityChunkSnapshots,leasedRegions,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,removalsApplied,removalsDropped,removalsRepeated,itemCountStart,itemCountEnd,itemsDropped,itemsDelivered,itemsConserved,planMs,leaseMs,awaitMs,handoffMs,sliceMs,sliceSamples,blockEntityAdmissionCache,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks,stealsPerTick";
     static final String ENTITY_CSV_HEADER = "profile,workers,regionSize,zombies,items,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,deferredEntityTicks,sectionUpdatesApplied,sectionUpdatesDropped,ownershipViolations,zombieReplacements,regionMismatches";
-    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks";
+    static final String ENTITY_WORKER_CSV_HEADER = "profile,workers,regionSize,mobs,chunks,msptAvg,msptP50,msptP95,msptP99,entityTicksOnWorkers,fallbackEntityTicks,skippedEntityTicks,deferredEntityTicks,entityMutationsAllowed,entityMutationsRejected,entityQueriesAllowed,entityQueriesTruncated,entityQueriesRejected,ownershipViolations,sectionUpdatesApplied,sectionUpdatesDropped,pendingTransfers,rememberedTransfers,rejectedTransferRecords,legacyDeferredMoves,retriedDeferredMoves,unchangedDeferredMoves,batchedDeferredMoves,refusedDeferredMoveBatches,regionMismatches,mobSurvivors,entityTickFailures,distinctBlockers,chunkGuardRefusals,chunkFallbackEntityTicks,chunkPreloadRefusedEntityTicks,chunkPreloadMargin,entityTickMode,planMs,leaseMs,awaitMs,handoffMs,deferredPublicationMs,sliceMs,sliceSamples,removalsApplied,removalsDropped,removalsRepeated,additionsRecorded,additionsApplied,additionsDropped,entityAddRejectedOnWorker,mobDeaths,mobReplacements,tasksPerTick,regionsPerPackedTask,taskSubmissions,packedTasks,packedRegions,submissionNanosPerTask,wakeUpNanosPerWakeUp,partialPackFallbacks,stealsPerTick";
     /**
      * Columns of the piston workload row: the profile and its load, the server tick distribution, the block
      * event phase and the distribution of one move.
@@ -2490,6 +2490,7 @@ public class ServerLoadBenchmarkGameTests {
         final String profile = profileName(after);
         final long slices = attributionAfter.sliceCount() - attributionBefore.sliceCount();
         System.out.println(sampler.note(profile, after) + " blockEntityAttributionSlices=" + slices);
+        printBlockEntityTickerAttribution("FURNACE", profile, attributionAfter);
         System.out.println("SERVER_BENCH_FURNACE_HEADER " + FURNACE_CSV_HEADER);
         System.out.printf(Locale.ROOT, "SERVER_BENCH_FURNACE_ROW %s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%s%n",
                 profile,
@@ -2614,7 +2615,8 @@ public class ServerLoadBenchmarkGameTests {
         final long wakeNanos = last.wakeNanos() - first.wakeNanos();
         final long idleWakeUps = last.idleWakeUps() - first.idleWakeUps();
         final long fallbacks = last.partialPackFallbacks() - first.partialPackFallbacks();
-        return String.format(Locale.ROOT, "%.2f,%.2f,%d,%d,%d,%.1f,%.1f,%d",
+        final long steals = last.steals() - first.steals();
+        return String.format(Locale.ROOT, "%.2f,%.2f,%d,%d,%d,%.1f,%.1f,%d,%.2f",
                 submissions / (double) MEASURED_TICKS,
                 packedTasks == 0L ? 0.0 : packedRegions / (double) packedTasks,
                 submissions,
@@ -2622,7 +2624,8 @@ public class ServerLoadBenchmarkGameTests {
                 packedRegions,
                 submissions == 0L ? 0.0 : submitNanos / (double) submissions,
                 idleWakeUps == 0L ? 0.0 : wakeNanos / (double) idleWakeUps,
-                fallbacks);
+                fallbacks,
+                steals / (double) MEASURED_TICKS);
     }
 
     /**
@@ -2733,7 +2736,61 @@ public class ServerLoadBenchmarkGameTests {
                         + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_SNAPSHOT)
                         + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.STALE_ADMISSION)
                         + attribution.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.CHUNK_UNAVAILABLE), slices));
+        printBlockEntityTickerAttribution("HOPPER", profile, attribution);
         printHopperRegionSpread(diagnostics);
+    }
+
+    /**
+     * Prints the split of the worker-side block-entity time into the per-ticker parts and the group wrapper.
+     * <p>
+     * The ticker columns are microseconds per ticker: the admission checks, the reservation of the block-write
+     * effects, the entry and exit of the admission scope and the body itself, which together with the reservation
+     * are the whole ticker loop. {@code queryUsPerTicker} is the part of the body the region-scoped entity query
+     * took - the worker's replacement for the level-wide entity section index - and
+     * {@code deferredRegistrationUsPerTicker} the part the block writes deferred. The group columns are the work
+     * the slice adds around the ticker loop, per group. {@code wrapperMsPerTick} is what is left of the group wall
+     * time after the tickers and those group parts: the dispatch, the batch bookkeeping and the completion of the
+     * groups, i.e. the part of the worker time that is neither a ticker nor a region.
+     */
+    private static void printBlockEntityTickerAttribution(String marker, String profile, RegionBlockEntityTickAttribution.Snapshot attribution) {
+        final long slices = attribution.sliceCount();
+        final RegionBlockEntityTickAttribution.TickerAttribution tickers = attribution.tickers();
+        final RegionBlockEntityTickAttribution.GroupDistribution groups = attribution.groups();
+        final long wrapperNanos = groups.nanos() - groups.tickerNanos() - tickers.admissionNanos()
+                - tickers.reservationNanos() - tickers.ownershipScopeNanos() - tickers.groupPrepareNanos()
+                - tickers.groupEndNanos() - groups.retireNanos();
+        System.out.println("SERVER_BENCH_" + marker + "_TICKER_HEADER profile,slices,tickersPerTick,groupsPerTick,admissionUsPerTicker,reserveUsPerTicker,scopeUsPerTicker,queryUsPerTicker,queriesPerTicker,deferredRegistrationUsPerTicker,registrationsPerTicker,bodyUsPerTicker,tickerTotalUsPerTicker,tickerMsPerTick,ownershipScopeUsPerGroup,prepareUsPerGroup,endUsPerGroup,retireMsPerTick,wrapperMsPerTick,wrapperUsPerTicker");
+        System.out.printf(Locale.ROOT, "SERVER_BENCH_" + marker + "_TICKER_ROW %s,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.3f%n",
+                profile,
+                slices,
+                perUnit(tickers.tickers(), slices),
+                perUnit(groups.groups(), slices),
+                microsPerUnit(tickers.admissionNanos(), tickers.tickers()),
+                microsPerUnit(tickers.reservationNanos(), tickers.tickers()),
+                microsPerUnit(tickers.scopeNanos(), tickers.tickers()),
+                microsPerUnit(tickers.queryNanos(), tickers.tickers()),
+                perUnit(tickers.queries(), tickers.tickers()),
+                microsPerUnit(tickers.deferredRegistrationNanos(), tickers.tickers()),
+                perUnit(tickers.deferredRegistrations(), tickers.tickers()),
+                microsPerUnit(tickers.bodyNanos(), tickers.tickers()),
+                microsPerUnit(groups.tickerNanos(), tickers.tickers()),
+                millisPerSlice(groups.tickerNanos(), slices),
+                microsPerUnit(tickers.ownershipScopeNanos(), groups.groups()),
+                microsPerUnit(tickers.groupPrepareNanos(), groups.groups()),
+                microsPerUnit(tickers.groupEndNanos(), groups.groups()),
+                millisPerSlice(groups.retireNanos(), slices),
+                millisPerSlice(wrapperNanos, slices),
+                microsPerUnit(wrapperNanos, tickers.tickers()));
+    }
+
+    /** {@return {@code nanos} per {@code units} in microseconds, or {@code -1} when nothing was measured} */
+    private static double microsPerUnit(long nanos, long units) {
+        return units <= 0L ? -1.0 : nanos / (double) units / 1_000.0;
+    }
+
+    /** {@return {@code count} per {@code units}, or {@code -1} when nothing was measured} */
+    private static double perUnit(long count, long units) {
+        return units <= 0L ? -1.0 : count / (double) units;
     }
 
     /**

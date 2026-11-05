@@ -59,18 +59,24 @@ public final class RegionScopedEntityQuery {
             return null;
         }
         final List<Entity> result = new ArrayList<>();
-        if (isEmpty(leased.box())) {
-            return result;
-        }
-        level.forEachAccessibleNonEmptySectionInRegion(leased.coordinate().regionX(), leased.coordinate().regionZ(), leased.box(), section -> {
-            section.getEntities(leased.box(), entity -> {
-                if (entity != excluded && predicate.test(entity)) {
-                    result.add(entity);
-                }
+        // The region-scoped query is what a block-entity tick pays instead of the level-wide section index of
+        // the server thread; the attribution times it against the ticker body that issued it.
+        final boolean timing = RegionBlockEntityTickScope.isAttributingTickerBody();
+        final long start = timing ? System.nanoTime() : 0L;
+        if (!isEmpty(leased.box())) {
+            level.forEachAccessibleNonEmptySectionInRegion(leased.coordinate().regionX(), leased.coordinate().regionZ(), leased.box(), section -> {
+                section.getEntities(leased.box(), entity -> {
+                    if (entity != excluded && predicate.test(entity)) {
+                        result.add(entity);
+                    }
+                    return AbortableIterationConsumer.Continuation.CONTINUE;
+                });
                 return AbortableIterationConsumer.Continuation.CONTINUE;
             });
-            return AbortableIterationConsumer.Continuation.CONTINUE;
-        });
+        }
+        if (timing) {
+            RegionBlockEntityTickAttribution.recordTickerQuery(System.nanoTime() - start);
+        }
         return result;
     }
 
@@ -90,6 +96,8 @@ public final class RegionScopedEntityQuery {
         if (isEmpty(leased.box())) {
             return true;
         }
+        final boolean timing = RegionBlockEntityTickScope.isAttributingTickerBody();
+        final long start = timing ? System.nanoTime() : 0L;
         level.forEachAccessibleNonEmptySectionInRegion(leased.coordinate().regionX(), leased.coordinate().regionZ(), leased.box(), section -> section.getEntities(typeTest, leased.box(), entity -> {
             if (predicate.test(entity)) {
                 result.add(entity);
@@ -99,6 +107,9 @@ public final class RegionScopedEntityQuery {
             }
             return AbortableIterationConsumer.Continuation.CONTINUE;
         }));
+        if (timing) {
+            RegionBlockEntityTickAttribution.recordTickerQuery(System.nanoTime() - start);
+        }
         return true;
     }
 

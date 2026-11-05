@@ -13,7 +13,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -98,12 +97,154 @@ class RegionWorkerPoolTest {
         assertEquals(groupCount, snapshotLong(pool, "submissions"));
         assertTrue(snapshotLong(pool, "submitNanos") > 0L);
         assertTrue(snapshotLong(pool, "wakeNanos") >= 0L);
-        // Only the tasks an idle worker took measure a wake-up; the ones that went to the shared overflow queue
-        // waited behind other work, and every one of them still ran exactly once.
+        // Only the tasks an idle worker took measure a wake-up; the ones that waited behind other work - or were
+        // stolen from another worker's deque - waited for that work instead, and every one of them still ran
+        // exactly once.
         final long idleWakeUps = snapshotLong(pool, "idleWakeUps");
         assertTrue(idleWakeUps > 0L, "the first groups of the batch must be handed to idle workers");
         assertTrue(idleWakeUps <= groupCount);
-        assertEquals(idleWakeUps, snapshotLong(pool, "spinWakeUps") + snapshotLong(pool, "parkWakeUps"));
+        // Every task start is one spin or park wake-up, whether the worker took the task from its own deque or
+        // stole it, so the two counters add up to the tasks the barrier saw.
+        assertEquals(groupCount, snapshotLong(pool, "spinWakeUps") + snapshotLong(pool, "parkWakeUps"));
+    }
+
+    @Test
+    void aStealingWorkerTakesWorkFromABusyOne() throws Exception {
+        final Object pool = this.persistentPool(2);
+        final CountDownLatch firstStarted = new CountDownLatch(1);
+        final CountDownLatch releaseFirst = new CountDownLatch(1);
+        final CountDownLatch secondStarted = new CountDownLatch(1);
+        final CountDownLatch releaseSecond = new CountDownLatch(1);
+        final CountDownLatch quickRan = new CountDownLatch(1);
+        // Both workers are held inside a task, so the next submission finds no idle worker and is queued behind
+        // the one the rotating scan starts at. Releasing the other worker then leaves it with no own work and a
+        // task waiting in a neighbour's deque: it has to steal it, and the steal counter says so without timing.
+        assertTrue(submit(pool, "first", () -> {
+            firstStarted.countDown();
+            awaitUnchecked(releaseFirst);
+        }));
+        awaitUnchecked(firstStarted);
+        assertTrue(submit(pool, "second", () -> {
+            secondStarted.countDown();
+            awaitUnchecked(releaseSecond);
+        }));
+        awaitUnchecked(secondStarted);
+        assertTrue(submit(pool, "quick", quickRan::countDown));
+
+        releaseSecond.countDown();
+        assertTrue(quickRan.await(10, TimeUnit.SECONDS), "the queued task never ran while both workers were held");
+        assertTrue(snapshotLong(pool, "steals") > 0L, "the released worker never stole the task queued on the other one");
+        releaseFirst.countDown();
+    }
+
+    @Test
+    void packedGroupsStolenAcrossWorkersRunEveryGroupExactlyOnce() throws Exception {
+        final Object pool = this.persistentPool(4);
+        // Eight packs of four groups per batch, over twenty batches with random group durations, so the packs of
+        // one batch are stolen across the workers while the next batch is submitted. A group is the unit of
+        // region exclusivity: a worker may only be inside a group while no other worker is inside the same one.
+        final int batches = 20;
+        final int packCount = 8;
+        final int groupsPerPack = 4;
+        final int groupCount = packCount * groupsPerPack;
+        final int[] runs = new int[groupCount];
+        final AtomicBoolean overlapped = new AtomicBoolean();
+        for (int batchIndex = 0; batchIndex < batches; ++batchIndex) {
+            final RegionTaskBatch batch = new RegionTaskBatch();
+            final AtomicInteger[] insideGroups = new AtomicInteger[groupCount];
+            for (int pack = 0; pack < packCount; ++pack) {
+                final List<Runnable> works = new ArrayList<>();
+                for (int index = 0; index < groupsPerPack; ++index) {
+                    final int group = pack * groupsPerPack + index;
+                    insideGroups[group] = new AtomicInteger();
+                    works.add(() -> {
+                        if (insideGroups[group].incrementAndGet() != 1) {
+                            overlapped.set(true);
+                        }
+                        sleep(ThreadLocalRandom.current().nextInt(3));
+                        ++runs[group];
+                        insideGroups[group].decrementAndGet();
+                    });
+                }
+                batch.addPacked("pack " + pack, works);
+            }
+
+            final RegionTaskBatch.Barrier barrier = batch.submit(executor(pool));
+            barrier.awaitCompletion();
+            assertTrue(barrier.isComplete());
+            assertNull(barrier.failure());
+        }
+
+        assertFalse(overlapped.get(), "two workers were inside one group of a packed batch at the same time");
+        for (int index = 0; index < runs.length; ++index) {
+            assertEquals(batches, runs[index], "group " + index + " ran " + runs[index] + " times of " + batches);
+        }
+    }
+
+    @Test
+    void aThrowingGroupFailsTheBatchAndTheOtherGroupsStillFinish() throws Exception {
+        final Object pool = this.persistentPool(2);
+        final RegionTaskBatch batch = new RegionTaskBatch();
+        final CountDownLatch survivors = new CountDownLatch(15);
+        for (int index = 0; index < 15; ++index) {
+            batch.add("survivor " + index, survivors::countDown);
+        }
+        batch.add("failing", () -> {
+            throw new IllegalStateException("boom");
+        });
+
+        final RegionTaskBatch.Barrier barrier = batch.submit(executor(pool));
+        barrier.awaitCompletion();
+
+        assertTrue(barrier.isComplete(), "the barrier did not complete after a failing group");
+        assertTrue(survivors.await(1, TimeUnit.SECONDS), "the groups behind the failing one never ran");
+        assertTrue(barrier.failure() instanceof IllegalStateException, String.valueOf(barrier.failure()));
+        assertEquals(0, barrier.rejectedCount());
+    }
+
+    @Test
+    void closeDrainsTheQueuedWorkOfEveryWorker() throws Exception {
+        final Object pool = this.persistentPool(3);
+        final CountDownLatch started = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        assertTrue(submit(pool, "blocker", () -> {
+            started.countDown();
+            awaitUnchecked(release);
+        }));
+        awaitUnchecked(started);
+        final int queued = 300;
+        final int[] runs = new int[queued];
+        final CountDownLatch done = new CountDownLatch(queued);
+        for (int index = 0; index < queued; ++index) {
+            final int task = index;
+            assertTrue(submit(pool, "queued " + task, () -> {
+                ++runs[task];
+                done.countDown();
+            }));
+        }
+
+        final AtomicReference<Throwable> closerFailure = new AtomicReference<>();
+        final CountDownLatch closed = new CountDownLatch(1);
+        final Thread closer = new Thread(() -> {
+            try {
+                close.invoke(pool);
+            } catch (Throwable throwable) {
+                closerFailure.set(throwable);
+            } finally {
+                closed.countDown();
+            }
+        }, "pool-close-test");
+        closer.start();
+        // The queued tasks cannot run before the blocker releases the worker they are queued behind.
+        sleep(50);
+        release.countDown();
+
+        assertTrue(closed.await(30, TimeUnit.SECONDS), "close never returned");
+        assertNull(closerFailure.get(), () -> "close failed: " + closerFailure.get());
+        assertTrue(done.await(1, TimeUnit.SECONDS), "close left queued work unexecuted");
+        for (int index = 0; index < queued; ++index) {
+            assertEquals(1, runs[index], "queued task " + index + " ran " + runs[index] + " times");
+        }
     }
 
     @Test
@@ -214,21 +355,24 @@ class RegionWorkerPoolTest {
     @Test
     void closeLeavesNoWorkerParked() throws Exception {
         final Object pool = this.persistentPool(3);
-        final Set<Thread> workers = new HashSet<>();
+        final Set<Thread> workers = ConcurrentHashMap.newKeySet();
+        // One blocking task per worker: a blocked worker cannot steal the task handed to its neighbour, so the
+        // three threads are all occupied before they are released and the close has to retire every one of them.
+        final CountDownLatch started = new CountDownLatch(3);
+        final CountDownLatch release = new CountDownLatch(1);
         for (int index = 0; index < 3; ++index) {
-            final CountDownLatch reported = new CountDownLatch(1);
-            final AtomicReference<Thread> thread = new AtomicReference<>();
-            assertTrue(submit(pool, "report", () -> {
-                thread.set(Thread.currentThread());
-                reported.countDown();
+            assertTrue(submit(pool, "report " + index, () -> {
+                workers.add(Thread.currentThread());
+                started.countDown();
+                awaitUnchecked(release);
             }));
-            awaitUnchecked(reported);
-            workers.add(thread.get());
         }
+        assertTrue(started.await(10, TimeUnit.SECONDS), "the three workers did not all start a task");
+        release.countDown();
 
         unchecked(() -> close.invoke(pool));
 
-        assertEquals(3, workers.size());
+        assertEquals(3, workers.size(), "the three tasks did not run on three distinct workers");
         for (final Thread worker : workers) {
             assertFalse(worker.isAlive(), "worker " + worker.getName() + " is still alive after close");
         }

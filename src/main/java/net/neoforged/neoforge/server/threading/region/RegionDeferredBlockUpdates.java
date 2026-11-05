@@ -58,9 +58,26 @@ final class RegionDeferredBlockUpdates {
     private final AtomicInteger reserved = new AtomicInteger();
     /** Entries one batch may reserve, i.e. the admission bound of every slice of that batch. */
     private final int maxEntries;
+    /**
+     * Whether the batch of this queue is the block-entity tick slice, whose per-ticker attribution reports the
+     * registrations of the worker bodies. Only that slice measures them: the other slices record into their own
+     * queue, and a registration of one of their workers is not a block-entity ticker cost.
+     */
+    private final boolean blockEntitySlice;
 
-    RegionDeferredBlockUpdates(int maxEntries) {
+    RegionDeferredBlockUpdates(RegionTickSlice slice, int maxEntries) {
         this.maxEntries = maxEntries;
+        this.blockEntitySlice = slice == RegionTickSlice.BLOCK_ENTITY_TICK;
+    }
+
+    /**
+     * {@return true when a registration into this queue has to be timed for the block-entity ticker attribution}
+     * <p>
+     * One volatile read when the attribution is off, which is the default; the read only decides whether the two
+     * timestamps of a measured registration are taken.
+     */
+    boolean attributesRegistrations() {
+        return this.blockEntitySlice && RegionBlockEntityTickAttribution.isEnabled();
     }
 
     /**

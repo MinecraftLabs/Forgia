@@ -96,7 +96,7 @@ abstract class RegionTickBatch {
     RegionTickBatch(ServerLevel level, RegionTickSlice slice, int blockUpdateEntryBudget) {
         this.level = level;
         this.slice = slice;
-        this.blockUpdates = new RegionDeferredBlockUpdates(blockUpdateEntryBudget);
+        this.blockUpdates = new RegionDeferredBlockUpdates(slice, blockUpdateEntryBudget);
     }
 
     /**

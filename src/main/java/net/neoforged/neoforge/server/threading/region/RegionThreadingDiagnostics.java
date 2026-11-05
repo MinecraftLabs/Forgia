@@ -327,11 +327,13 @@ public record RegionThreadingDiagnostics(
      * <p>
      * {@code submissions} counts the tasks the pool accepted, {@code submitNanos} the wall time the submitting
      * threads spent handing them to the pool, and {@code wakeNanos} the wall time between a hand-off and the start
-     * of the task body for the tasks a submitter handed to an idle worker - the wake-up the pool controls.
-     * {@code idleWakeUps} counts those tasks; {@code wakeNanos / idleWakeUps} is the wake-up latency and a window
-     * without an idle hand-off reports zero for it. {@code spinWakeUps} and {@code parkWakeUps} split the
-     * wake-ups into the ones a spinning worker took and the ones a parked worker took, so their ratio is the
-     * spin-versus-park behaviour of the pool. {@code packedTasks} counts the worker tasks that hold several regions and
+     * of the task body for the tasks a submitter handed to an idle worker and that worker ran itself - the wake-up
+     * the pool controls. {@code idleWakeUps} counts those tasks; {@code wakeNanos / idleWakeUps} is the wake-up
+     * latency and a window without an idle hand-off reports zero for it. {@code spinWakeUps} and {@code parkWakeUps} split the
+     * task starts into the ones a spinning worker took and the ones a parked worker took, so their ratio is the
+     * spin-versus-park behaviour of the pool. {@code steals} counts the tasks a worker took from the deque of
+     * another worker, i.e. the work stealing that balances a batch whose regions are not equally expensive.
+     * {@code packedTasks} counts the worker tasks that hold several regions and
      * {@code packedRegions} the regions they hold, so {@code packedRegions / packedTasks} is the regions per
      * packed task. {@code partialPackFallbacks} counts the packs that could not lease every region they needed,
      * released the ones they took and leased the affected regions one by one instead: a fallback is never a
@@ -345,6 +347,7 @@ public record RegionThreadingDiagnostics(
             long idleWakeUps,
             long spinWakeUps,
             long parkWakeUps,
+            long steals,
             long packedTasks,
             long packedRegions,
             long partialPackFallbacks,

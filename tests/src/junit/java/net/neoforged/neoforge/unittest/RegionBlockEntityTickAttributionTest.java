@@ -42,6 +42,14 @@ class RegionBlockEntityTickAttributionTest {
         RegionBlockEntityTickAttribution.recordFallback(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION, 5);
         RegionBlockEntityTickAttribution.recordGroup(1_000L, 1_000L, 6, 6);
         RegionBlockEntityTickAttribution.recordTicker(100L);
+        RegionBlockEntityTickAttribution.recordTickerAdmission(100L);
+        RegionBlockEntityTickAttribution.recordTickerReservation(100L);
+        RegionBlockEntityTickAttribution.recordTickerScope(100L);
+        RegionBlockEntityTickAttribution.recordTickerBody(100L);
+        RegionBlockEntityTickAttribution.recordDeferredRegistration(100L);
+        RegionBlockEntityTickAttribution.recordOwnershipScope(100L);
+        RegionBlockEntityTickAttribution.recordGroupPrepare(100L);
+        RegionBlockEntityTickAttribution.recordGroupEnd(100L);
         RegionBlockEntityTickAttribution.recordAwaitPoll();
         RegionBlockEntityTickAttribution.endSlice();
 
@@ -58,6 +66,11 @@ class RegionBlockEntityTickAttributionTest {
         assertEquals(0L, snapshot.awaitPolls());
         assertEquals(0L, snapshot.batchMakespanNanos());
         assertEquals(0L, snapshot.batchSpanNanos());
+        assertEquals(0L, snapshot.tickers().tickers());
+        assertEquals(0L, snapshot.tickers().admissionNanos());
+        assertEquals(0L, snapshot.tickers().bodyNanos());
+        assertEquals(0L, snapshot.tickers().deferredRegistrationNanos());
+        assertEquals(0L, snapshot.tickers().ownershipScopeNanos());
         assertEquals(0L, snapshot.fallbackTickers(RegionBlockEntityTickAttribution.FallbackReason.UNSAFE_REGION));
         assertEquals(0L, snapshot.handoffSteps().removalCount());
     }
@@ -192,6 +205,43 @@ class RegionBlockEntityTickAttributionTest {
         assertEquals(2L, snapshot.awaitPolls());
         // The wrapper of the group is what the group wall time has beyond the tickers' own tick.
         assertEquals(3_000L, snapshot.groups().nanos() - snapshot.groups().tickerNanos());
+    }
+
+    @Test
+    void tickerPartsAndGroupWrapperAccumulateSeparately() {
+        RegionBlockEntityTickAttribution.setEnabled(true);
+
+        // One group of two tickers: the group wall time is the ticker loop plus the setup, the ownership lease
+        // and the release of the group, and every part of the ticker loop is reported on its own.
+        RegionBlockEntityTickAttribution.recordGroupPrepare(500L);
+        RegionBlockEntityTickAttribution.recordOwnershipScope(300L);
+        RegionBlockEntityTickAttribution.recordTickerScope(40L);
+        RegionBlockEntityTickAttribution.recordTickerAdmission(10L);
+        RegionBlockEntityTickAttribution.recordTickerReservation(20L);
+        RegionBlockEntityTickAttribution.recordTickerBody(2_000L);
+        RegionBlockEntityTickAttribution.recordTicker(2_070L);
+        RegionBlockEntityTickAttribution.recordTickerScope(40L);
+        RegionBlockEntityTickAttribution.recordTickerAdmission(10L);
+        RegionBlockEntityTickAttribution.recordTickerReservation(20L);
+        RegionBlockEntityTickAttribution.recordTickerBody(3_000L);
+        RegionBlockEntityTickAttribution.recordTicker(3_070L);
+        RegionBlockEntityTickAttribution.recordDeferredRegistration(120L);
+        RegionBlockEntityTickAttribution.recordDeferredRegistration(80L);
+        RegionBlockEntityTickAttribution.recordOwnershipScope(300L);
+        RegionBlockEntityTickAttribution.recordGroupEnd(100L);
+        RegionBlockEntityTickAttribution.recordGroup(5_500L, 5_000L, 2, 2);
+
+        final RegionBlockEntityTickAttribution.TickerAttribution tickers = RegionBlockEntityTickAttribution.snapshot().tickers();
+        assertEquals(2L, tickers.tickers());
+        assertEquals(20L, tickers.admissionNanos());
+        assertEquals(40L, tickers.reservationNanos());
+        assertEquals(80L, tickers.scopeNanos());
+        assertEquals(5_000L, tickers.bodyNanos());
+        assertEquals(200L, tickers.deferredRegistrationNanos());
+        assertEquals(2L, tickers.deferredRegistrations());
+        assertEquals(600L, tickers.ownershipScopeNanos());
+        assertEquals(500L, tickers.groupPrepareNanos());
+        assertEquals(100L, tickers.groupEndNanos());
     }
 
     @Test
