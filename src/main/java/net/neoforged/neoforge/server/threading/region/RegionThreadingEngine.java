@@ -42,6 +42,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.projectile.FishingHook;
 import net.minecraft.world.level.ChunkPos;
@@ -1001,6 +1002,23 @@ public final class RegionThreadingEngine implements RegionThreading {
      */
     public void serverThreadOnlyEntity(Class<? extends Entity> type, String reason) {
         this.entityTickPolicy.serverThreadOnly(type, reason);
+    }
+
+    /**
+     * Declares that the tick of the registry type {@code type} may only run on the server thread.
+     * <p>
+     * This is the declaration-file hook of the mod compatibility layer: a declaration file names a registry
+     * type id, which resolves to exactly this object, so the file needs no class. The declaration covers
+     * exactly the named registry type - a modded subtype is a registry type of its own and keeps the worker
+     * unless it is declared too - while {@link #serverThreadOnlyEntity(Class, String)} covers a class and its
+     * subclasses. Like the class declaration it only ever moves work back to the server thread, and its reason
+     * is the key of the per reason counter of the status output.
+     *
+     * @param type   the declared entity registry type
+     * @param reason the short reason token of the declaration
+     */
+    public void serverThreadOnlyEntityType(EntityType<?> type, String reason) {
+        this.entityTickPolicy.serverThreadOnlyType(type, reason);
     }
 
     /**

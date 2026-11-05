@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -12,6 +13,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -29,7 +31,14 @@ import org.jetbrains.annotations.Nullable;
  * a server-thread tick readable instead of only its total. This registry is the hook the mod compatibility
  * layer uses: a mod packs its own declaration through
  * {@link RegionThreadingEngine#serverThreadOnlyEntity(Class, String)} instead of being refused a worker
- * wholesale.
+ * wholesale, and a declaration file (see {@code RegionThreadingDeclarations}) packs a registry type through
+ * {@link RegionThreadingEngine#serverThreadOnlyEntityType(EntityType, String)}.
+ * <p>
+ * A class declaration and a type declaration have different scopes on purpose. The class declaration of the
+ * API covers the declared class and every subclass of it, because a mod's subclass of a declared vanilla
+ * type is written against the same guard sites. A type declaration names one registry type - the only scope a
+ * declaration file can name - and covers exactly that type; a modded subtype is a registry type of its own and
+ * is pinned by its own declaration.
  * <p>
  * The vanilla POI declarations are gone: the level's {@code PoiManager} is partitioned per region
  * ({@code enableRegionThreadingPoi}), so a villager, iron golem, raider, bee, zombie or fox tick reads
@@ -43,6 +52,15 @@ import org.jetbrains.annotations.Nullable;
 @ApiStatus.Internal
 final class RegionEntityTickPolicy {
     private final Map<Class<? extends Entity>, String> declarations = new ConcurrentHashMap<>();
+    /**
+     * Declarations by registry type, which is what a declaration file can name.
+     * <p>
+     * The map is empty in every configuration that declares no type. A tick reads this volatile field once and
+     * skips the type check when the map is empty, so a server without a declaration file keeps the class
+     * lookup it always had. A declaration replaces the map instead of mutating it, so a tick never observes a
+     * half-applied set.
+     */
+    private volatile Map<EntityType<?>, String> typeDeclarations = Map.of();
     /**
      * Resolved answers per runtime class, tagged with the declaration version they were computed at.
      * <p>
@@ -77,6 +95,28 @@ final class RegionEntityTickPolicy {
     }
 
     /**
+     * Declares that the tick of the registry type {@code type} may only run on the server thread.
+     * <p>
+     * The declaration covers exactly the registry type it names: an entity of a subtype has its own registry
+     * type, so the class-hierarchy coverage of {@link #serverThreadOnly(Class, String)} is not extended by this
+     * declaration. A later declaration of the same type replaces the reason of the earlier one.
+     *
+     * @param type   the declared entity registry type
+     * @param reason the short reason token of the declaration; it is the key of the per reason counter and
+     *               the token the status output reports
+     */
+    void serverThreadOnlyType(EntityType<?> type, String reason) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(reason, "reason");
+        if (reason.isBlank()) {
+            throw new IllegalArgumentException("reason must not be blank");
+        }
+        final Map<EntityType<?>, String> updated = new HashMap<>(this.typeDeclarations);
+        updated.put(type, reason);
+        this.typeDeclarations = Map.copyOf(updated);
+    }
+
+    /**
      * {@return the reason of the declaration that covers {@code entity} or one of its passengers, or
      * {@code null} when no declaration covers the tick of the entity}
      * <p>
@@ -87,6 +127,10 @@ final class RegionEntityTickPolicy {
      */
     @Nullable
     String reasonFor(Entity entity) {
+        final String typeReason = this.typeReasonFor(entity);
+        if (typeReason != null) {
+            return typeReason;
+        }
         final String reason = this.reasonForType(entity.getClass());
         if (reason != null) {
             return reason;
@@ -98,6 +142,23 @@ final class RegionEntityTickPolicy {
             }
         }
         return null;
+    }
+
+    /**
+     * {@return the reason of the declaration of the registry type of {@code entity}}
+     * <p>
+     * A type declaration cannot be memoized per class, because two registry types can share one class, so the
+     * type map is read once per decision. The empty map of a server without a declaration file is the only
+     * cost of the check: one volatile read and an empty test.
+     */
+    @Nullable
+    private String typeReasonFor(Entity entity) {
+        final Map<EntityType<?>, String> byType = this.typeDeclarations;
+        if (byType.isEmpty()) {
+            return null;
+        }
+        final EntityType<?> type = entity.getType();
+        return type == null ? null : byType.get(type);
     }
 
     /**

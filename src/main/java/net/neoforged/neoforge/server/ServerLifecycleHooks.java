@@ -9,8 +9,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -51,11 +53,15 @@ import net.neoforged.neoforge.mixins.MappedRegistryAccessor;
 import net.neoforged.neoforge.registries.NeoForgeRegistries;
 import net.neoforged.neoforge.registries.NeoForgeRegistries.Keys;
 import net.neoforged.neoforge.server.permission.PermissionAPI;
+import net.neoforged.neoforge.server.threading.RegionThreadingCompatReport;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
+import net.neoforged.neoforge.server.threading.RegionThreadingConflicts;
+import net.neoforged.neoforge.server.threading.RegionThreadingDeclarations;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
+import net.neoforged.neoforge.server.threading.region.RegionTickCompatibility;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.Marker;
@@ -100,32 +106,94 @@ public class ServerLifecycleHooks {
         // on the dedi server we need to force the stuff to setup properly
         LogicalSidedProvider.setServer(() -> server);
         ConfigTracker.INSTANCE.loadConfigs(ModConfig.Type.SERVER, FMLPaths.CONFIGDIR.get(), getServerConfigPath(server));
-        if (NeoForgeConfig.SERVER.enableRegionThreadingBridge.get()) {
-            if (RegionThreadingCompatibility.canInstallBridge()) {
-                // The layout carries the fixed region edge length, so the engine, its regionizer and the
-                // physical section partitions of every level created afterwards share one region size.
-                final RegionLayout layout = RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get());
-                // Entity worker ticks need region-owned entity storage: the ticks of the leased entities mutate
-                // the level's entity storage, and only the region-owned guards let a worker run them while the
-                // server thread keeps the shared vanilla maps. A dynamic layout cannot partition the storage, so
-                // the entity slice stays on the server thread there.
-                final RegionEntityStorageMode entityStorageMode = RegionEntityStorageMode.forConfiguration(
-                        NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), layout);
-                final RegionThreadingEngine engine = new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(), NeoForgeConfig.SERVER.enableRegionThreadingPersistentWorkers.get(), NeoForgeConfig.SERVER.enableRegionThreadingPackedRegionLeases.get(), layout, entityStorageMode);
-                // The engine ships the vanilla declarations of the types whose own tick reaches a mutation the
-                // lease does not own (a splitting slime, a discarding fishing hook); every other type ticks on
-                // its region worker. The vanilla POI declarations are gone because the level's POI storage is
-                // partitioned per region (enableRegionThreadingPoi), so a villager, golem, raider, bee, zombie
-                // or fox tick reaches region-owned sections instead of one shared manager.
-                RegionThreadingManager.install(engine);
-            } else {
-                LOGGER.warn(SERVERHOOKS, "Region threading bridge is enabled but blocked by compatibility policy {}; unsupported mods: {}", RegionThreadingCompatibility.defaultSupport(), RegionThreadingCompatibility.unsupportedMods());
-            }
-        } else if (!RegionThreadingCompatibility.requiredMods().isEmpty()) {
-            LOGGER.warn(SERVERHOOKS, "Region threading bridge is disabled but required by mods: {}", RegionThreadingCompatibility.requiredMods());
-        }
+        installRegionThreading();
         runModifiers(server);
         NeoForge.EVENT_BUS.post(new ServerAboutToStartEvent(server));
+    }
+
+    /**
+     * Installs the region threading engine the configuration asks for, as far as the compatibility layer allows
+     * it, applies the declaration files and records the verdict for the diagnostics and for
+     * {@code /neoforge regionthreading compat}.
+     * <p>
+     * The order is the contract: the known-conflict table decides which slices exist, the engine is installed
+     * with the remaining ones, and only then are the declaration files read and applied, before any level is
+     * created and therefore before the first tick. Both halves are fail-closed: a conflict removes a slice and
+     * a declaration only ever moves a type back to the server thread.
+     */
+    private static void installRegionThreading() {
+        final boolean requested = NeoForgeConfig.SERVER.enableRegionThreadingBridge.get();
+        final RegionThreadingConflicts.Plan compatibility = RegionThreadingConflicts.plan(
+                requested,
+                NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(),
+                NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get());
+        final List<String> blockedBy = new ArrayList<>();
+        RegionThreadingEngine installed = null;
+        if (!compatibility.installEngine()) {
+            if (requested) {
+                // A known conflict makes every worker slice unsafe, so refusing to install the engine is the
+                // only fail-closed answer; the server starts on the vanilla server-thread tick.
+                logCompatibility(compatibility, false);
+                blockedBy.add("known conflicts: " + compatibility.conflicts().stream()
+                        .map(RegionThreadingConflicts.Conflict::modId).toList());
+            }
+        } else if (RegionThreadingCompatibility.canInstallBridge()) {
+            // The layout carries the fixed region edge length, so the engine, its regionizer and the
+            // physical section partitions of every level created afterwards share one region size.
+            final RegionLayout layout = RegionLayout.of(NeoForgeConfig.SERVER.regionThreadingMode.get(), NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get());
+            // Entity worker ticks need region-owned entity storage: the ticks of the leased entities mutate
+            // the level's entity storage, and only the region-owned guards let a worker run them while the
+            // server thread keeps the shared vanilla maps. A dynamic layout cannot partition the storage, so
+            // the entity slice stays on the server thread there.
+            final RegionEntityStorageMode entityStorageMode = RegionEntityStorageMode.forConfiguration(
+                    compatibility.entityTickWorkers(), layout);
+            final RegionThreadingEngine engine = new RegionThreadingEngine(NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get(), NeoForgeConfig.SERVER.enableRegionThreadingWorkers.get(), NeoForgeConfig.SERVER.enableGlobalRegionThreadingWorker.get(), compatibility.entityTickWorkers(), NeoForgeConfig.SERVER.enableRegionThreadingBlockEntityTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingScheduledTicks.get(), NeoForgeConfig.SERVER.enableRegionThreadingRandomTicks.get(), compatibility.spawnWorkers(), NeoForgeConfig.SERVER.enableRegionThreadingPersistentWorkers.get(), NeoForgeConfig.SERVER.enableRegionThreadingPackedRegionLeases.get(), layout, entityStorageMode);
+            // The engine ships the vanilla declarations of the types whose own tick reaches a mutation the
+            // lease does not own (a splitting slime, a discarding fishing hook); every other type ticks on
+            // its region worker. The vanilla POI declarations are gone because the level's POI storage is
+            // partitioned per region (enableRegionThreadingPoi), so a villager, golem, raider, bee, zombie
+            // or fox tick reaches region-owned sections instead of one shared manager.
+            RegionThreadingManager.install(engine);
+            installed = engine;
+            logCompatibility(compatibility, true);
+        } else {
+            blockedBy.add("mod support policy: default=" + RegionThreadingCompatibility.defaultSupport()
+                    + ", unsupported mods=" + RegionThreadingCompatibility.unsupportedMods());
+            LOGGER.warn(SERVERHOOKS, "Region threading bridge is enabled but blocked by compatibility policy {}; unsupported mods: {}", RegionThreadingCompatibility.defaultSupport(), RegionThreadingCompatibility.unsupportedMods());
+        }
+        // The declarations are read whether or not an engine was installed: a block-entity declaration narrows
+        // the block-entity allowlist of the engine, and the report has to name what the files asked for even
+        // when the engine is off.
+        final RegionThreadingDeclarations.Report declarations = RegionThreadingDeclarations.load();
+        declarations.applyTo(installed);
+        if (!declarations.isEmpty()) {
+            LOGGER.info(SERVERHOOKS, "Region threading declarations in effect: {}{}", declarations.declarationCount(),
+                    declarations.ignored().isEmpty() ? "" : " (" + declarations.ignored().size() + " ignored)");
+        }
+        for (final String ignored : declarations.ignored()) {
+            // A file a mod declared but did not ship, or an entry a pack author mistyped, is a configuration
+            // error of that declaration and is reported once per server start instead of being swallowed.
+            LOGGER.warn(SERVERHOOKS, "Region threading declaration ignored: {}", ignored);
+        }
+        RegionThreadingCompatReport.record(requested, installed != null,
+                blockedBy.isEmpty() ? null : String.join("; ", blockedBy), compatibility, declarations);
+        if (!requested && !RegionThreadingCompatibility.requiredMods().isEmpty()) {
+            LOGGER.warn(SERVERHOOKS, "Region threading bridge is disabled but required by mods: {}", RegionThreadingCompatibility.requiredMods());
+        }
+    }
+
+    /**
+     * Logs the verdict of the known-conflict table once per server start, at error level when the engine is
+     * not installed and warning level when a slice is left off.
+     */
+    private static void logCompatibility(final RegionThreadingConflicts.Plan compatibility, boolean engineInstalled) {
+        for (final String line : compatibility.lines()) {
+            if (engineInstalled) {
+                LOGGER.warn(SERVERHOOKS, line);
+            } else {
+                LOGGER.error(SERVERHOOKS, line);
+            }
+        }
     }
 
     public static void handleServerStarting(final MinecraftServer server) {
@@ -154,6 +222,10 @@ public class ServerLifecycleHooks {
     public static void handleServerStopped(final MinecraftServer server) {
         NeoForge.EVENT_BUS.post(new ServerStoppedEvent(server));
         RegionThreadingManager.clear();
+        // The declarations of a stopped server must not be reported, and a static block-entity declaration must
+        // not outlive the server it belongs to; the next start applies its own set instead.
+        RegionThreadingCompatReport.reset();
+        RegionTickCompatibility.declareServerThreadOnlyTypes(Map.of());
         currentServer = null;
         LogicalSidedProvider.setServer(null);
         CountDownLatch latch = exitLatch;

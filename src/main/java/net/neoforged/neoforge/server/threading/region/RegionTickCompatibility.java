@@ -5,6 +5,7 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.Map;
 import java.util.Set;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
@@ -14,7 +15,9 @@ import org.jetbrains.annotations.Nullable;
  * storage protocol.
  * <p>
  * The list is an allowlist, not a denylist: an unknown or modded block entity type always stays on the
- * server thread. A type is only allowed on a worker when its server tick
+ * server thread. A declaration can only narrow it further - {@link #declareServerThreadOnlyTypes(Map)} removes
+ * an entry and can never add one, so a pack that pins a type to the server thread costs throughput and never
+ * safety. A type is only allowed on a worker when its server tick
  * <ul>
  * <li>only reaches entity storage through the region-scoped query of the lease and only mutates an entity
  * that lease owns, with every server-owned effect deferred to the batch barrier,</li>
@@ -68,8 +71,42 @@ public final class RegionTickCompatibility {
             "minecraft:blast_furnace",
             "minecraft:hopper",
             "minecraft:smoker");
+    /**
+     * Types a declaration file, a mod or a pack author pinned to the server thread, by type id with the
+     * reason of the declaration.
+     * <p>
+     * The map only narrows the allowlist above: a declared type is removed from it, and a type that is not on
+     * the allowlist cannot be added by a declaration. It is empty until a declaration is applied, and the
+     * admission reads it once per ticker of a rebuilt chunk snapshot, so a server without a declaration pays
+     * one empty-map test per collected ticker and nothing per tick.
+     * <p>
+     * The declaration is applied at server start, before a level loads its chunks, because the admission of a
+     * chunk's tickers is cached until the chunk's ticker set changes
+     * ({@link RegionBlockEntityTickChunkCache}); a declaration that arrives later would only be honoured by
+     * chunks that are rebuilt. Nothing in the engine applies one later, and this comment is what keeps a
+     * future caller from believing it would.
+     */
+    private static volatile Map<String, String> serverThreadOnlyTypes = Map.of();
 
     private RegionTickCompatibility() {}
+
+    /**
+     * Replaces the declared server-thread-only block-entity types.
+     * <p>
+     * This is the hook the declaration files of {@code RegionThreadingDeclarations} call; the programmatic API
+     * stays the allowlist itself, which a mod can only narrow through this call. Applying an empty map clears
+     * the declarations of an earlier server start.
+     *
+     * @param declarations the declared type ids with their reason, keyed by the type id the ticker reports
+     */
+    public static void declareServerThreadOnlyTypes(Map<String, String> declarations) {
+        serverThreadOnlyTypes = Map.copyOf(declarations);
+    }
+
+    /** {@return the declared server-thread-only block-entity types with their reason} */
+    public static Map<String, String> serverThreadOnlyTypes() {
+        return serverThreadOnlyTypes;
+    }
 
     /**
      * {@return true when a block entity of {@code type} may tick on a region worker}
@@ -84,9 +121,13 @@ public final class RegionTickCompatibility {
     /**
      * {@return true when the server tick of {@code type} starts neighbor updates and therefore may only
      * run when the chunks around its position belong to the same region}
+     * <p>
+     * A declared server-thread-only type is never admitted, whatever the position: the declaration says the
+     * tick is not safe on a worker at all, so the interior-chunk rule cannot rescue it.
      */
     public static boolean requiresInteriorRegion(@Nullable String type) {
-        return type != null && REGION_SAFE_INTERIOR_BLOCK_ENTITY_TYPES.contains(type);
+        return type != null && REGION_SAFE_INTERIOR_BLOCK_ENTITY_TYPES.contains(type)
+                && !serverThreadOnlyTypes.containsKey(type);
     }
 
     /**

@@ -12,6 +12,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.neoforged.neoforge.common.NeoForgeConfig;
+import net.neoforged.neoforge.server.threading.RegionThreadingCompatReport;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
@@ -37,10 +38,21 @@ final class RegionThreadingCommand {
                             () -> sendNotInstalled(source));
                     return 1;
                 }))
+                .then(Commands.literal("compat").executes(context -> sendCompatibility(context.getSource())))
                 .then(Commands.literal("regions")
                         .executes(context -> sendRegionListing(context.getSource(), DEFAULT_LISTED_REGIONS))
                         .then(Commands.argument("count", IntegerArgumentType.integer(1, MAX_LISTED_REGIONS))
                                 .executes(context -> sendRegionListing(context.getSource(), IntegerArgumentType.getInteger(context, "count")))));
+    }
+
+    /**
+     * Sends the compatibility verdict of the running server: the declarations in effect, the detected known
+     * conflicts, the action each of them took and the slices that were therefore left off, followed by the
+     * limits of the detection.
+     */
+    private static int sendCompatibility(CommandSourceStack source) {
+        RegionThreadingCompatReport.lines().forEach(line -> source.sendSuccess(() -> Component.literal(line), false));
+        return 1;
     }
 
     /**
@@ -146,6 +158,9 @@ final class RegionThreadingCommand {
                 + ", defaultModSupport=" + RegionThreadingCompatibility.defaultSupport()
                 + ", unsupportedMods=" + RegionThreadingCompatibility.unsupportedMods().size()
                 + ", requiredMods=" + RegionThreadingCompatibility.requiredMods().size()
+                + ", compatDeclarations=" + RegionThreadingCompatReport.declarationCount()
+                + ", compatConflicts=" + RegionThreadingCompatReport.conflictCount()
+                + ", compatLeftOffSlices=" + RegionThreadingCompatReport.state().plan().leftOffSlices()
                 + ", globalTicks=" + diagnostics.globalTickCount()
                 + ", globalLastTickNs=" + diagnostics.globalLastTickDurationNanos()
                 + ", regionTicks=" + diagnostics.totalRegionTickCount()
@@ -285,6 +300,9 @@ final class RegionThreadingCommand {
                 + ", defaultModSupport=" + RegionThreadingCompatibility.defaultSupport()
                 + ", unsupportedMods=" + RegionThreadingCompatibility.unsupportedMods().size()
                 + ", requiredMods=" + RegionThreadingCompatibility.requiredMods().size()
+                + ", compatDeclarations=" + RegionThreadingCompatReport.declarationCount()
+                + ", compatConflicts=" + RegionThreadingCompatReport.conflictCount()
+                + ", compatLeftOffSlices=" + RegionThreadingCompatReport.state().plan().leftOffSlices()
                 + ", configuredWorkerThreads=" + NeoForgeConfig.SERVER.regionThreadingWorkerThreads.get()
                 + ", configuredRegionPolicy=" + NeoForgeConfig.SERVER.regionThreadingMode.get()
                 + ", configuredRegionChunkSize=" + NeoForgeConfig.SERVER.regionThreadingFixedRegionChunks.get()), false);
