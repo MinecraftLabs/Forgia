@@ -1,52 +1,67 @@
-# Mod pack compatibility matrix
+# Modpack test tools
 
-Runs the installed server on a **selected set of mods** so compatibility can be classified without booting the
-whole pack every time. This is a test harness, not part of the loader.
+These tools select jars in an installed server copy. They do not add a loader `mods-list` option.
+A successful boot is evidence only for that selected group and build, not for individual mods in all combinations.
+Missing dependencies, timeouts and disabled worker slices are not compatibility passes.
 
-## Why not a loader switch
+## Load testing
 
-FML has no "load only these mods" option. The safe equivalent is an overlay run directory: everything in the
-pack except `mods/` is a symlink, and `mods/` holds hardlinks to the jars a group names. Nothing is copied,
-nothing in the pack is modified, no loader code is patched, and each run is independent.
-
-## Pieces
-
-| File | What it does |
-|---|---|
-| `scan.py` | Reads every jar's `neoforge.mods.toml` (including jar-in-jar) and writes `mods.json` with each mod id, version, jar and mandatory dependencies. Use it to reason about dependency closures. |
-| `run_group.sh` | Builds the overlay run directory for one jar list, writes a tiny flat-world `server.properties`, starts the server, and classifies the outcome: `OK` (reached `Done (`), `MIXIN` (critical injection failure, with the mod), `DEPS` (missing mandatory dependency), `LOAD` (mod failed to load, `NoSuchMethodError`, `NoClassDefFoundError`), `CRASH` otherwise. |
-| `bisect_mods.py` | Adaptive bisection: run the whole set; if it reaches `Done` every jar is compatible, otherwise split and test both halves, recursively. Finds k incompatible jars in about k·log₂(n) runs instead of n. Results in `results.csv`. |
-
-## Usage
+`run_loadtest.sh` delegates to `loadtest.py` and runs **one server at a time**. Use JDK 21 explicitly;
+changing the Java version or the installed loader changes the experiment. The result records both.
 
 ```bash
-# classify the whole pack (2 concurrent runs, 3 minutes per run)
-python3 tools/modpack-matrix/bisect_mods.py /home/yc/Minecraft/SkyExplorer-forgia --parallel 2 --timeout 180
+# A list contains exact jar basenames, including spaces and Unicode, one per line.
+# Use a prepared list with all dependencies. Unknown and duplicate filenames are fatal.
+tools/modpack-matrix/run_loadtest.sh /path/to/installed-pack /path/to/mods-list.txt smoke-001 1 30
 
-# one specific group
-printf 'Quark-4.1-482.jar\n' > /tmp/group.txt
-tools/modpack-matrix/run_group.sh /home/yc/Minecraft/SkyExplorer-forgia /tmp/group.txt quark-alone
+# After the smoke fixture is valid, measure 30 minutes, sampling automatically every five minutes.
+tools/modpack-matrix/run_loadtest.sh /path/to/installed-pack /path/to/mods-list.txt load-001 30 300
 ```
 
-Each run keeps its log at `/tmp/modpack-matrix/runs/<name>.log` and its overlay directory at
-`/tmp/modpack-matrix/runs/<name>/`, so a failure can be inspected (or re-run with one more jar) without
-rebuilding anything.
+Options after the positional arguments include `--java /path/to/java`, `--runs /disk/runs`,
+`--boot-timeout 360`, and `--warmup 30`. The default run root is the repository's sibling
+`modpack-matrix-runs` directory, on disk rather than a small `/tmp` tmpfs. Existing run names are refused.
+Do not install a new loader or modify shared library files during a run.
 
-## Reading the results
+Each instance has private copies of its mutable resources: configuration, KubeJS scripts, mods, world,
+logs and caches. Only the installed libraries are shared. The test never writes `server.properties` or
+world/config files through links into the source pack. The copied EULA file must already permit startup.
+Both game and RCON ports bind to loopback; RCON uses an ephemeral port and a per-run password.
 
-* `OK` - the group reached `Done`, so every jar in it starts under Forgia. Bisection does not re-test them.
-* `MIXIN` - a mod's mixin could not be applied, usually because Forgia changed the shape of a vanilla call.
-  The reason names the callback and the mod.
-* `DEPS` - the group is missing a mandatory dependency; run it again with the provider included.
-* `LOAD` - a mod threw while loading (missing method, missing class). The reason names it.
+The fixture uses 81 generated chunks, nine fenced platforms above the terrain, 45 tagged mobs including
+villagers, crops, container/hopper/furnace lines, and a comparator reading a chest across a region border.
+A test-only KubeJS command installs force-ticking tickets and a fake player to exercise player-dependent
+chunk/spawn gates. This is not a network client or a multiplayer test. Only the isolated test directory
+receives this script.
 
-A group that fails for `DEPS` is not evidence about compatibility, so the driver reports it as a failure and
-bisection will usually end up at single jars; read the reason column before drawing conclusions.
+Commands have to acknowledge success. The runner waits for all fixture chunks before construction, verifies
+mob/container counts and total cobblestone, then starts the measured window. It reads all RCON response
+packets, including nested per-slice failure counters. Missing values are errors, not zeros. A PASS needs
+advancing entity, block-entity, chunk and spawn worker counters, no safety counter failures, item conservation
+and a clean stop. Other engine fallbacks are retained in the report. Failure paths stop the exact child
+process, record a nonzero outcome and preserve the world and logs. Setup and shutdown are outside the
+measurement duration.
 
-## Caveats
+Artifacts in each run directory:
 
-* Runs share the CPU and the heap budget; keep `--parallel` at 2 on a 4-core/9 GiB host.
-* A run that reaches `Done` proves loading and the first tick, not gameplay. Deeper behaviour is what the
-  region threading GameTests and the production soak cover.
-* The harness needs the installer to have been applied to the pack with the Forgia loader, and the version
-  directory in `tool-java.sh` (`libraries/net/neoforged/neoforge/<version>/unix_args.txt`) has to match.
+- `result.json`: verdict, error, build identity, coverage and shutdown outcome.
+- `commands.jsonl`: complete command responses; `diagnostics.raw.txt`: complete latest status response.
+- `samples.jsonl` / `samples.csv`: actual MSPT, process RSS (not JVM heap), fixture checks and worker counters.
+- `server.log`, the original `mods-list.txt`, and the retained world.
+
+Tests for RCON framing, missing input, TOML placement and diagnostic parsing:
+
+```bash
+python3 -m unittest discover -s tools/modpack-matrix -p test_loadtest.py
+```
+
+## Startup groups and bisection
+
+`run_group.sh`, `scan.py` and `bisect_mods.py` are the earlier startup-only tools. They retain logs and
+classify `Done`, dependency and injection errors, but the scanner's dependency closure and group isolation
+need further work before broad automated classification. In particular, forcing Connector/FFAPI into every
+group makes a common infrastructure failure appear in many unrelated tests. A failing group does not prove
+that each contained jar is incompatible, and passing halves do not rule out an interaction in their union.
+
+Use the load runner above for measurements. Do not interpret the older `OK` startup result as a gameplay
+compatibility verdict, a worker-execution check or a performance comparison.
