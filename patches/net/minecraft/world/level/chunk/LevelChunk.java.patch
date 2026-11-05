@@ -225,22 +225,37 @@
          }
      }
  
-@@ -326,7 +_,24 @@
+@@ -324,9 +_,39 @@
+         return this.getBlockEntity(p_62912_, LevelChunk.EntityCreationType.CHECK);
+     }
  
++    /**
++     * Neo: answers a block-entity lookup issued by a region worker for a chunk of another region.
++     * <p>
++     * It lives in its own method so that {@link #getBlockEntity(BlockPos, LevelChunk.EntityCreationType)}
++     * keeps the instruction neighbourhood vanilla has: mods inject there with instruction-level offsets, and a
++     * foreign branch inlined into that method moved the anchors they rely on. The behaviour is unchanged - the
++     * lookup returns the live block entity of the chunk or {@code null}, and never promotes pending NBT,
++     * creates one, or removes a stale entry, because a foreign worker must not mutate this chunk.
++     */
++    @Nullable
++    private BlockEntity foreignBlockEntityOrNull(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
++        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, p_62868_)) {
++            return null;
++        }
++        BlockEntity existing = this.blockEntities.get(p_62868_);
++        if ((existing != null && existing.isRemoved()) || this.pendingBlockEntities.containsKey(p_62868_)
++                || (existing == null && p_62869_ == LevelChunk.EntityCreationType.IMMEDIATE)) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this);
++            return null;
++        }
++        return existing;
++    }
++
      @Nullable
      public BlockEntity getBlockEntity(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
 +        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
-+            if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, p_62868_)) {
-+                return null;
-+            }
-+            BlockEntity existing = this.blockEntities.get(p_62868_);
-+            // A foreign lookup must not promote pending NBT or remove an entry from this chunk.
-+            if ((existing != null && existing.isRemoved()) || this.pendingBlockEntities.containsKey(p_62868_)
-+                    || (existing == null && p_62869_ == LevelChunk.EntityCreationType.IMMEDIATE)) {
-+                net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this);
-+                return null;
-+            }
-+            return existing;
++            return this.foreignBlockEntityOrNull(p_62868_, p_62869_);
 +        }
          BlockEntity blockentity = this.blockEntities.get(p_62868_);
 +        if (blockentity != null && blockentity.isRemoved()) {
@@ -277,7 +292,7 @@
          }
      }
  
-@@ -368,42 +_,61 @@
+@@ -368,42 +_,66 @@
      }
  
      boolean isTicking(BlockPos p_156411_) {
@@ -354,10 +369,15 @@
 +
 +                p_156374_.setLevel(this.level);
 +                p_156374_.clearRemoved();
++                // Neo: the light of a replaced block entity is cleared before the map write, so the instructions
++                // after Map.put stay exactly the ones vanilla has (mods inject there with instruction offsets).
++                BlockEntity previousBlockEntity = this.blockEntities.get(blockpos);
++                if (previousBlockEntity != null && previousBlockEntity != p_156374_) {
++                    auxLightManager.removeLightAt(blockpos);
++                }
 +                BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
 +                if (blockentity != null && blockentity != p_156374_) {
 +                    blockentity.setRemoved();
-+                    auxLightManager.removeLightAt(blockpos);
 +                }
 +            }
 +        } finally {

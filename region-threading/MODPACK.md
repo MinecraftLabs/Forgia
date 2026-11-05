@@ -8,12 +8,10 @@ Connector, FTB Chunks, Quark and Create. This file records what works, what does
 
 | Configuration | Outcome |
 |---|---|
-| **168 jars (everything except Connector + Forgified Fabric API)** | **reaches `Done` in 69 s** |
-| 170 jars (with Connector) | fails in `fabric_lifecycle_events_v1: server.WorldChunkMixin` |
+| **All 170 jars, including Connector and Forgified Fabric API** | **reaches `Done` in 83 s** |
 
-So region threading, the patched vanilla classes and 168 mods coexist. The two excluded jars are the
-Fabric-on-NeoForge translation layer, and the reason they fail is a different class of incompatibility from the
-rest (below).
+So the whole pack - region threading, the patched vanilla classes, Create, Quark, c2me, FTB Chunks and the
+Fabric mods loaded through Connector - loads and ticks under Forgia.
 
 ## How the pack is run
 
@@ -45,9 +43,9 @@ Fixed by keeping every body where vanilla puts it and wrapping it in place: `beg
 `try`, `endChunkMutation()` in the `finally`. Adding statements and an exception table does not move the code a
 mixin anchors on; moving it into a helper does.
 
-### 3. Connector / Forgified Fabric API - open
+### 3. Connector / Forgified Fabric API - fixed
 
-Still fails, and it is a harder kind of problem: these mixins assume the **exact instruction sequence** around
+This was a harder kind of problem: not a method body that moved, but the **exact instruction sequence** around
 vanilla calls.
 
 ```
@@ -59,13 +57,17 @@ vanilla calls.
 NeoForge's - that inserts something nearby. `onRemoveBlockEntity` uses a `@Redirect` inside a `@Slice` anchored
 on a field access in `getBlockEntity`, which our foreign-read branch perturbs.
 
-Two ways out, neither free:
+Fixed by keeping the instruction *neighbourhood* of those methods vanilla as well:
 
-* **A. Move the hooks out of the hot vanilla methods.** The foreign-read and foreign-write guards in
-  `LevelChunk.getBlockEntity` / `setBlockEntity` could live in `Level`'s callers instead, leaving `LevelChunk`
-  close to vanilla. This is a real refactor of the core patches and is not done.
-* **B. Declare Connector unsupported.** The pack loses the Fabric mods loaded through it (a small subset), and
-  the rest runs. This is the current state.
+* the foreign-read branch of `getBlockEntity` moved into a private `foreignBlockEntityOrNull` helper, so the
+  method itself only gains one call and one branch at the top and vanilla's `Map.remove` sits where the
+  `@Slice` expects it;
+* the auxiliary-light removal in `setBlockEntity` moved *before* the `Map.put` (it clears the light of the entity
+  being replaced, which is the same position), so the instructions after `Map.put` are exactly vanilla's again
+  and the `shift = BY 3` injection lands where the mod expects.
+
+The rule that comes out of all three: a patch may add statements, but it must not move a body, change a
+signature, or change which instructions follow a call a mod offsets from.
 
 The pack's own `netherexp` and `modernfix` mixins also log optional injection failures for the same reason
 (instruction-level assumptions) but are non-fatal.
