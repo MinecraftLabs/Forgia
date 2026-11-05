@@ -27,6 +27,9 @@ disabled, which is the vanilla code path.
 | Spawning | Region states partition the level counts; the level-wide cap is enforced with an atomic check-and-reserve |
 | Cross-region reads | Seqlock: never torn; a stale read re-runs the region that made it (the test fails with the check disabled) |
 | Production soak | 6 000 ticks on generated terrain with villagers, mobs, a hopper/furnace line, a farm, a border-crossing redstone clock and a moving fake player: 0 ownership violations, 0 tick failures, item conservation, redstone identical in 6 200/6 200 ticks |
+| Game events | Six sculk tests compare the full tick-by-tick trace against the inline run (power, comparator, calibrated filtering, two-region ties, a two-border radius, a shrieker summoning its warden); all fail with the replay short-circuited |
+| Save and crash | Save/reload compares 114 blocks, 13 block entities, 9 entity UUIDs, 10 POI records with tickets and the rebuilt region mapping; a hard kill mid-tick recovers in three directions (on to on, on to off, off to on) |
+| Players | Walking, a 1000-block teleport, a teleport during a batch, a nether round trip and two players swapping regions all keep a player in exactly one region |
 | Save and reload | A whole fixture world saved, unloaded and reloaded from disk: every block, block entity, entity UUID and position, POI record with its free-ticket count and region mapping equal, with region threading on and off and across the two configurations |
 | Crash recovery | Six runs in three pairs kill the JVM mid-tick and restart on the same world: the save point is intact, no duplicate UUID, no leaked ticket, no dangling deferral, 600 further ticks green |
 
@@ -229,12 +232,12 @@ per pair, of which 600 ticks at 20 TPS dominate.
 | A2b | Work-stealing dispatch (per-worker deque, steal half) and per-ticker wrapper attribution | planned — this is what makes A2 a win for every slice instead of a trade-off |
 | A3 | Continuous region ticking (tick clock instead of a per-tick barrier) | planned |
 | A4 | Dynamic region size (split/merge by load) | planned |
-| B1 | Cross-region game events (sculk vibration) | planned |
+| B1 | Cross-region game events (sculk vibration) | **done** (dbebf9803): per-column capture, same-tick replay on the target worker, 1650 events / 5657 deferred columns in the soak, none lost. Found and fixed that worker-posted events were silently dropped before |
 | B2 | Structure leases (piston multi-block moves, Create contraptions) | measured, not worth it (see above) |
-| B3 | Player regionization (teleport, portals, cross-dimension) | planned |
+| B3 | Player regionization (teleport, portals, cross-dimension) | **done** (f2f529272): explicit transitions by kind, exactly-one-region audit, ledger handover across dimensions, 6356 assertions in the soak with 0 failures |
 | B4 | Large randomized redstone soak | planned |
 | C1 | Save/load and crash recovery of regionized state | **done** |
-| C2 | Long-run soak (6+ hours, drift and leak detection) | planned |
+| C2 | Long-run soak (6+ hours, drift and leak detection) | planned - the 6000-tick soak is green but six hours is a different regime |
 | C3 | Multiplayer concurrency (players, view distance, tickets) | planned |
 | D1 | Mod compatibility declarations (policy registry, conflict detection) | planned |
 | D2 | 170-mod pack bring-up (bare → all mods off → all mods on → one at a time) | planned |
