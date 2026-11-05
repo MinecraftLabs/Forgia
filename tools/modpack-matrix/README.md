@@ -15,13 +15,13 @@ nothing in the pack is modified, no loader code is patched, and each run is inde
 |---|---|
 | `scan.py` | Reads every jar's `neoforge.mods.toml` (including jar-in-jar) and writes `mods.json` with each mod id, version, jar and mandatory dependencies. Use it to reason about dependency closures. |
 | `run_group.sh` | Builds the overlay run directory for one jar list, writes a tiny flat-world `server.properties`, starts the server, and classifies the outcome: `OK` (reached `Done (`), `MIXIN` (critical injection failure, with the mod), `DEPS` (missing mandatory dependency), `LOAD` (mod failed to load, `NoSuchMethodError`, `NoClassDefFoundError`), `CRASH` otherwise. |
-| `bisect.py` | Adaptive bisection: run the whole set; if it reaches `Done` every jar is compatible, otherwise split and test both halves, recursively. Finds k incompatible jars in about k·log₂(n) runs instead of n. Results in `results.csv`. |
+| `bisect_mods.py` | Adaptive bisection: run the whole set; if it reaches `Done` every jar is compatible, otherwise split and test both halves, recursively. Finds k incompatible jars in about k·log₂(n) runs instead of n. Results in `results.csv`. |
 
 ## Usage
 
 ```bash
 # classify the whole pack (2 concurrent runs, 3 minutes per run)
-python3 tools/modpack-matrix/bisect.py /home/yc/Minecraft/SkyExplorer-forgia --parallel 2 --timeout 180
+python3 tools/modpack-matrix/bisect_mods.py /home/yc/Minecraft/SkyExplorer-forgia --parallel 2 --timeout 180
 
 # one specific group
 printf 'Quark-4.1-482.jar\n' > /tmp/group.txt

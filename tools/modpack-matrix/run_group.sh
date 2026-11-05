@@ -60,12 +60,27 @@ printf 'eula=true\n' > "$RUNDIR/eula.txt"
 
 LOG="$RUNS/$NAME.log"
 START=$(date +%s)
-timeout "${GROUP_TIMEOUT:-180}" "$SCRIPT_DIR/tool-java.sh" "$RUNDIR" > "$LOG" 2>&1
-rc=$?
+"$SCRIPT_DIR/tool-java.sh" "$RUNDIR" > "$LOG" 2>&1 &
+PID=$!
+LIMIT=${GROUP_TIMEOUT:-180}
+OUTCOME=""
+while kill -0 "$PID" 2>/dev/null; do
+    if grep -q 'Done (' "$LOG" 2>/dev/null; then OUTCOME=done; break; fi
+    if grep -q 'InjectionError\|Missing or unsupported mandatory dependencies\|Failed to load mods\|NoSuchMethodError\|NoClassDefFoundError\|Exception in thread "main"' "$LOG" 2>/dev/null; then
+        OUTCOME=error; break
+    fi
+    if [ $(( $(date +%s) - START )) -ge "$LIMIT" ]; then OUTCOME=timeout; break; fi
+    sleep 1
+done
+# stop the server and its children; give it a moment to save nothing and exit
+kill -TERM "$PID" 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
+kill -KILL "$PID" 2>/dev/null
+wait "$PID" 2>/dev/null
 ELAPSED=$(( $(date +%s) - START ))
 
 STATUS=CRASH
-REASON="exit $rc"
+REASON="outcome ${OUTCOME:-unknown}"
 if grep -q 'Done (' "$LOG"; then
     STATUS=OK
     REASON="reached Done"
