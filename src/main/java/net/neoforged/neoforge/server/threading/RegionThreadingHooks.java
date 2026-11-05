@@ -11,6 +11,7 @@ import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
@@ -30,6 +31,7 @@ import net.neoforged.neoforge.server.threading.region.RegionChunkTickAttribution
 import net.neoforged.neoforge.server.threading.region.RegionChunkTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityOwnershipScope;
+import net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTransferResult;
@@ -37,6 +39,7 @@ import net.neoforged.neoforge.server.threading.region.RegionEntityTransferToken;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionMailbox;
 import net.neoforged.neoforge.server.threading.region.RegionOwnershipViolationHandler;
+import net.neoforged.neoforge.server.threading.region.RegionPlayerSnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionScopedEntityQuery;
 import net.neoforged.neoforge.server.threading.region.RegionSpawnAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionSpawnPlan;
@@ -412,11 +415,51 @@ public final class RegionThreadingHooks {
     }
 
     /**
-     * Rejects a legacy entity query before it runs a predicate, a consumer or returns a live reference.
+     * Rejects a legacy entity query of one operation before it runs a predicate, a consumer or returns a live
+     * reference.
+     * <p>
+     * The rejection is counted per query operation next to the aggregate rejection counter, so a crash report
+     * shows which entry point a worker reached and how often it happened before the guard refused it.
+     *
+     * @param operation the entry point a crash report has to name
+     * @param path      the operation the per-operation counters record the refusal under
      */
-    public static void rejectLegacyEntityQuery(String operation) {
+    public static void rejectLegacyEntityQuery(String operation, RegionEntityQueryCounters.Operation path) {
         RegionEntityOwnershipScope.recordRejectedQuery();
+        RegionEntityQueryCounters.record(path, RegionEntityQueryCounters.Path.REFUSED);
         RegionOwnershipViolationHandler.rejectNativeWorkerStorageAccess(operation);
+    }
+
+    /**
+     * {@return the players of {@code level} a native region worker may iterate, or {@code null} when the caller
+     * has to keep the level's live player list}
+     * <p>
+     * A player is an always-ticking entity that only the server thread ticks, so the level's player list is
+     * server-owned storage and a player lookup is a level-wide question a region cannot answer. The server
+     * thread therefore publishes an immutable snapshot of the list once per tick, at the head of the level
+     * tick, and a worker answers every player lookup - {@code getNearestPlayer}, {@code getPlayerByUUID},
+     * {@code getNearbyPlayers}, {@code hasNearbyAlivePlayer} - from it. The snapshot is at most one tick old:
+     * a player who joined, left or changed dimension after the publication is not in it.
+     * <p>
+     * The server thread, the client and every ordinary thread get {@code null} and keep the live list, which is
+     * the vanilla behaviour. A native worker never gets {@code null}: it gets the published list, or - when the
+     * level has no snapshot - the same {@link IllegalStateException} every other storage guard throws, counted
+     * as a refused player answer. Reading the live {@code ArrayList} would be exactly the server-owned storage
+     * access this bridge exists to keep away from a worker, so there is no fallback for it.
+     */
+    @Nullable
+    public static List<ServerPlayer> playersOfLevel(ServerLevel level) {
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return null;
+        }
+        final RegionPlayerSnapshots.Snapshot snapshot = RegionPlayerSnapshots.of(level);
+        if (snapshot == null) {
+            // The guard counts the refusal and throws; a worker never reaches the live list.
+            rejectLegacyEntityQuery("ServerLevel.players()", RegionEntityQueryCounters.Operation.PLAYERS);
+            return List.of();
+        }
+        RegionEntityQueryCounters.record(RegionEntityQueryCounters.Operation.PLAYERS, RegionEntityQueryCounters.Path.PUBLISHED);
+        return snapshot.players();
     }
 
     /**

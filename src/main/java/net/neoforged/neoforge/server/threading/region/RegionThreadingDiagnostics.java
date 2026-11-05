@@ -65,12 +65,23 @@ import java.util.Map;
  * decision: it only increments {@link #ownershipViolationCount()}.
  * <p>
  * The three query counters report the region-scoped entity query of a leased native worker. An allowed
- * query is one {@code Level.getEntities} call that ran against the lease instead of the legacy guard, a
+ * query is one entity query that ran against the lease instead of the legacy guard - a box query, a
+ * {@code getAll()}, a type-filtered lookup or a by-id/by-uuid lookup the region's index answered - a
  * truncated query is one allowed query whose box extended past the leased region and was clamped to it, and
- * a rejected query is one legacy query the storage guard refused on a native worker. A rejected query is
+ * a rejected query is one legacy query the storage guard refused on a native worker, including a player
+ * lookup of a level whose player snapshot is not published. A rejected query is
  * always counted with {@link #ownershipViolationCount()} as well, because the guard reports the operation and
  * throws. The counters make the clamp-and-count contract observable: a truncated query never silently loses
  * the entities outside the lease.
+ * <p>
+ * {@link #entityQueryPaths()} splits the same answers per entry point - {@code get(int)}, {@code get(UUID)},
+ * {@code getAll()}, the type-filtered lookup, the two box queries and the player lookups - into the four
+ * answers a worker can receive: local (the region's index or its section bucket), published (the per-tick
+ * player snapshot), truncated (a local answer that is not the whole level answer) and refused (no local or
+ * published answer was available, so the legacy guard refused the operation and threw). One call can
+ * count in two columns, e.g. a player-typed box query counts local for its region bucket and published for
+ * the players the snapshot adds. {@link #playerSnapshotsPublished()} counts the per-tick publications
+ * themselves, so a worker's one-tick-stale player view is observable next to the answers it produced.
  * <p>
  * {@link #regionChunkSize()} is the edge length in chunks of one region coordinate of the installed
  * layout. For a fixed policy it is the configured fixed region size, so the status output and every
@@ -219,6 +230,8 @@ public record RegionThreadingDiagnostics(
         long entityQueriesAllowedByLease,
         long entityQueriesTruncatedByLease,
         long entityQueriesRejected,
+        List<RegionEntityQueryCounters.OperationCounters> entityQueryPaths,
+        long playerSnapshotsPublished,
         long blockEntityTicksOnWorkers,
         long skippedBlockEntityTicks,
         long fallbackBlockEntityTicks,

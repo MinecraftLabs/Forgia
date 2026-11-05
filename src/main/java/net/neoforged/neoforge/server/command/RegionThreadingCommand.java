@@ -16,6 +16,7 @@ import net.neoforged.neoforge.server.threading.RegionThreadingCompatReport;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters;
 import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -220,6 +221,11 @@ final class RegionThreadingCommand {
         // A sixth independent line for the player region transitions, so the five lines above keep their shape
         // for scripts that match them.
         source.sendSuccess(() -> Component.literal("Region players: " + diagnostics.playerRegions()), false);
+        // A seventh independent line for the per-operation entity query answers of a native region worker, so
+        // the six lines above keep their shape for scripts that match them. The line renders the record the
+        // diagnostics carry instead of re-reading the counters, so the report and the line cannot disagree.
+        source.sendSuccess(() -> Component.literal(RegionEntityQueryCounters.summaryLine(diagnostics.entityQueryPaths())
+                + " playerSnapshots=" + diagnostics.playerSnapshotsPublished()), false);
     }
 
     /**

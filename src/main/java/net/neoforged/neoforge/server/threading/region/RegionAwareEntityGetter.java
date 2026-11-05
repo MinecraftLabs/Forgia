@@ -24,25 +24,30 @@ import org.jetbrains.annotations.Nullable;
  * Entity getter of a {@link ServerLevel} that keeps the vanilla section/index storage owned by the
  * server thread.
  * <p>
- * The vanilla storage is a set of single-threaded maps. A native region worker that called
- * {@code getEntities().get(uuid)} or iterated {@code getAll()} would read those maps while the server
- * thread mutated them, and even a completed server-thread handoff still returns live entity references
- * and runs caller predicates/consumers. Production therefore rejects every legacy query issued from a
- * native worker before its predicate, consumer or result escapes.
+ * The vanilla storage is a set of single-threaded maps. A native region worker that read them directly would
+ * race the server thread and, for the consumer shapes, run a caller callback against live storage. Every
+ * operation of this getter is therefore answered from what the worker may read - the region it leases and the
+ * per-tick player snapshot the server thread publishes - before this class reaches the delegate:
+ * <ul>
+ * <li>the by-id and by-uuid lookups from the region's entity index, because a modded entity resolves its
+ * owner every tick and the owner almost always stands in the same region;</li>
+ * <li>{@code getAll()} and the type-filtered lookup from the region's entity index, counted as truncated
+ * when the level's index holds entities outside the lease;</li>
+ * <li>the box queries from the physical section bucket of the lease, clamped to it and counted, plus the
+ * players of the published snapshot;</li>
+ * <li>the player lookups from the published snapshot; see {@link RegionThreadingHooks#playersOfLevel}.</li>
+ * </ul>
+ * What is left on the legacy guard is a query with no local and no published answer: a by-uuid or by-id
+ * lookup of an entity of another region, a worker without a lease, a level with shared (DYNAMIC) section
+ * storage, and a level whose region entity index is not published. Each of those is refused with the
+ * operation name, counted, and reported by {@code /neoforge regionthreading status}.
  * <p>
  * The internal mechanics seam ({@code enableLegacyEntityQueryHandoffForTesting()}) keeps the handoff
  * transport covered by tests: it runs the complete query (including its predicate/consumer and, for
- * {@link #getAll()}, the iteration) on the server thread and returns the finished result. Production
- * never enables that seam.
+ * {@link #getAll()}, the iteration) on the server thread and returns the finished result. Production never
+ * enables that seam.
  * <p>
- * The AABB queries of {@code Level.getEntities(...)} have one additional production path: a native worker
- * that owns a region entity tick lease runs them against the physical bucket of that region through
- * {@link RegionScopedEntityQuery}. That path is entered before this getter, so it does not appear here. A
- * direct call to this getter - including its AABB overloads - stays on the legacy rejection because the
- * by-id/by-uuid/all view is not partitioned.
- * <p>
- * On the server thread and on every non-worker caller the call runs inline and keeps the vanilla
- * semantics.
+ * On the server thread and on every non-worker caller every call runs inline and keeps the vanilla semantics.
  */
 @ApiStatus.Internal
 public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> {
@@ -61,7 +66,7 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         if (scoped != null) {
             return scoped;
         }
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(int)");
+        rejectOnNativeWorker("RegionAwareEntityGetter.get(int)", RegionEntityQueryCounters.Operation.GET_BY_ID);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(id));
         }
@@ -75,7 +80,7 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         if (scoped != null) {
             return scoped;
         }
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(UUID)");
+        rejectOnNativeWorker("RegionAwareEntityGetter.get(UUID)", RegionEntityQueryCounters.Operation.GET_BY_UUID);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(uuid));
         }
@@ -84,7 +89,11 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
 
     @Override
     public Iterable<Entity> getAll() {
-        rejectOnNativeWorker("RegionAwareEntityGetter.getAll");
+        final List<Entity> scoped = RegionScopedEntityQuery.tryGetAll(this.level);
+        if (scoped != null) {
+            return scoped;
+        }
+        rejectOnNativeWorker("RegionAwareEntityGetter.getAll", RegionEntityQueryCounters.Operation.GET_ALL);
         if (!RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return this.delegate.getAll();
         }
@@ -100,7 +109,11 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
 
     @Override
     public <U extends Entity> void get(EntityTypeTest<Entity, U> typeTest, AbortableIterationConsumer<U> consumer) {
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(EntityTypeTest, AbortableIterationConsumer)");
+        if (RegionScopedEntityQuery.tryGetByType(this.level, typeTest, consumer)) {
+            return;
+        }
+        rejectOnNativeWorker("RegionAwareEntityGetter.get(EntityTypeTest, AbortableIterationConsumer)",
+                RegionEntityQueryCounters.Operation.GET_BY_TYPE);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> {
                 this.delegate.get(typeTest, consumer);
@@ -113,7 +126,10 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
 
     @Override
     public void get(AABB boundingBox, Consumer<Entity> consumer) {
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(AABB, Consumer)");
+        if (RegionScopedEntityQuery.tryGetInBox(this.level, boundingBox, consumer)) {
+            return;
+        }
+        rejectOnNativeWorker("RegionAwareEntityGetter.get(AABB, Consumer)", RegionEntityQueryCounters.Operation.GET_IN_BOX);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> {
                 this.delegate.get(boundingBox, consumer);
@@ -126,7 +142,11 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
 
     @Override
     public <U extends Entity> void get(EntityTypeTest<Entity, U> typeTest, AABB boundingBox, AbortableIterationConsumer<U> consumer) {
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(EntityTypeTest, AABB, AbortableIterationConsumer)");
+        if (RegionScopedEntityQuery.tryGetByTypeInBox(this.level, typeTest, boundingBox, consumer)) {
+            return;
+        }
+        rejectOnNativeWorker("RegionAwareEntityGetter.get(EntityTypeTest, AABB, AbortableIterationConsumer)",
+                RegionEntityQueryCounters.Operation.GET_BY_TYPE_IN_BOX);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> {
                 this.delegate.get(typeTest, boundingBox, consumer);
@@ -138,10 +158,6 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
     }
 
     /**
-     * Rejects a legacy query issued by a native worker before its predicate, consumer or live result can
-     * escape. The mechanics seam that enables the transport is the only way past this check.
-     */
-    /**
      * {@return the entity of the region this worker leases, or {@code null} when the caller may not use the
      * region-scoped path or the region does not hold the entity}
      * <p>
@@ -150,13 +166,19 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
      * projectile almost always stands in the same region, so the lookup is answered from the region the worker
      * leases. An entity of another region is not visible here: the lookup then takes the legacy path, which
      * rejects it and is counted, so a cross-region owner stays a visible refusal rather than a silent null.
+     * <p>
+     * The region index is an answer only while it is published: a level whose entity tick index was never
+     * seeded (entity tick workers off, the engine shut down) keeps the legacy guard instead of answering
+     * {@code null} from an index that holds nothing yet. An entity whose removal is deferred to the batch
+     * barrier is still in the index, but vanilla would already have dropped it from its own lookup, so the
+     * lookup falls through to the counted refusal instead of handing out a removed entity.
      */
     @Nullable
     private Entity regionScopedLookup(int id, @Nullable UUID uuid) {
         if (!RegionWorkerScope.isNativeWorkerThread()) {
             return null;
         }
-        if (!(RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine)) {
+        if (!(RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine) || !engine.isEntityIndexPublished(this.level)) {
             return null;
         }
         final RegionCoordinate coordinate = RegionEntityOwnershipScope.currentLeaseCoordinate(this.level);
@@ -167,12 +189,19 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         if (region == null) {
             return null;
         }
-        return uuid != null ? region.entityByUuid(uuid) : region.entityById(id);
+        final Entity entity = uuid != null ? region.entityByUuid(uuid) : region.entityById(id);
+        if (entity == null || entity.isRemoved()) {
+            return null;
+        }
+        RegionEntityOwnershipScope.recordAllowedQuery();
+        RegionEntityQueryCounters.record(uuid != null ? RegionEntityQueryCounters.Operation.GET_BY_UUID : RegionEntityQueryCounters.Operation.GET_BY_ID,
+                RegionEntityQueryCounters.Path.LOCAL);
+        return entity;
     }
 
-    private static void rejectOnNativeWorker(String operation) {
+    private static void rejectOnNativeWorker(String operation, RegionEntityQueryCounters.Operation path) {
         if (RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
-            RegionThreadingHooks.rejectLegacyEntityQuery(operation);
+            RegionThreadingHooks.rejectLegacyEntityQuery(operation, path);
         }
     }
 }

@@ -913,6 +913,8 @@ public final class RegionThreadingEngine implements RegionThreading {
         this.declareVanillaServerThreadOnlyEntities();
         RegionOwnershipViolationHandler.reset();
         RegionEntityOwnershipScope.resetCounters();
+        RegionEntityQueryCounters.reset();
+        RegionPlayerSnapshots.reset();
     }
 
     /**
@@ -1455,6 +1457,10 @@ public final class RegionThreadingEngine implements RegionThreading {
     @ApiStatus.Internal
     public void beginLevelTick(ServerLevel level) {
         this.levelTickPhaseState(level).beginGlobalPhase();
+        // The player list of the level is published once per tick, at the head of the tick and before any region
+        // batch of it runs, so a worker answers a player lookup from an immutable view instead of walking the
+        // level's live list. See RegionPlayerSnapshots for the one-tick staleness this buys.
+        RegionPlayerSnapshots.publish(level);
         this.drainGlobalMessages(level);
     }
 
@@ -1539,6 +1545,31 @@ public final class RegionThreadingEngine implements RegionThreading {
     @Nullable
     RegionState regionStateFor(RegionCoordinate coordinate) {
         return this.regionizer.get(coordinate);
+    }
+
+    /**
+     * {@return true when the region entity tick index of {@code level} is a complete view of its entities}
+     * <p>
+     * The index is fed by the level's entity tick list hooks and seeded once on the server thread, so it is
+     * complete from the first entity slice of the level on. Before that - and whenever entity tick workers
+     * are off, the engine shut down or the level's identity closed - the index is not an answer, and a worker
+     * query that would read it keeps the legacy guard instead of returning an empty result.
+     */
+    @ApiStatus.Internal
+    public boolean isEntityIndexPublished(ServerLevel level) {
+        return this.entityTickWorkerExecutionEnabled && !this.shutdown && this.seededEntityTickLevels.contains(level);
+    }
+
+    /**
+     * {@return the number of entities the region entity tick index of {@code level} holds}
+     * <p>
+     * A worker compares it with the size of its own region's index to report that its region is only a part of
+     * the level-wide answer. The count is engine bookkeeping maintained with the index, so reading it needs no
+     * lock and touches no vanilla storage.
+     */
+    @ApiStatus.Internal
+    public int indexedEntityCount(ServerLevel level) {
+        return this.regionizer.entityCount(level);
     }
 
     /**
@@ -7020,6 +7051,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.pendingDeferredEntityMoves.removeIf(move -> move.destination().level() == level);
                     this.chunkLoadAnswers.remove(level);
                     this.seededEntityTickLevels.remove(level);
+                    RegionPlayerSnapshots.detach(level);
                     this.regionizer.clearLevel(level);
                     // The mailbox and the phase state of the level die with its region state: the queued
                     // messages are dropped and counted, and a later post is refused instead of waiting for a
@@ -8313,6 +8345,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                 RegionEntityOwnershipScope.allowedQueryCount(),
                 RegionEntityOwnershipScope.truncatedQueryCount(),
                 RegionEntityOwnershipScope.rejectedQueryCount(),
+                RegionEntityQueryCounters.snapshot(),
+                RegionPlayerSnapshots.publicationCount(),
                 this.blockEntityTicksOnWorkers.get(),
                 this.skippedBlockEntityTicks.get(),
                 this.fallbackBlockEntityTicks.get(),

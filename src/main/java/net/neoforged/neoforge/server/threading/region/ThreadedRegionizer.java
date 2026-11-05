@@ -17,6 +17,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
@@ -41,6 +42,16 @@ final class ThreadedRegionizer {
     private final Map<RegionSectionCoordinate, RegionState> sectionRegions = new ConcurrentHashMap<>();
     private final Map<Entity, RegionState> entities = new ConcurrentHashMap<>();
     private final Map<Entity, ServerLevel> entityLevels = new ConcurrentHashMap<>();
+    /**
+     * Number of entities the region entity tick index holds per level.
+     * <p>
+     * A native worker that answers {@code getAll()} or a type-filtered query from the index of its leased
+     * region needs the level's own index size to know whether its region is the whole answer or only a part
+     * of it: the difference is what the truncation counter reports. The counters are maintained under the
+     * write lock, together with the index they count, and are read without a lock, so the check on the worker
+     * is one map lookup and one atomic read.
+     */
+    private final Map<ServerLevel, AtomicInteger> indexedEntityCounts = new ConcurrentHashMap<>();
     /**
      * Level identities that finished a level clear. All accesses happen under the regionizer write lock,
      * the same lock that serializes region creation, so a creation either publishes before the clear (and
@@ -326,6 +337,7 @@ final class ThreadedRegionizer {
             return region;
         }
         if (previous == null) {
+            this.indexedEntityCounts.computeIfAbsent(coordinate.level(), key -> new AtomicInteger()).incrementAndGet();
             region.indexEntityTickEntry(entity, this.entityTickSequence.incrementAndGet());
             this.requestMergeCheckIfNeeded(sectionCoordinate(coordinate), region);
             this.structuralChangeCount.incrementAndGet();
@@ -465,6 +477,7 @@ final class ThreadedRegionizer {
                     if (previous != null) {
                         this.migrateEntityTickEntry(entity, previous, destination);
                     } else {
+                        this.indexedEntityCounts.computeIfAbsent(level, key -> new AtomicInteger()).incrementAndGet();
                         destination.indexEntityTickEntry(entity, this.entityTickSequence.incrementAndGet());
                     }
                 }
@@ -705,8 +718,11 @@ final class ThreadedRegionizer {
         final long stamp = this.acquireWriteLock();
         try {
             final RegionState region = this.entities.remove(entity);
-            this.entityLevels.remove(entity);
+            final ServerLevel level = this.entityLevels.remove(entity);
             if (region != null) {
+                if (level != null) {
+                    this.indexedEntityCounts.computeIfAbsent(level, key -> new AtomicInteger()).decrementAndGet();
+                }
                 region.removeEntityTickEntry(entity);
                 this.structuralChangeCount.incrementAndGet();
                 this.removeIfEmptyLocked(region);
@@ -767,6 +783,7 @@ final class ThreadedRegionizer {
                 }
                 return false;
             });
+            this.indexedEntityCounts.keySet().removeIf(counted -> counted == level);
             this.regions.keySet().removeIf(coordinate -> coordinate.level() == level);
             final int currentSize = this.regions.size() + this.sections.size() + this.entities.size();
             if (currentSize != previousSize) {
@@ -790,6 +807,7 @@ final class ThreadedRegionizer {
             });
             this.entityLevels.clear();
             this.entities.clear();
+            this.indexedEntityCounts.clear();
             this.sectionRegions.clear();
             this.sections.clear();
             this.regions.clear();
@@ -1122,6 +1140,20 @@ final class ThreadedRegionizer {
         } finally {
             this.regionLock.unlockRead(stamp);
         }
+    }
+
+    /**
+     * {@return the number of entities the region entity tick index of {@code level} holds}
+     * <p>
+     * This is the level's share of the index, i.e. every entity whose region mapping names a region of
+     * {@code level}. A worker compares it with the size of its own region's index to decide whether its
+     * region is the whole answer of a {@code getAll()} or a type-filtered query, or only a part of it; the
+     * difference is what the truncation counter reports. The count is maintained with the index under the
+     * write lock and read without one, so the worker pays one map lookup.
+     */
+    int entityCount(ServerLevel level) {
+        final AtomicInteger count = this.indexedEntityCounts.get(level);
+        return count == null ? 0 : count.get();
     }
 
     int runningRegionCount() {

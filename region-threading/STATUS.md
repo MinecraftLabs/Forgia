@@ -33,6 +33,41 @@ disabled, which is the vanilla code path.
 | Save and reload | A whole fixture world saved, unloaded and reloaded from disk: every block, block entity, entity UUID and position, POI record with its free-ticket count and region mapping equal, with region threading on and off and across the two configurations |
 | Crash recovery | Six runs in three pairs kill the JVM mid-tick and restart on the same world: the save point is intact, no duplicate UUID, no leaked ticket, no dangling deferral, 600 further ticks green |
 
+## Entity query surface of a region worker
+
+Every entity query entry point a modded tick can reach is answered from data the worker may read, and the
+answers are counted per operation (`/neoforge regionthreading status`, line `Region entity queries:`).
+
+| Entry point | Worker answer | Counter |
+|---|---|---|
+| `LevelEntityGetter.get(int)`, `ServerLevel.getEntity(int)`, `getEntityOrPart(int)` | the region's entity index, once the level's index is published | `local`; `refused` for an entity of another region, for an entity whose removal is deferred in this batch, and for a level whose index is not published |
+| `LevelEntityGetter.get(UUID)`, `ServerLevel.getEntity(UUID)` | the region's entity index (projectile owner resolution), once the level's index is published | `local`; `refused` as above |
+| `LevelEntityGetter.getAll()`, `ServerLevel.getAllEntities()` | the region's entity index, in tick-list order | `local`, `truncated` when the level's index holds more entities |
+| `get(EntityTypeTest, consumer)`, `ServerLevel.getEntities(EntityTypeTest, Predicate, List, int)` | the region's entity index | `local`, `truncated` as above |
+| `get(AABB, Consumer)`, `get(EntityTypeTest, AABB, Consumer)`, `Level.getEntities(...)` | the region's physical section bucket, box clamped to the lease; `Level.getEntities` additionally appends the parts of the multipart owners the lease answered, where vanilla appends the level's parts | `local`, `truncated` on a clamp |
+| `getEntitiesOfClass(Player.class, box)` and every `Player` subtype query | the region bucket plus the players of the level's published snapshot whose recorded bounding box intersects the box; a player the bucket already answered is not added twice | `local` + `published` |
+| `players()`, `getNearestPlayer`, `getPlayerByUUID`, `getNearbyPlayers`, `hasNearbyAlivePlayer`, `getPlayers`, `getRandomPlayer` | the level's per-tick player snapshot; a worker of a level without a published snapshot is refused, never handed the live list | `published`; `refused` when no snapshot is published |
+| `EntityStorageGuardedGetter` (the section manager's own view) | still refused: the manager has no level, so there is no lease to answer from | `refused` |
+| entity transfer journal, identity ledger, section partitions, entity admission | still refused: they mutate server-owned state, they are not queries | violation counter |
+
+The player snapshot is published on the server thread at the head of the level tick (`RegionPlayerSnapshots`),
+replaced (never mutated) once per tick, and dropped when the level unloads. It is at most one tick old: a
+player who joined, left or changed dimension after the publication is not in it, and a recorded bounding box is
+the one the player had when the tick opened. A box query intersects that recorded bounding box, so a box that
+clips a player's body answers like the vanilla section scan. The entity a caller receives is live, so its own
+predicate and targeting test read the current state exactly like the vanilla loop. The snapshot exists because
+a player is an always-ticking entity that only the server thread ticks: it is in no worker's region, and the
+level's live player list is a mutable `ArrayList` a worker must not walk. A worker of a level that has no
+snapshot - the level tick never opened through the bridge, or its state was cleared on unload - is refused with
+the same `IllegalStateException` as every other storage guard and counted as `refused`; it never falls back to
+the live list, which stays for every non-worker caller.
+
+Multipart parts are appended by the two `Level.getEntities` shapes from the owners the lease answered, because
+vanilla appends `Level.getPartEntities()` - the live part map of the server thread - after its section scan, and
+a worker may not read that map. A part belongs to the region of its owner, so a part of an owner outside the
+lease stays outside the answer exactly like its owner. The `LevelEntityGetter` box shapes stay entity-only,
+which is what vanilla does.
+
 ## Production soak (everything on, 3-chunk regions)
 
 | Milestone | on (mspt mean) | off (mspt mean) | ratio |
@@ -236,6 +271,7 @@ per pair, of which 600 ticks at 20 TPS dominate.
 | B2 | Structure leases (piston multi-block moves, Create contraptions) | measured, not worth it (see above) |
 | B3 | Player regionization (teleport, portals, cross-dimension) | **done** (f2f529272): explicit transitions by kind, exactly-one-region audit, ledger handover across dimensions, 6356 assertions in the soak with 0 failures |
 | B4 | Large randomized redstone soak | planned |
+| B5 | Region-scoped entity query surface + per-tick player snapshot | **done**: `getAll`, the type-filtered and box shapes and every player lookup answered from the lease or the published snapshot; a player the region bucket answered is not added twice, a removed entity is not answered from the index, `Level.getEntities` appends the parts of the owners the lease answered, and the by-id/by-uuid lookups of a foreign entity, a worker without a lease, a shared-storage level and a level whose region index is not published stay refused with the operation name |
 | C1 | Save/load and crash recovery of regionized state | **done** |
 | C2 | Long-run soak (6+ hours, drift and leak detection) | planned - the 6000-tick soak is green but six hours is a different regime |
 | C3 | Multiplayer concurrency (players, view distance, tickets) | planned |
@@ -262,3 +298,20 @@ Dependency spine: A1 → A2 → A3 → A4, then B1 → B2 → B3 → B4, then C1
   entity slice, and the next step is a work-stealing dispatcher rather than a global switch.
 - Cross-region effects are ordered per target region, not in one global vanilla order.
 - Modded callbacks that reach beyond the admitted radius are refused, not analysed.
+- A worker's player view is the snapshot of the level tick: membership and the recorded bounding boxes are
+  at most one tick old. A player lookup that must see a player who joined in the current tick is not
+  answered by the snapshot, and a worker of a level without a snapshot is refused instead of reading the
+  live list.
+- A region-scoped `getAll()` returns the entities of the worker's region that the level's entity tick
+  index holds, not the level's whole entity view; the truncation counter reports every call where the
+  two differ.
+- A region-scoped box query appends the parts of the multipart owners it answered, not every part of the
+  level: a part of an owner outside the lease is outside the answer, exactly like its owner.
+
+## Patch placement notes
+
+- `LevelChunk.removeBlockEntity`: the `removeBlockEntityTicker` call sits inside the added
+  `beginChunkMutation`/`endChunkMutation` scope, not after it as in vanilla. It stays there on purpose - the
+  ticker removal bumps the chunk's ticker revision and rebinds the removed wrapper, so the chunk mutation
+  covers both - and the patch carries a comment saying so. It is not drift: a worker must not leave a stale
+  ticker behind after the block entity is gone.

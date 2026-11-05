@@ -359,6 +359,22 @@ final class RegionState {
         return new ArrayList<>(this.entityTickOrder);
     }
 
+    /**
+     * {@return a snapshot of the entities this region's index holds}
+     * <p>
+     * The unit of the region-scoped {@code getAll()} and type-filtered queries: the entities whose region
+     * mapping names this region, ticking or not, exactly as the level's own entity view would list the
+     * entities of this region. The list is a copy, so a worker iterates it while the server thread keeps
+     * publishing index changes.
+     */
+    List<Entity> indexedEntities() {
+        final List<Entity> entities = new ArrayList<>(this.entityTickOrder.size());
+        for (final RegionEntityTickEntry entry : this.entityTickOrder) {
+            entities.add(entry.entity());
+        }
+        return entities;
+    }
+
     /** {@return the number of entities indexed for this region} */
     int entityTickEntryCount() {
         return this.entityTickEntries.size();

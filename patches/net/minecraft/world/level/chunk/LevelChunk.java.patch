@@ -400,7 +400,7 @@
          } else {
              CompoundTag compoundtag = this.pendingBlockEntities.get(p_62932_);
              if (compoundtag != null) {
-@@ -428,18 +_,28 @@
+@@ -428,18 +_,31 @@
  
      @Override
      public void removeBlockEntity(BlockPos p_62919_) {
@@ -427,14 +427,17 @@
 +                    auxLightManager.removeLightAt(p_62919_);
 +                    }
              }
--        }
- 
--        this.removeBlockEntityTicker(p_62919_);
++
++            // Neo: the ticker removal stays inside the mutation scope on purpose. It bumps the chunk's
++            // ticker revision and rebinds the removed wrapper, so the chunk mutation covers both, and a
++            // worker cannot leave a stale ticker behind after the block entity is gone.
 +            this.removeBlockEntityTicker(p_62919_);
 +
 +        } finally {
 +            this.endChunkMutation();
-+        }
+         }
+-
+-        this.removeBlockEntityTicker(p_62919_);
      }
  
      private <T extends BlockEntity> void removeGameEventListener(T p_223413_, ServerLevel p_223414_) {

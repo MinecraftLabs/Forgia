@@ -424,7 +424,7 @@
      }
  
      public boolean isLoaded(BlockPos p_46750_) {
-@@ -796,6 +_,31 @@
+@@ -796,6 +_,32 @@
  
      @Override
      public List<Entity> getEntities(@Nullable Entity p_46536_, AABB p_46537_, Predicate<? super Entity> p_46538_) {
@@ -440,7 +440,8 @@
 +        if (this instanceof net.minecraft.server.level.ServerLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
 +            // Neo: production region workers never receive live entity storage or run the caller predicate.
-+            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(Entity, AABB, Predicate)");
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(Entity, AABB, Predicate)",
++                    net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters.Operation.GET_IN_BOX);
 +        }
 +        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldHandOffEntityQuery()) {
@@ -476,7 +477,7 @@
          return list;
      }
  
-@@ -828,6 +_,34 @@
+@@ -828,6 +_,35 @@
      public <T extends Entity> void getEntities(
          EntityTypeTest<Entity, T> p_261885_, AABB p_262086_, Predicate<? super T> p_261688_, List<? super T> p_262071_, int p_261858_
      ) {
@@ -490,7 +491,8 @@
 +        if (this instanceof net.minecraft.server.level.ServerLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
 +            // Neo: production region workers never receive live entity storage or run the caller predicate.
-+            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(EntityTypeTest, AABB, Predicate, List, int)");
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(EntityTypeTest, AABB, Predicate, List, int)",
++                    net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters.Operation.GET_BY_TYPE_IN_BOX);
 +        }
 +        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
 +                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldHandOffEntityQuery()) {

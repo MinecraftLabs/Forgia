@@ -352,6 +352,17 @@
          }
      }
  
+@@ -852,7 +_,9 @@
+     public List<ServerPlayer> getPlayers(Predicate<? super ServerPlayer> p_261698_, int p_262035_) {
+         List<ServerPlayer> list = Lists.newArrayList();
+ 
+-        for (ServerPlayer serverplayer : this.players) {
++        // Neo: through players(), so a native region worker answers from the published player snapshot instead
++        // of walking the level's live list.
++        for (ServerPlayer serverplayer : this.players()) {
+             if (p_261698_.test(serverplayer)) {
+                 list.add(serverplayer);
+                 if (list.size() >= p_262035_) {
 @@ -896,6 +_,8 @@
      }
  
@@ -554,6 +565,20 @@
      }
  
      private boolean doBlockEvent(BlockEventData p_8699_) {
+@@ -1371,7 +_,12 @@
+ 
+     @Override
+     public List<ServerPlayer> players() {
+-        return this.players;
++        // Neo: a player is an always-ticking entity that only the server thread ticks, so the live list is
++        // server-owned storage. A native region worker answers every player lookup from the immutable snapshot
++        // the server thread publishes at the head of the level tick; see RegionPlayerSnapshots for its
++        // one-tick staleness. Every other caller keeps the live list, which is the vanilla behaviour.
++        final List<ServerPlayer> published = net.neoforged.neoforge.server.threading.RegionThreadingHooks.playersOfLevel(this);
++        return published != null ? published : this.players;
+     }
+ 
+     @Override
 @@ -1600,7 +_,34 @@
  
      @Override
