@@ -55,6 +55,15 @@ final class RegionState {
      */
     private final ConcurrentSkipListSet<RegionEntityTickEntry> entityTickOrder = new ConcurrentSkipListSet<>(RegionEntityTickEntry.BY_SEQUENCE);
     private final ConcurrentHashMap<Entity, RegionEntityTickEntry> entityTickEntries = new ConcurrentHashMap<>();
+    /**
+     * The entities of this region by UUID and by network id.
+     * <p>
+     * A modded entity resolves its owner every tick ({@code Projectile.getOwner()} asks the level for a UUID),
+     * and the legacy level lookup is server-owned storage. A worker answers such a lookup from the region it
+     * leases instead, so the index is maintained exactly where the region's entity membership changes.
+     */
+    private final ConcurrentHashMap<java.util.UUID, Entity> entitiesByUuid = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Entity> entitiesById = new ConcurrentHashMap<>();
     /** Number of indexed entities the level's entity tick list currently contains. */
     private final AtomicInteger tickingEntityCount = new AtomicInteger();
     /** Number of ticking entities only the server thread may tick, i.e. always-ticking entities such as players. */
@@ -204,6 +213,7 @@ final class RegionState {
         if (this.entityTickEntries.putIfAbsent(entity, entry) != null) {
             return;
         }
+        indexEntityLookups(entity);
         this.entityTickOrder.add(entry);
     }
 
@@ -217,6 +227,7 @@ final class RegionState {
         if (this.entityTickEntries.putIfAbsent(entry.entity(), entry) != null) {
             return;
         }
+        indexEntityLookups(entry.entity());
         this.entityTickOrder.add(entry);
         if (entry.ticking()) {
             this.tickingEntityCount.incrementAndGet();
@@ -238,6 +249,7 @@ final class RegionState {
             return null;
         }
         this.entityTickOrder.remove(removed);
+        removeEntityLookups(entity);
         if (removed.ticking()) {
             this.tickingEntityCount.decrementAndGet();
             if (removed.serverThreadOnly()) {
@@ -308,6 +320,41 @@ final class RegionState {
      * tick list change. It is the unit the region worker enumerates: the entities it may tick are the entries
      * whose {@link RegionEntityTickEntry#ticking()} is set.
      */
+    /**
+     * Adds the lookup keys of {@code entity}, tolerating a null UUID.
+     * <p>
+     * A mock or a partially constructed entity can answer a null UUID; the maps must not see a null key, and an
+     * entity without one is simply not reachable by UUID.
+     */
+    private void indexEntityLookups(Entity entity) {
+        final java.util.UUID uuid = entity.getUUID();
+        if (uuid != null) {
+            this.entitiesByUuid.put(uuid, entity);
+        }
+        this.entitiesById.put(entity.getId(), entity);
+    }
+
+    /** Removes the lookup keys of {@code entity} again. */
+    private void removeEntityLookups(Entity entity) {
+        final java.util.UUID uuid = entity.getUUID();
+        if (uuid != null) {
+            this.entitiesByUuid.remove(uuid, entity);
+        }
+        this.entitiesById.remove(entity.getId(), entity);
+    }
+
+    /** {@return the entity of this region with {@code uuid}, or {@code null} when this region does not hold it} */
+    @Nullable
+    Entity entityByUuid(java.util.UUID uuid) {
+        return this.entitiesByUuid.get(uuid);
+    }
+
+    /** {@return the entity of this region with network id {@code id}, or {@code null} when it does not hold it} */
+    @Nullable
+    Entity entityById(int id) {
+        return this.entitiesById.get(id);
+    }
+
     List<RegionEntityTickEntry> entityTickEntries() {
         return new ArrayList<>(this.entityTickOrder);
     }

@@ -16,6 +16,7 @@ import net.minecraft.world.level.entity.EntityTypeTest;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 
@@ -56,6 +57,10 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
     @Nullable
     @Override
     public Entity get(int id) {
+        final Entity scoped = regionScopedLookup(id, null);
+        if (scoped != null) {
+            return scoped;
+        }
         rejectOnNativeWorker("RegionAwareEntityGetter.get(int)");
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(id));
@@ -66,6 +71,10 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
     @Nullable
     @Override
     public Entity get(UUID uuid) {
+        final Entity scoped = regionScopedLookup(0, uuid);
+        if (scoped != null) {
+            return scoped;
+        }
         rejectOnNativeWorker("RegionAwareEntityGetter.get(UUID)");
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(uuid));
@@ -132,6 +141,35 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
      * Rejects a legacy query issued by a native worker before its predicate, consumer or live result can
      * escape. The mechanics seam that enables the transport is the only way past this check.
      */
+    /**
+     * {@return the entity of the region this worker leases, or {@code null} when the caller may not use the
+     * region-scoped path or the region does not hold the entity}
+     * <p>
+     * A modded entity resolves its owner every tick - {@code Projectile.getOwner()} asks the level for a UUID -
+     * and the legacy lookup is server-owned storage that a worker must not read. The entity that fired a
+     * projectile almost always stands in the same region, so the lookup is answered from the region the worker
+     * leases. An entity of another region is not visible here: the lookup then takes the legacy path, which
+     * rejects it and is counted, so a cross-region owner stays a visible refusal rather than a silent null.
+     */
+    @Nullable
+    private Entity regionScopedLookup(int id, @Nullable UUID uuid) {
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return null;
+        }
+        if (!(RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine)) {
+            return null;
+        }
+        final RegionCoordinate coordinate = RegionEntityOwnershipScope.currentLeaseCoordinate(this.level);
+        if (coordinate == null) {
+            return null;
+        }
+        final RegionState region = engine.regionStateFor(coordinate);
+        if (region == null) {
+            return null;
+        }
+        return uuid != null ? region.entityByUuid(uuid) : region.entityById(id);
+    }
+
     private static void rejectOnNativeWorker(String operation) {
         if (RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
             RegionThreadingHooks.rejectLegacyEntityQuery(operation);

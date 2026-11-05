@@ -129,7 +129,11 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
     private static final Set<String> GRANTABLE_PENDING_ADMISSION_OPERATIONS = Set.of(
             "Entity.absMoveTo",
             "Entity.moveTo",
-            "Entity.setPosRaw");
+            "Entity.setPosRaw",
+            // BlockAttachedEntity overrides setPos and writes its attachment anchor before the position, so the
+            // constructor of a hanging entity (a leash knot restored by a horse's tick, an item frame placed by a
+            // block) needs the same construction half of an admission as the Entity position writes above.
+            "BlockAttachedEntity.setPos");
 
     private static final ThreadLocal<RegionEntityOwnershipScope> CURRENT = new ThreadLocal<>();
     private static final ThreadLocal<Long> CURRENT_LEASE_ID = new ThreadLocal<>();

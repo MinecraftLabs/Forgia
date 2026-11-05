@@ -129,6 +129,23 @@ class RegionEntityOwnershipLeaseTest {
     }
 
     @Test
+    void aHangingEntityThatIsNotAddedYetMayBePositionedWhileItIsConstructed() throws ReflectiveOperationException {
+        // A horse's tick can restore its leash on a region worker, which constructs a LeashFenceKnotEntity. The
+        // BlockAttachedEntity constructor writes the attachment anchor through its own setPos override, before
+        // the entity is added, so that write belongs to the construction half of an admission.
+        final Entity hanging = mock(Entity.class);
+        try (RegionEntityOwnershipScope lease = openLease(hanging)) {
+            assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, hanging, "BlockAttachedEntity.setPos"));
+        }
+        final Entity added = mock(Entity.class);
+        when(added.isAddedToLevel()).thenReturn(true);
+        try (RegionEntityOwnershipScope lease = openLease(added)) {
+            // Once the entity is in a level the anchor write is server-owned state again.
+            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, added, "BlockAttachedEntity.setPos"));
+        }
+    }
+
+    @Test
     void leaseNeverGrantsARemovedEntity() throws ReflectiveOperationException {
         final Entity removed = mock(Entity.class);
         when(removed.isRemoved()).thenReturn(true);
