@@ -115,9 +115,13 @@ them produced no violation. **c2me keeps `DISABLE_ENGINE`**, which makes the pac
 ```
 enableRegionThreadingBridge = true
 enableRegionThreadingEntityTicks = true
-...                            # every slice
+...                            # every slice, no force flag
 # and c2me removed from mods/
 ```
+
+Measured that way in the harness - real policy, no force flag, 169 jars, flat world, 169 chunks force-loaded
+and 32 mobs summoned: engine enabled, **92 101 entity ticks on region workers**, 6 701 cross-region reads, zero
+ownership violations, clean shutdown.
 
 
 Two things this run does **not** prove, and the harness cannot prove yet: chunk ticks on workers stayed at zero

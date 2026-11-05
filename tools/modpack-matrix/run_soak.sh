@@ -31,22 +31,35 @@ for entry in "$PACK"/*; do
     ln -s "$entry" "$RUNDIR/$base"
 done
 cp -a "$PACK/config/." "$RUNDIR/config/" 2>/dev/null
-cat > "$RUNDIR/config/neoforge-server.toml" <<'CFG'
-enableRegionThreadingBridge = true
-enableRegionThreadingWorkers = true
-enableRegionThreadingEntityTicks = true
-enableRegionThreadingBlockEntityTicks = true
-enableRegionThreadingScheduledTicks = false
-enableRegionThreadingRandomTicks = true
-enableRegionThreadingSpawning = true
-enableRegionThreadingPoi = true
-enableRegionThreadingBorderUpdates = true
-enableRegionThreadingGameEvents = false
-regionThreadingForceWithKnownConflicts = true
-regionThreadingMode = "FIXED_3X3"
-regionThreadingFixedRegionChunks = 3
-regionThreadingWorkerThreads = 4
-CFG
+# The pack's server config is a full generated file; a partial one is rejected and regenerated with defaults, so
+# patch the copied file in place and never replace it.
+CFG_FILE="$RUNDIR/config/neoforge-server.toml"
+set_key() {
+    if grep -q "^$1 = " "$CFG_FILE"; then
+        sed -i -E "s|^$1 = .*|$1 = $2|" "$CFG_FILE"
+    else
+        last=$(grep -n '^regionThreading[a-zA-Z]* = ' "$CFG_FILE" | tail -1 | cut -d: -f1)
+        if [ -n "$last" ]; then
+            sed -i "${last}a $1 = $2" "$CFG_FILE"
+        else
+            printf '%s = %s\n' "$1" "$2" >> "$CFG_FILE"
+        fi
+    fi
+}
+set_key enableRegionThreadingBridge true
+set_key enableRegionThreadingWorkers true
+set_key enableRegionThreadingEntityTicks true
+set_key enableRegionThreadingBlockEntityTicks true
+set_key enableRegionThreadingScheduledTicks false
+set_key enableRegionThreadingRandomTicks true
+set_key enableRegionThreadingSpawning true
+set_key enableRegionThreadingPoi true
+set_key enableRegionThreadingBorderUpdates true
+set_key enableRegionThreadingGameEvents false
+set_key regionThreadingForceWithKnownConflicts "${FORCE_CONFLICTS:-true}"
+set_key regionThreadingMode '"FIXED_3X3"'
+set_key regionThreadingFixedRegionChunks 3
+set_key regionThreadingWorkerThreads 4
 count=0
 while IFS= read -r jar; do
     [ -z "$jar" ] && continue
