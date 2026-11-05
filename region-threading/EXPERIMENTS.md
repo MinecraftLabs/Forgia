@@ -47,9 +47,12 @@ continuous against 55.6 us with 4 ms gaps). That is a platform effect - frequenc
 laptop, inside WSL2 - and it explains the residual: the light slices are bursty by nature.
 
 **Consequence for the roadmap:** light-load micro-optimisation on this host cannot close the remaining gap;
-the principled fix is to make each burst longer, which is what continuous region ticking (A3) does. It also
-means all light-slice measurements carry a platform-specific penalty that a server with a fixed performance
-governor would not have.
+the principled fix is to make each burst longer. It also means all light-slice measurements carry a
+platform-specific penalty that a server with a fixed performance governor would not have.
+
+A3 was proposed as that fix - a bounded tick window in which a region runs one tick ahead - and §5 measures it
+and refutes it: the bursts are already as long as the work of their slice, and the interval between them is the
+server thread building the next one. Making the burst longer needs a region to own its whole tick.
 
 ## 3. Per-region mob cap for spawning - replaced
 
@@ -68,3 +71,37 @@ workers.
 **Result:** correct but it cost the entity win for those types (zombies 22.6-23.2 mspt against 20.2-20.6
 inline). Replaced by region-partitioned POI storage with published snapshots and vanilla-identical queries,
 after which zombies run at 6.6-8.8 mspt (3.4x) and villagers at 21.9-25.7 (2.1-2.4x).
+
+## 5. A bounded tick window (a region one tick ahead) - refuted
+
+**Hypothesis:** the server thread parks at a barrier after every slice of a level tick, so letting a region
+tick ahead while the server thread does its own work would recover the stop-and-go part of the tick (A3).
+
+**Measurement:** a new opt-in attribution (`RegionBarrierAttribution`, off by default) splits the wait of every
+batch of every slice into dispatch (submit to first group start), span (first to last group end, i.e. the worker
+makespan) and tail (last group end to the end of the wait), and records the handoff after the barrier and the
+server-thread interval between two barriers. Production soak (3-chunk regions, 4 workers, all switches on) and
+the four slice workloads, 200 warmup + 600 measured ticks, two repeats, `-XX:+UseZGC`.
+
+**Result:** barrier wait is 46-56 % of a tick in the soak and the light workloads and 87 % in the 1024-zombie
+workload, but 75-99 % of that wait is the worker makespan of the slice - the interval in which the workers are
+running the only work the tick has. The part of a tick that is the barrier's own cost (dispatch + completion
+detection) is **1.1-11.7 %**: 1.143/1.224 ms of an 11.774/10.470 ms soak tick, 0.224/0.248 of a 6.512/5.904 ms
+9x9 chunk tick, 0.293 of a 5.103 ms furnace tick, 0.311 of a 6.203 ms hopper tick, 0.317/0.310 of a 26.769/27.793
+ms zombie tick. That is what a cheaper dispatch and a faster completion detection remove - which is A2's
+submission path (furnace await 1.88 -> 1.62 ms with persistent workers and packed leases), not a window.
+
+The naive "both lanes overlap" bound is large (max(span, tick - span) would save 37-48 % of a soak or chunk-tick
+tick), and it is unreachable: the server-thread lane **produces** the region lane's input. The plan of slice
+k+1 is computed from the state the handoff of slice k writes, the handoff must be applied before slice k+1's
+bodies run because that is where the vanilla inline write would have landed, the vanilla statements between two
+slices read the state the previous slice wrote (block events read block states), and the interval across the
+tick boundary contains the collection of the next tick's first batch. A window would spend the same
+dispatch + tail and gain nothing, because there is no region work available to put in it.
+
+**What was done instead:** nothing is scheduled. The attribution is kept (off by default) because it is the
+number that decides this question, and the milestone is recorded as refuted in `region-threading/STATUS.md`.
+The remaining lever the numbers do support is the worker makespan (34.5-86.3 % of a tick): a cheaper body or a
+better intra-slice balance (A2b work stealing), or longer bursts, which needs a region to own its whole tick -
+regionized world ticking, a different milestone with its own correctness argument, not a bounded window.
+Full tables, the ordering table and the two-tick observability list are in `tmp/continuous-tick/SUMMARY.md`.

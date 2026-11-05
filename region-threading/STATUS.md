@@ -167,6 +167,40 @@ at 6.53 mspt mean (p50 5.84, p95 10.1, p99 13.8) against 6.35 (5.93/9.2/12.0) fo
 The one class of work the phase still serializes is the move itself, which runs on the server thread because
 the phase sits outside every region batch.
 
+## Barrier accounting: why a region cannot run ahead (A3, refuted)
+
+`RegionBarrierAttribution` (off by default) splits the wait of every batch of every slice into **dispatch**
+(submit to first group start), **span** (first to last group end - the worker makespan) and **tail** (last group
+end to the end of the wait), and records the **handoff** after the barrier and the server-thread interval
+between two barriers. `dispatch + span + tail` is the await, so `dispatch + tail` is the part of the wait no
+worker work explains. Measured on the baseline with 200 warmup + 600 measured ticks, two repeats, ZGC; the
+shares are what the milestone turns on, the milliseconds are from a session whose absolute values are 30-90 %
+above the tables above because other work was running on the machine.
+
+| workload | mspt | sum await | sum span | sum overhead | overhead share | await share |
+|---|---|---|---|---|---|---|
+| production soak, 3-chunk, 4w | 11.774 / 10.470 | 5.556 / 4.835 | 4.412 / 3.609 | 1.143 / 1.224 | 9.7 % / 11.7 % | 47.2 % / 46.2 % |
+| 9x9 chunk ticks, 1024 chunks | 6.512 / 5.904 | 3.582 / 3.354 | 3.358 / 3.106 | 0.224 / 0.248 | 3.4 % / 4.2 % | 55.0 % / 56.8 % |
+| furnace 4096, 3-chunk | 5.103 | 2.463 | 2.170 | 0.293 | 5.7 % | 48.3 % |
+| hopper 2048, 3-chunk | 6.203 | 2.989 | 2.678 | 0.311 | 5.0 % | 48.2 % |
+| 1024 zombies, 3-chunk | 26.769 / 27.793 | 23.408 / 24.226 | 23.092 / 23.915 | 0.317 / 0.310 | 1.2 % / 1.1 % | 87.4 % / 87.2 % |
+
+The per-slice p50s of the soak (entity 2.576 / 2.120 await against 2.400 / 1.952 span; chunk 0.488 / 0.464
+against 0.360 / 0.312; spawn 0.792 / 0.672 against 0.624 / 0.544; block entity 0.232 / 0.232 against
+0.120 / 0.104; propagation 0.232 / 0.256 against 0.080 / 0.072) show the same shape as the means.
+
+The conclusion is that the barrier wait is the work: 75-99 % of it is the makespan of the slice's own groups,
+and the remaining 1.1-11.7 % of a tick is dispatch and completion detection, which the persistent-worker and
+packed-lease submission path (A2) already removes. The naive bound - both lanes fully overlapped, which would
+save 34-48 % of a soak or chunk-tick tick - is unreachable, because the server thread's work between two
+barriers *builds the next batch*: the plan of slice k+1 is computed from the state the handoff of slice k
+writes, the handoff must land before slice k+1's bodies run, and the interval across the tick boundary contains
+the collection of the next tick's first batch. The full tables, the per-state ordering table (game time,
+day time, weather, `LevelTicks`, `ChunkMap`/tickets, POI tickets, block events, `ServerLevel` counters,
+per-chunk seeds, spawn caps, the mailbox, cross-region writes, the game-event replay) and the list of what a
+two-tick window would make observable are in `tmp/continuous-tick/SUMMARY.md`; the refutation is
+`region-threading/EXPERIMENTS.md` §5.
+
 ## Save, reload and crash recovery
 
 A world saved with region threading enabled reloads to the same state, and a hard kill leaves a world that
@@ -265,7 +299,7 @@ per pair, of which 600 ticks at 20 TPS dominate.
 | A1 | Deferred cross-region block writes, then relax the interior-chunk rule | **done** (e82a76c47) |
 | A2 | Persistent workers + multi-region group leases (light-load overhead) | **done, off by default** (af9a44429): furnace −19 %, hopper −6 %, but the entity slice loses 2.3–2.7 ms because the per-worker slot loses the executor's dynamic balancing |
 | A2b | Work-stealing dispatch (per-worker deque, steal half) and per-ticker wrapper attribution | planned — this is what makes A2 a win for every slice instead of a trade-off |
-| A3 | Continuous region ticking (tick clock instead of a per-tick barrier) | planned |
+| A3 | Continuous region ticking (tick clock instead of a per-tick barrier) | **refuted** (measured, see below): the barrier wait is 75-99 % worker makespan and the barrier's own cost is 1.1-11.7 % of a tick, which A2's submission path already removes; the naive overlap bound is unreachable because the server thread's work between two barriers produces the next batch |
 | A4 | Dynamic region size (split/merge by load) | planned |
 | B1 | Cross-region game events (sculk vibration) | **done** (dbebf9803): per-column capture, same-tick replay on the target worker, 1650 events / 5657 deferred columns in the soak, none lost. Found and fixed that worker-posted events were silently dropped before |
 | B2 | Structure leases (piston multi-block moves, Create contraptions) | measured, not worth it (see above) |
@@ -280,12 +314,18 @@ per pair, of which 600 ticks at 20 TPS dominate.
 | D3 | Automated performance regression baselines | planned |
 | D4 | Documentation and production configuration guide | planned |
 
-Dependency spine: A1 → A2 → A3 → A4, then B1 → B2 → B3 → B4, then C1 → C2 → C3, then D1 → D2 → D3 → D4.
+Dependency spine: A1 → A2 → A2b → A4, then B1 → B2 → B3 → B4, then C1 → C2 → C3, then D1 → D2 → D3 → D4.
+A3 was removed from the spine by its phase-1 measurement (see "Barrier accounting" below): the remaining lever is
+the worker makespan, not the barrier schedule.
 
 ## Known limitations
 
 - Region size is static; a region that becomes hot cannot be split.
-- The per-tick barrier bounds light-load performance.
+- The per-tick barrier bounds light-load performance, but the accounting below shows it is not what a
+  scheduling change can recover: 75-99 % of the wait is the worker makespan of the slice, and the barrier's own
+  cost (dispatch + completion detection) is 1.1-11.7 % of a tick. A region cannot run ahead of the server
+  thread, because the server thread's work between two barriers builds the next batch from the state the
+  previous barrier's handoff wrote.
 - Raw internal chunk mutation (the block-entity map, the section array, the raw heightmap array) is outside
   the seqlock contract; only the normal entry points are covered.
 - A worker write outside its lease is deferred to the target region's same-tick fixpoint; a write that

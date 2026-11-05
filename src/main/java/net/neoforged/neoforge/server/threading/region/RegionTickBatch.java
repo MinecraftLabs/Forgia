@@ -81,6 +81,15 @@ abstract class RegionTickBatch {
     private final List<RegionTickFailure> tickFailures = new ArrayList<>();
     private final RegionTaskBatch tasks = new RegionTaskBatch();
     private final RegionTaskBatch.Barrier groupBarrier = RegionTaskBatch.Barrier.open();
+    /**
+     * First start and last end of the groups of this batch, for {@link RegionBarrierAttribution}. Both are
+     * written by the group wrapper only while the attribution is enabled and read once by
+     * {@link #submitAndAwait} after the barrier, so a disabled run writes neither.
+     */
+    private final java.util.concurrent.atomic.AtomicLong firstGroupStartNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong lastGroupEndNanos = new java.util.concurrent.atomic.AtomicLong();
+    /** End of the barrier wait of this batch, so {@link #finish()} can report the handoff after it. */
+    private volatile long awaitEndNanos;
     private final CountDownLatch finished = new CountDownLatch(1);
     private final ThreadLocal<Boolean> executing = new ThreadLocal<>();
     private final Object mainThreadWorkLock = new Object();
@@ -228,9 +237,11 @@ abstract class RegionTickBatch {
             this.executing.set(Boolean.TRUE);
             CURRENT.set(this);
             CURRENT_BLOCK_UPDATES.set(this.blockUpdates);
+            RegionBarrierAttribution.groupStarted(this.firstGroupStartNanos);
             try {
                 work.run();
             } finally {
+                RegionBarrierAttribution.groupEnded(this.lastGroupEndNanos);
                 // Preserve the lifecycle marker when a rejected group runs inline on the publishing thread.
                 if (alreadyExecuting) {
                     this.executing.set(Boolean.TRUE);
@@ -406,6 +417,10 @@ abstract class RegionTickBatch {
             this.closeMainThreadWork(throwable);
         } finally {
             this.groupBarrier.awaitCompletion();
+            final long awaitEnd = System.nanoTime();
+            this.awaitEndNanos = awaitEnd;
+            RegionBarrierAttribution.recordBatch(this.slice, submitStart, awaitEnd, this.submitNanos,
+                    this.firstGroupStartNanos.get(), this.lastGroupEndNanos.get(), this.tasks.groupCount());
         }
         if (barrierFailure != null) {
             if (barrierFailure instanceof RuntimeException runtimeException) {
@@ -433,6 +448,7 @@ abstract class RegionTickBatch {
         // No group is running anymore; release any handoff that was enqueued but not serviced so the
         // batch can never keep a worker waiting after its lifecycle ended.
         this.closeMainThreadWork(new IllegalStateException("Region tick batch finished before its main-thread work ran"));
+        RegionBarrierAttribution.recordHandoff(this.slice, this.awaitEndNanos, System.nanoTime());
         this.finished.countDown();
     }
 

@@ -64,6 +64,7 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.PlayerRegionAudit;
+import net.neoforged.neoforge.server.threading.region.RegionBarrierAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
@@ -227,12 +228,16 @@ public class ProductionSoakGameTests {
             final List<ChunkPos> grid = soakGrid();
             final SoakWorld world = new SoakWorld(level, grid);
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, measuredTicks);
+            // The barrier accounting covers the measured window only: the warmup ticks would otherwise be part
+            // of the per-slice medians of a window whose tick time is reported separately.
+            sampler.onMeasuredWindowStart(() -> RegionBarrierAttribution.setEnabled(true));
             final SoakWatch watch = new SoakWatch(level, world, measuredTicks);
             final Heartbeat heartbeat = new Heartbeat(level, world, engine, profile);
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
             final AtomicReference<Optional<RegionThreadingDiagnostics>> after = new AtomicReference<>(Optional.empty());
             final AtomicReference<SoakSample> startSample = new AtomicReference<>();
             final AtomicReference<SoakSample> endSample = new AtomicReference<>();
+            final AtomicReference<RegionBarrierAttribution.Snapshot> barrier = new AtomicReference<>(RegionBarrierAttribution.snapshot());
             final AtomicBoolean cleaned = new AtomicBoolean();
             final GameRules.BooleanValue mobSpawning = level.getGameRules().getRule(GameRules.RULE_DOMOBSPAWNING);
             final boolean previousMobSpawning = mobSpawning.get();
@@ -258,6 +263,9 @@ public class ProductionSoakGameTests {
                 NeoForge.EVENT_BUS.unregister(sampler);
                 NeoForge.EVENT_BUS.unregister(watch);
                 NeoForge.EVENT_BUS.unregister(heartbeat);
+                // A window that failed before its report must not leave the accounting on for the next test
+                // of the same JVM.
+                RegionBarrierAttribution.setEnabled(false);
                 if (cleaned.compareAndSet(false, true)) {
                     restoreServerState.run();
                 }
@@ -311,6 +319,8 @@ public class ProductionSoakGameTests {
                         // The counters of the window end here, before the extra tick below.
                         after.set(RegionThreadingHooks.diagnostics());
                         endSample.set(watch.sampleEnd());
+                        barrier.set(RegionBarrierAttribution.snapshot());
+                        RegionBarrierAttribution.setEnabled(false);
                     })
                     // One tick after the window every entity that still ticks published its region mapping
                     // again (the mapping names the region of the tick's start position), so the end-state
@@ -318,7 +328,7 @@ public class ProductionSoakGameTests {
                     .thenIdle(1)
                     .thenExecute(() -> {
                         final List<Invariant> invariants = report(new SoakWindow(profile, level, world, sampler, watch,
-                                before.get(), after.get(), startSample.get(), endSample.get(), measuredTicks));
+                                before.get(), after.get(), startSample.get(), endSample.get(), measuredTicks, barrier.get()));
                         if (cleaned.compareAndSet(false, true)) {
                             restoreServerState.run();
                         }
@@ -991,7 +1001,7 @@ public class ProductionSoakGameTests {
     /** The window a report is written for. */
     private record SoakWindow(String profile, ServerLevel level, SoakWorld world, TickSampler sampler, SoakWatch watch,
             Optional<RegionThreadingDiagnostics> before, Optional<RegionThreadingDiagnostics> after,
-            SoakSample start, SoakSample end, int measuredTicks) {}
+            SoakSample start, SoakSample end, int measuredTicks, RegionBarrierAttribution.Snapshot barrier) {}
 
     /**
      * Prints the report of the window: the tick distribution, the drift, every counter of the window, the
@@ -1037,6 +1047,9 @@ public class ProductionSoakGameTests {
         System.out.println("SOAK_DRIFT " + csv(window.profile(), fixed(firstHalf.avgMs()), fixed(last.avgMs()), fixed(driftRatio),
                 fixed((driftRatio - 1.0) * 100.0), fixed(firstHalf.p99Ms()), fixed(last.p99Ms())));
         printCounters(window.profile(), window.before(), after, window.measuredTicks());
+        for (final String row : RegionBarrierAttribution.formatRows(window.barrier(), "SOAK_BARRIER", window.measuredTicks())) {
+            System.out.println(row);
+        }
         System.out.println("SOAK_STRUCT_HEADER " + STRUCT_HEADER);
         for (SoakSample sample : window.watch().samples()) {
             System.out.println("SOAK_STRUCT " + csv(sample.point(), Integer.toString(sample.measuredTick()),
@@ -1599,6 +1612,7 @@ public class ProductionSoakGameTests {
         private long windowEndNanos = -1L;
         private long firstGameTime = -1L;
         private long lastGameTime = -1L;
+        private Runnable measuredWindowStart;
 
         TickSampler(int warmupTicks, int measuredTicks) {
             this.warmupTicks = warmupTicks;
@@ -1610,8 +1624,19 @@ public class ProductionSoakGameTests {
             this.firstGameTime = gameTime;
         }
 
+        /**
+         * Runs {@code action} once, at the start of the first measured tick, so an instrument that must cover
+         * the measured window only starts from zero when the warmup ended.
+         */
+        void onMeasuredWindowStart(Runnable action) {
+            this.measuredWindowStart = action;
+        }
+
         @SubscribeEvent
         public void onTickPre(ServerTickEvent.Pre event) {
+            if (this.measuredWindowStart != null && this.tickIndex == this.warmupTicks) {
+                this.measuredWindowStart.run();
+            }
             this.tickStartNanos = System.nanoTime();
         }
 

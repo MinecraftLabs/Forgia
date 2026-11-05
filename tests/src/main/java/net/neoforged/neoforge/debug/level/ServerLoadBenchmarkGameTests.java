@@ -77,6 +77,7 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreading;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.RegionBarrierAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEventAttribution;
 import net.neoforged.neoforge.server.threading.region.RegionChunkTickAttribution;
@@ -465,7 +466,10 @@ public class ServerLoadBenchmarkGameTests {
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, null);
             // The attribution is reported per measured tick, so it is reset when the warmup ends and the
             // warmup itself stays unmeasured.
-            sampler.onMeasuredWindowStart(RegionBlockEntityTickAttribution::reset);
+            sampler.onMeasuredWindowStart(() -> {
+                RegionBlockEntityTickAttribution.reset();
+                RegionBarrierAttribution.reset();
+            });
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
             final AtomicReference<RegionBlockEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionBlockEntityTickAttribution.snapshot());
             final AtomicBoolean cleaned = new AtomicBoolean();
@@ -489,6 +493,7 @@ public class ServerLoadBenchmarkGameTests {
                     .thenExecute(() -> {
                         before.set(RegionThreadingHooks.diagnostics());
                         RegionBlockEntityTickAttribution.setEnabled(true);
+                        RegionBarrierAttribution.setEnabled(true);
                         attributionBefore.set(RegionBlockEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
@@ -503,6 +508,7 @@ public class ServerLoadBenchmarkGameTests {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         final RegionBlockEntityTickAttribution.Snapshot attributionAfter = RegionBlockEntityTickAttribution.snapshot();
                         RegionBlockEntityTickAttribution.setEnabled(false);
+                        reportBarrierAttribution(MEASURED_TICKS);
                         reportFurnaces(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, furnaces.size(), grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             removeFurnaces(level, furnaces);
@@ -538,7 +544,10 @@ public class ServerLoadBenchmarkGameTests {
             final TickSampler sampler = new TickSampler(WARMUP_TICKS, MEASURED_TICKS, drops);
             // The attribution is reported per measured tick, so it is reset when the warmup ends and the
             // warmup itself stays unmeasured.
-            sampler.onMeasuredWindowStart(RegionBlockEntityTickAttribution::reset);
+            sampler.onMeasuredWindowStart(() -> {
+                RegionBlockEntityTickAttribution.reset();
+                RegionBarrierAttribution.reset();
+            });
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
             final AtomicReference<RegionBlockEntityTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionBlockEntityTickAttribution.snapshot());
             final AtomicReference<Long> itemCountStart = new AtomicReference<>(0L);
@@ -564,6 +573,7 @@ public class ServerLoadBenchmarkGameTests {
                         itemCountStart.set(countItems(level, hoppers));
                         before.set(RegionThreadingHooks.diagnostics());
                         RegionBlockEntityTickAttribution.setEnabled(true);
+                        RegionBarrierAttribution.setEnabled(true);
                         attributionBefore.set(RegionBlockEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
@@ -578,6 +588,7 @@ public class ServerLoadBenchmarkGameTests {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         final RegionBlockEntityTickAttribution.Snapshot attributionAfter = RegionBlockEntityTickAttribution.snapshot();
                         RegionBlockEntityTickAttribution.setEnabled(false);
+                        reportBarrierAttribution(MEASURED_TICKS);
                         reportHoppers(helper, sampler, before.get(), attributionBefore.get(), attributionAfter, hoppers, grid.size(), itemCountStart.get(), drops.injectedItems(), admissionCache);
                         if (cleaned.compareAndSet(false, true)) {
                             removeHoppers(level, hoppers);
@@ -673,6 +684,7 @@ public class ServerLoadBenchmarkGameTests {
             sampler.onMeasuredWindowStart(() -> {
                 RegionChunkTickAttribution.reset();
                 RegionChunkTickAttribution.setMeasuredLevel(level);
+                RegionBarrierAttribution.reset();
             });
             final AtomicReference<Optional<RegionThreadingDiagnostics>> before = new AtomicReference<>(Optional.empty());
             final AtomicReference<RegionChunkTickAttribution.Snapshot> attributionBefore = new AtomicReference<>(RegionChunkTickAttribution.snapshot());
@@ -704,6 +716,7 @@ public class ServerLoadBenchmarkGameTests {
                     .thenExecute(() -> {
                         before.set(RegionThreadingHooks.diagnostics());
                         RegionChunkTickAttribution.setEnabled(true);
+                        RegionBarrierAttribution.setEnabled(true);
                         attributionBefore.set(RegionChunkTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(sampler);
@@ -716,6 +729,7 @@ public class ServerLoadBenchmarkGameTests {
                         final RegionChunkTickAttribution.Snapshot attributionAfter = RegionChunkTickAttribution.snapshot();
                         RegionChunkTickAttribution.setEnabled(false);
                         RegionChunkTickAttribution.setMeasuredLevel(null);
+                        reportBarrierAttribution(MEASURED_TICKS);
                         reportRandomTicks(helper, sampler, before.get(), attributionBefore.get(), attributionAfter,
                                 grid.size(), blocksPlaced.get(), placedFingerprint.get(), randomTickFingerprint(level, grid), level.getGameTime());
                         if (cleaned.compareAndSet(false, true)) {
@@ -958,9 +972,11 @@ public class ServerLoadBenchmarkGameTests {
                         // ends and the warmup itself stays unmeasured.
                         sampler.onMeasuredWindowStart(() -> {
                             RegionEntityTickAttribution.reset();
+                            RegionBarrierAttribution.reset();
                             deathDriver.markMeasuredWindowStart();
                         });
                         RegionEntityTickAttribution.setEnabled(true);
+                        RegionBarrierAttribution.setEnabled(true);
                         before.set(RegionThreadingHooks.diagnostics());
                         attributionBefore.set(RegionEntityTickAttribution.snapshot());
                         sampler.startWindow(level.getGameTime());
@@ -974,6 +990,7 @@ public class ServerLoadBenchmarkGameTests {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         NeoForge.EVENT_BUS.unregister(deathDriver);
                         // The counters of the diagnostic engine are read before it is replaced again.
+                        reportBarrierAttribution(MEASURED_TICKS);
                         reportEntityWorkers(helper, sampler, before.get(), attributionBefore.get(), RegionEntityTickAttribution.snapshot(), mobs, blockers, deathDriver, grid.size());
                         if (cleaned.compareAndSet(false, true)) {
                             cleanupEntityWorkerWindow(level, grid, mobs, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
@@ -1074,8 +1091,10 @@ public class ServerLoadBenchmarkGameTests {
                         // belongs to the measured ticks and to the load those ticks carry.
                         sampler.onMeasuredWindowStart(() -> {
                             deathDriver.markMeasuredWindowStart();
+                            RegionBarrierAttribution.reset();
                             before.set(RegionThreadingHooks.diagnostics());
                         });
+                        RegionBarrierAttribution.setEnabled(true);
                         sampler.startWindow(level.getGameTime());
                         NeoForge.EVENT_BUS.register(watch);
                         NeoForge.EVENT_BUS.register(sampler);
@@ -1092,6 +1111,7 @@ public class ServerLoadBenchmarkGameTests {
                         NeoForge.EVENT_BUS.unregister(sampler);
                         NeoForge.EVENT_BUS.unregister(deathDriver);
                         NeoForge.EVENT_BUS.unregister(watch);
+                        reportBarrierAttribution(measuredTicks);
                         final List<Invariant> invariants = reportSoak(helper, new SoakWindow(level, sampler, watch, before.get(), blockers, deathDriver, zombies, grid, zombieCount, measuredTicks));
                         if (cleaned.compareAndSet(false, true)) {
                             cleanupEntityWorkerWindow(level, grid, zombies, daylight, previousDaylight, mobLoot, previousMobLoot, Optional.ofNullable(replaced.get()));
@@ -3696,6 +3716,22 @@ public class ServerLoadBenchmarkGameTests {
             joiner.add(value == null ? "-" : String.valueOf(value));
         }
         return joiner.toString();
+    }
+
+    /**
+     * Prints the per-slice barrier accounting of a measured window that just ended and disables the accounting.
+     * <p>
+     * One row per slice of {@code RegionTickSlice}, so a report shows which slice the server thread parks in
+     * and how much of that wait no worker work explains.
+     *
+     * @param measuredTicks the measured ticks the window covered
+     */
+    static void reportBarrierAttribution(int measuredTicks) {
+        final RegionBarrierAttribution.Snapshot snapshot = RegionBarrierAttribution.snapshot();
+        RegionBarrierAttribution.setEnabled(false);
+        for (final String row : RegionBarrierAttribution.formatRows(snapshot, "SERVER_BENCH_BARRIER", measuredTicks)) {
+            System.out.println(row);
+        }
     }
 
     /** {@return {@code value} with a fixed number of decimals, so a report line stays locale independent} */
