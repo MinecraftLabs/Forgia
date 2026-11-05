@@ -52,12 +52,27 @@ public final class EntityIdentityLedger {
 
     private volatile boolean sealed;
 
+    /**
+     * Identities another level handed to this ledger, by UUID, waiting for their admission here.
+     * <p>
+     * A dimension change removes the entity from the old level and admits it into the new one, so without this
+     * record the new level would publish a {@link EntityIdentity.State#RESERVED} reservation for an identity
+     * that already existed: a reader of the new level would observe the identity as not yet admitted, and the
+     * identity would be released by the old level and reserved again by the new one instead of following the
+     * entity. The record is written on the server thread when the travel is announced and consumed by the
+     * admission of the same UUID and int id. A travel that is cancelled leaves its entry behind; the entry is
+     * dropped when the admission does not match it and is bounded so a cancelled travel cannot grow it.
+     */
+    private final Map<UUID, EntityIdentity> expectedTransfers = Collections.synchronizedMap(new BoundedTransferCache());
+
     /** Server-thread only diagnostics; never read by the publication path. */
     private long duplicateUuidAdmissions;
     private long duplicateIdAdmissions;
     private long rejectedTransitions;
     private long unknownTransitions;
     private long rejectedRebinds;
+    private long continuedTransfers;
+    private long unusedTransfers;
 
     /**
      * Reserves the identity of {@code entity} before the vanilla manager writes any of its maps.
@@ -68,6 +83,11 @@ public final class EntityIdentityLedger {
      * overwritten. On {@link Admission#ADMITTED} the caller must perform the vanilla writes and then
      * publish {@link #publishAdmitted(Entity)}, or publish {@link #abandon(Entity)} when the vanilla UUID
      * registration still refuses the entity.
+     * <p>
+     * An identity this ledger was handed by another level - see {@link #expectTransfer(EntityIdentity)} - is
+     * not reserved: it is published as {@link EntityIdentity.State#ADMITTED} directly, so the entry follows the
+     * entity across the dimension change and no reader of this level ever observes a reservation of an identity
+     * that already existed.
      */
     public Admission admit(Entity entity) {
         checkServerAccess("EntityIdentityLedger.admit");
@@ -76,7 +96,9 @@ public final class EntityIdentityLedger {
         }
         final UUID uuid = entity.getUUID();
         final int id = entity.getId();
-        final EntityIdentity identity = new EntityIdentity(uuid, id, EntityIdentity.State.RESERVED, this.nextEpoch());
+        final EntityIdentity transferred = this.claimTransfer(uuid, id);
+        final EntityIdentity identity = new EntityIdentity(uuid, id,
+                transferred == null ? EntityIdentity.State.RESERVED : EntityIdentity.State.ADMITTED, this.nextEpoch());
         if (this.live.putIfAbsent(uuid, identity) != null) {
             this.duplicateUuidAdmissions++;
             return Admission.DUPLICATE_UUID;
@@ -91,13 +113,64 @@ public final class EntityIdentityLedger {
     }
 
     /**
+     * {@return the live identity of {@code entity}, to be handed to the ledger of the level it travels to}
+     * <p>
+     * This reads the publication and changes nothing: a dimension change that is cancelled must leave the source
+     * level's identity untouched, so the source does not publish a departure here. The removal of the entity from
+     * the source level publishes that departure as it always did.
+     *
+     * @return the live identity, or {@code null} when this level holds none for the entity
+     */
+    @Nullable
+    public EntityIdentity liveIdentity(Entity entity) {
+        checkServerAccess("EntityIdentityLedger.liveIdentity");
+        return this.live.get(entity.getUUID());
+    }
+
+    /**
+     * Records that the identity of {@code transferred} is travelling to this ledger.
+     * <p>
+     * The next admission of the same UUID and int id continues the identity instead of reserving it: see
+     * {@link #admit(Entity)}. The record is bounded, and an admission that does not match it leaves it to be
+     * evicted rather than adopting an identity the caller did not hand over.
+     */
+    public void expectTransfer(EntityIdentity transferred) {
+        checkServerAccess("EntityIdentityLedger.expectTransfer");
+        this.expectedTransfers.put(transferred.uuid(), transferred);
+    }
+
+    /**
+     * {@return the identity {@code uuid} was handed with, when it matches the int id of the admission}
+     * <p>
+     * The entry is consumed, so one handover continues exactly one admission. A mismatch is counted and dropped:
+     * the identity was re-ided between the handover and the admission, so the admission reserves normally.
+     */
+    @Nullable
+    private EntityIdentity claimTransfer(UUID uuid, int id) {
+        final EntityIdentity transferred = this.expectedTransfers.remove(uuid);
+        if (transferred == null) {
+            return null;
+        }
+        if (transferred.entityId() != id) {
+            this.unusedTransfers++;
+            return null;
+        }
+        this.continuedTransfers++;
+        return transferred;
+    }
+
+    /**
      * Cancels a reservation whose vanilla admission did not happen, and remembers it as departed.
+     * <p>
+     * An identity that was continued from another level is published as admitted by the reservation itself, so
+     * the cancellation covers that state as well: the caller reaches here only when the vanilla UUID registration
+     * refused the entity, in which case the identity is not in the level either way.
      */
     public void abandon(Entity entity) {
         checkServerAccess("EntityIdentityLedger.abandon");
         final UUID uuid = entity.getUUID();
         final EntityIdentity reservation = this.live.get(uuid);
-        if (reservation == null || reservation.state() != EntityIdentity.State.RESERVED) {
+        if (reservation == null || (reservation.state() != EntityIdentity.State.RESERVED && reservation.state() != EntityIdentity.State.ADMITTED)) {
             return;
         }
         this.retire(reservation, new EntityIdentity(uuid, reservation.entityId(), EntityIdentity.State.GONE, this.nextEpoch()));
@@ -291,6 +364,26 @@ public final class EntityIdentityLedger {
         return this.rejectedRebinds;
     }
 
+    /**
+     * {@return the number of admissions that continued an identity another level handed over}
+     * <p>
+     * A continued admission publishes {@link EntityIdentity.State#ADMITTED} directly instead of reserving the
+     * identity again, so this counts the dimension changes whose identity followed the entity.
+     */
+    public long continuedTransfers() {
+        return this.continuedTransfers;
+    }
+
+    /**
+     * {@return the number of handovers whose admission did not match the handed identity}
+     * <p>
+     * The identity was re-ided or the travel was cancelled between the handover and the admission, so the
+     * admission reserved normally instead of adopting a stale record.
+     */
+    public long unusedTransfers() {
+        return this.unusedTransfers;
+    }
+
     private void transition(Entity entity, EntityIdentity.State target, String operation) {
         checkServerAccess(operation);
         final UUID uuid = entity.getUUID();
@@ -332,6 +425,23 @@ public final class EntityIdentityLedger {
 
     private static final class BoundedDepartureCache extends LinkedHashMap<UUID, EntityIdentity> {
         BoundedDepartureCache() {
+            super(MAX_REMEMBERED_DEPARTURES, 0.75F, false);
+        }
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<UUID, EntityIdentity> eldest) {
+            return size() > MAX_REMEMBERED_DEPARTURES;
+        }
+    }
+
+    /**
+     * The handovers of other levels that this ledger has not consumed yet.
+     * <p>
+     * Bounded like the departure cache: a travel that is announced and then cancelled never reaches the admission
+     * that would consume its entry, so an unbounded map would grow with cancelled travels.
+     */
+    private static final class BoundedTransferCache extends LinkedHashMap<UUID, EntityIdentity> {
+        BoundedTransferCache() {
             super(MAX_REMEMBERED_DEPARTURES, 0.75F, false);
         }
 

@@ -180,6 +180,15 @@ import java.util.Map;
  * for the owning region, a delivered column one that region replayed on its own worker, a refused column one the
  * capture bound refused at the call site, and a dropped column one that was never replayed. Every column reaches
  * exactly one of visited, replayed or dropped.
+ * <p>
+ * {@link PlayerRegionCounters} reports the region transitions of players, which are published at the start of the
+ * entity slice of the level they are in ({@link PlayerRegionTransitions}). A transition is one departure plus one
+ * entry and is counted by its cause; a publication that the defined point refused because a batch of the level
+ * was in flight, the engine had shut down or the level identity had closed is counted as refused, and an
+ * attempt of that kind is counted as a transition during a batch. A deferred arrival is a tick list membership
+ * of a player whose region mapping is published at the next defined point, which is what a login and the arrival
+ * half of a dimension change are. The invariant counters report the audits of "a player is in exactly one region
+ * of each level it is in": {@link #playerRegionInvariantFailures()} must stay zero.
  */
 public record RegionThreadingDiagnostics(
         int regionCount,
@@ -307,6 +316,7 @@ public record RegionThreadingDiagnostics(
         BorderUpdateCounters borderUpdates,
         BlockEventPhaseCounters blockEventPhase,
         GameEventCounters gameEvents,
+        PlayerRegionCounters playerRegions,
         PoiCounters poiCounters,
         SaveCounters saveCounters,
         WorkerDispatchCounters workerDispatch,
@@ -453,6 +463,57 @@ public record RegionThreadingDiagnostics(
                     + "/blockWritesOverflowed=" + this.blockWritesOverflowed
                     + "/blockWritesDropped=" + this.blockWritesDropped
                     + "/readAfterBlockWrite=" + this.readAfterBlockWrite;
+        }
+    }
+
+    /**
+     * The counters of the player region transitions.
+     * <p>
+     * The region of a player is published at the start of the entity slice of the level the player is in, before
+     * the batch of that slice is published, so walking, a teleport, a portal and a dimension change are all
+     * published at that one quiescent point. {@code entries} counts the publications that put a player into a
+     * region and {@code departures} the ones that took it out of another; a transition is one of each, counted
+     * once more by its cause. {@code walkTransitions}, {@code teleportTransitions}, {@code portalTransitions} and
+     * {@code dimensionTransitions} therefore sum to the number of transitions, not to the number of publications.
+     * {@code transitionsDuringBatch} counts the publications the defined point refused because a batch of the
+     * level was in flight; such a transition is published at the next start of the slice instead, so the counter
+     * is a caller that published outside the point and never a torn mapping. {@code refusedTransitions} counts
+     * every publication that did not happen - a batch in flight, a shut-down engine, a closed level identity or a
+     * removed player. {@code deferredArrivals} counts the tick list memberships of players whose mapping is
+     * published at the next defined point, which is a login and the arrival half of a dimension change.
+     * {@code identityHandovers} counts the dimension changes whose identity was handed to the destination level's
+     * ledger, so the entry follows the player instead of being reserved again there.
+     * {@code invariantChecks} and {@code invariantFailures} report the one-region invariant: every publication is
+     * checked, every audit adds one check, and a failure is a player in no region of its level or in more than
+     * one.
+     */
+    public record PlayerRegionCounters(
+            long entries,
+            long departures,
+            long walkTransitions,
+            long teleportTransitions,
+            long portalTransitions,
+            long dimensionTransitions,
+            long transitionsDuringBatch,
+            long refusedTransitions,
+            long deferredArrivals,
+            long identityHandovers,
+            long invariantChecks,
+            long invariantFailures) {
+        @Override
+        public String toString() {
+            return "entries=" + this.entries
+                    + "/departures=" + this.departures
+                    + "/walk=" + this.walkTransitions
+                    + "/teleport=" + this.teleportTransitions
+                    + "/portal=" + this.portalTransitions
+                    + "/dimension=" + this.dimensionTransitions
+                    + "/duringBatch=" + this.transitionsDuringBatch
+                    + "/refused=" + this.refusedTransitions
+                    + "/deferredArrivals=" + this.deferredArrivals
+                    + "/identityHandovers=" + this.identityHandovers
+                    + "/invariantChecks=" + this.invariantChecks
+                    + "/invariantFailures=" + this.invariantFailures;
         }
     }
 

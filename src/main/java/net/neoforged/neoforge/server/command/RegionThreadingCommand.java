@@ -196,6 +196,9 @@ final class RegionThreadingCommand {
                 + ", packedRegions=" + dispatch.packedRegions()
                 + ", regionsPerPackedTask=" + regionsPerPackedTask(dispatch)
                 + ", partialPackFallbacks=" + dispatch.partialPackFallbacks()), false);
+        // A fifth independent line for the player region transitions, so the four lines above keep their shape
+        // for scripts that match them.
+        source.sendSuccess(() -> Component.literal("Region players: " + diagnostics.playerRegions()), false);
     }
 
     /** {@return the average number of regions a packed task held, formatted for the diagnostics line} */

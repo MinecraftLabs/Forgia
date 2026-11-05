@@ -657,6 +657,50 @@ final class ThreadedRegionizer {
         }
     }
 
+    /**
+     * Publishes the region mapping and the tick membership of one player under a single write lock.
+     * <p>
+     * The mapping write and the index migration of {@link #addEntityLocked(Entity, RegionCoordinate)} are the
+     * same write, so a reader never observes the player in two regions or in none: the mapping names the
+     * destination before the index entry leaves the source, and the entry keeps its tick order. The membership
+     * is marked ticking in the same lock, so a player whose region transition is published at the start of the
+     * level's entity slice is handed over by the region of that slice.
+     *
+     * @return the destination region, or {@code null} when the level identity of {@code coordinate} is closed
+     */
+    @Nullable
+    RegionState publishPlayerRegion(Entity entity, RegionCoordinate coordinate) {
+        final long stamp = this.acquireWriteLock();
+        try {
+            final RegionState region = this.addEntityLocked(entity, coordinate);
+            if (region == null) {
+                return null;
+            }
+            region.markEntityTickEntryTicking(entity, this.entityTickSequence.incrementAndGet());
+            return region;
+        } finally {
+            this.releaseWriteLock(stamp);
+        }
+    }
+
+    /**
+     * {@return the number of regions whose entity tick index holds {@code entity}}
+     * <p>
+     * One region is the invariant: the regionizer maps an entity once, so a second index entry is a second
+     * region that would hand the entity over as well. The scan is the structural half of the player region
+     * invariant and only runs in an audit, never in the tick.
+     */
+    int indexedRegionCount(Entity entity) {
+        final Set<RegionState> live = this.uniqueRegions();
+        int count = 0;
+        for (final RegionState region : live) {
+            if (region.entityTickEntry(entity) != null) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     void removeEntity(Entity entity) {
         final long stamp = this.acquireWriteLock();
         try {

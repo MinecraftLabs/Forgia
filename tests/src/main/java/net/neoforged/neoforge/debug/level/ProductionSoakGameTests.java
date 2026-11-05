@@ -63,6 +63,7 @@ import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.PlayerRegionAudit;
 import net.neoforged.neoforge.server.threading.region.RegionCoordinate;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
@@ -1157,6 +1158,50 @@ public class ProductionSoakGameTests {
                     - start.droppedDeferredEntitySectionUpdatesForRemovedEntity();
             invariants.add(Invariant.of("droppedDeferredEntitySectionUpdatesOfLiveEntities",
                     droppedSectionUpdates - droppedSectionUpdatesOfRemovedEntities, 0L));
+            // The player region transitions: the player-like entity of the window crosses the border of its row
+            // every {@value #PLAYER_MOVE_INTERVAL_TICKS} ticks, and its region is published at the start of the
+            // level's entity slice. The counters are the measurement of the transition bookkeeping, and the audit
+            // is the invariant that the player is in exactly one region of the level it is in.
+            final RegionThreadingDiagnostics.PlayerRegionCounters players = engine.playerRegions();
+            final RegionThreadingDiagnostics.PlayerRegionCounters playersStart = start.playerRegions();
+            final long playerEntries = players.entries() - playersStart.entries();
+            final long playerDepartures = players.departures() - playersStart.departures();
+            final long playerWalkTransitions = players.walkTransitions() - playersStart.walkTransitions();
+            final long playerTeleportTransitions = players.teleportTransitions() - playersStart.teleportTransitions();
+            final long playerPortalTransitions = players.portalTransitions() - playersStart.portalTransitions();
+            final long playerDimensionTransitions = players.dimensionTransitions() - playersStart.dimensionTransitions();
+            final long playerRefusedTransitions = players.refusedTransitions() - playersStart.refusedTransitions();
+            final long playerTransitionsDuringBatch = players.transitionsDuringBatch() - playersStart.transitionsDuringBatch();
+            final long playerDeferredArrivals = players.deferredArrivals() - playersStart.deferredArrivals();
+            final long playerInvariantFailures = players.invariantFailures() - playersStart.invariantFailures();
+            final PlayerRegionAudit playerAudit = window.watch().engineState().auditPlayerRegions(level);
+            System.out.println("SOAK_PLAYERS_HEADER entries,departures,walk,teleport,portal,dimension,refused,duringBatch,"
+                    + "deferredArrivals,invariantFailures,audited,unplaced,duplicated,misplaced,checks,failures,"
+                    + "checkedMisplacements");
+            System.out.println("SOAK_PLAYERS " + csv(Long.toString(playerEntries), Long.toString(playerDepartures),
+                    Long.toString(playerWalkTransitions), Long.toString(playerTeleportTransitions),
+                    Long.toString(playerPortalTransitions), Long.toString(playerDimensionTransitions),
+                    Long.toString(playerRefusedTransitions), Long.toString(playerTransitionsDuringBatch),
+                    Long.toString(playerDeferredArrivals), Long.toString(playerInvariantFailures),
+                    Integer.toString(playerAudit.players()), Integer.toString(playerAudit.unplaced()),
+                    Integer.toString(playerAudit.duplicated()), Integer.toString(playerAudit.misplaced()),
+                    Integer.toString(window.watch().playerRegionChecks()), Integer.toString(window.watch().playerRegionFailures()),
+                    Integer.toString(window.watch().playerRegionMisplacements())));
+            if (!"-".equals(playerAudit.firstProblem())) {
+                System.out.println("SOAK_INVARIANT_DETAIL playerRegion " + playerAudit.firstProblem());
+            }
+            invariants.add(Invariant.of("playerRegionTransitions", playerEntries > 0 ? 1 : 0, 1));
+            invariants.add(Invariant.of("playerRegionTransitionsByKind",
+                    playerWalkTransitions + playerTeleportTransitions + playerPortalTransitions + playerDimensionTransitions,
+                    playerDepartures));
+            invariants.add(Invariant.of("playerRegionRefusedTransitions", playerRefusedTransitions, 0L));
+            invariants.add(Invariant.of("playerRegionInvariantFailures", playerInvariantFailures, 0L));
+            invariants.add(Invariant.of("playerRegionUnplaced", playerAudit.unplaced(), 0));
+            invariants.add(Invariant.of("playerRegionDuplicated", playerAudit.duplicated(), 0));
+            invariants.add(Invariant.of("playerRegionAudited", playerAudit.players() > 0 ? 1 : 0, 1));
+            invariants.add(Invariant.of("playerRegionCheckedEveryTick",
+                    window.watch().playerRegionChecks() >= window.measuredTicks() ? 1 : 0, 1));
+            invariants.add(Invariant.of("playerRegionFailuresPerTick", window.watch().playerRegionFailures(), 0));
             invariants.add(Invariant.of("mailboxDeliveryFailures", engine.mailboxDeliveryFailures() - start.mailboxDeliveryFailures(), 0L));
             invariants.add(Invariant.of("mailboxDroppedMessages",
                     (engine.mailboxDroppedRetiredMessages() - start.mailboxDroppedRetiredMessages())
@@ -1651,6 +1696,10 @@ public class ProductionSoakGameTests {
         private final List<Entity> pendingMappingChecks = new ArrayList<>();
         private int persistentMappingMismatches;
         private int mappingMismatchDetails;
+        private int playerRegionChecks;
+        private int playerRegionFailures;
+        private int playerRegionMisplacements;
+        private int playerRegionDetails;
         private int redstoneTicks;
         private long firstItemMismatchTick = -1L;
         private long firstOwnershipViolationTick = -1L;
@@ -1769,6 +1818,26 @@ public class ProductionSoakGameTests {
                     }
                 }
             }
+            // The player region invariant of every tick, checked after the level tick and before the player-like
+            // entity is moved: at that point the publication point of the tick has run, so a player that crossed
+            // the border of its row is in exactly one region of the level, at the region of its position, and no
+            // region indexes it twice. The move below happens after the tick, so the mapping lags it until the
+            // publication point of the next tick - which is exactly the window the counter
+            // {@code playerRegionMisplacements} reports.
+            if (this.engineState != null) {
+                final PlayerRegionAudit audit = this.engineState.auditPlayerRegions(this.level);
+                this.playerRegionChecks++;
+                this.playerRegionMisplacements += audit.misplaced();
+                if (!audit.ok() || audit.misplaced() > 0) {
+                    this.playerRegionFailures++;
+                    if (this.playerRegionDetails < 3) {
+                        this.playerRegionDetails++;
+                        System.out.println("SOAK_PLAYER_REGION_MISMATCH tick=" + this.tick + " unplaced=" + audit.unplaced()
+                                + " duplicated=" + audit.duplicated() + " misplaced=" + audit.misplaced()
+                                + " " + audit.firstProblem());
+                    }
+                }
+            }
             if (this.tick % TRAMPLE_INTERVAL_TICKS == 0) {
                 this.world.restoreTrampleFixture();
             }
@@ -1823,6 +1892,21 @@ public class ProductionSoakGameTests {
 
         int persistentMappingMismatches() {
             return this.persistentMappingMismatches;
+        }
+
+        /** {@return the number of ticks whose player region invariant was audited} */
+        int playerRegionChecks() {
+            return this.playerRegionChecks;
+        }
+
+        /** {@return the number of audits that found a player in no region, in two regions or not at its position} */
+        int playerRegionFailures() {
+            return this.playerRegionFailures;
+        }
+
+        /** {@return the number of audits that found a player in one region of the level, but not at its position} */
+        int playerRegionMisplacements() {
+            return this.playerRegionMisplacements;
         }
 
         int redstoneTicks() {
@@ -2007,6 +2091,17 @@ public class ProductionSoakGameTests {
 
         int pendingDeferredMoveCount() {
             return ((java.util.Collection<?>) fieldValue(this.pendingDeferredEntityMoves, this.engine)).size();
+        }
+
+        /**
+         * {@return the audit of the player region invariant of {@code level}}
+         * <p>
+         * The audit is the structural half of "a player is in exactly one region of each level it is in": it reads
+         * the mapping and the region tick indexes of every player the level ticks, so a player in no region or in
+         * two regions fails the soak instead of only showing up as a mapping mismatch.
+         */
+        PlayerRegionAudit auditPlayerRegions(ServerLevel level) {
+            return this.engine.auditPlayerRegions(level);
         }
 
         /**

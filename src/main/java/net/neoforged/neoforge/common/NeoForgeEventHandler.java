@@ -110,6 +110,21 @@ public class NeoForgeEventHandler {
         }
     }
 
+    /**
+     * Records the dimension change of a player before it leaves its level.
+     * <p>
+     * {@code EntityTravelToDimensionEvent} is fired by the travel hook at the top of both
+     * {@code Entity#changeDimension} and {@code ServerPlayer#changeDimension}, so it names the destination before
+     * the removal from the old level runs. The region threading bridge uses it to publish the region transition
+     * at its defined point and to hand the player's identity to the destination level's ledger.
+     */
+    @SubscribeEvent
+    public void onTravelToDimension(net.neoforged.neoforge.event.entity.EntityTravelToDimensionEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            RegionThreadingHooks.recordPlayerDimensionTransition(player, event.getDimension());
+        }
+    }
+
     /*
     @SubscribeEvent
     public void playerChangeDimension(PlayerEvent.PlayerChangedDimensionEvent event)

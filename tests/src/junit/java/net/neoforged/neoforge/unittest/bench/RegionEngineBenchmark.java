@@ -21,8 +21,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import net.minecraft.core.BlockPos;
@@ -33,6 +35,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.TickRateManager;
@@ -130,6 +133,12 @@ class RegionEngineBenchmark {
     private static final int FURNACE_Y = 64;
     /** Keeps a furnace lit for every measured tick; a lit furnace with an empty inventory only burns. */
     private static final int LIT_TIME_TICKS = 10_000_000;
+    /** Player counts of the region transition measurement. */
+    private static final int[] PLAYER_COUNTS = { 1, 8, 32 };
+    /** Publications per row of the region transition measurement. */
+    private static final int PLAYER_TRANSITION_TICKS = 2000;
+    private static final String PLAYER_TRANSITION_HEADER = "players,ticks,mode,totalMs,nanosPerPlayerTick,transitions,entries,departures";
+    private static final java.util.concurrent.atomic.AtomicInteger ENTITY_IDS = new java.util.concurrent.atomic.AtomicInteger(1);
     private static final String CSV_HEADER = "workload,workerThreads,regions,workPerRegion,ticksPerRun,totalMs,msPerTick,speedupVs1Worker,leasedRegions,blockEntityTicksOnWorkers,fallbackBlockEntityTicks,scheduledTicksOnWorkers,fallbackScheduledTicks,skippedScheduledTicks,rejectedWorkerTasks";
 
     /**
@@ -179,6 +188,114 @@ class RegionEngineBenchmark {
         printCsv("scheduled-tick", results);
         assertEquals(WORKER_COUNTS.length * REGION_COUNTS.length * WORK_PER_REGION.length, results.size(),
                 "every scheduled-tick configuration must produce one row");
+    }
+
+    /**
+     * Measures what the player region transition bookkeeping costs at the defined publication point.
+     * <p>
+     * The region of every player of a level is published at the start of the level's entity slice, so the cost
+     * of one player per tick is the cost of that publication. Two modes are measured against the same entry
+     * point: a player that stays in its region, whose publication only reads the mapping back, and a player that
+     * teleports to the other region before every publication, whose publication takes the regionizer write lock
+     * and migrates the region tick index. The difference of the two rows is the cost of one transition; the
+     * counters are asserted so the two rows measure what they claim.
+     */
+    @Test
+    void reportsPlayerRegionTransitionCost() {
+        final List<PlayerTransitionRow> rows = new ArrayList<>();
+        for (final int players : PLAYER_COUNTS) {
+            rows.add(measurePlayerPublication(players, false));
+            rows.add(measurePlayerPublication(players, true));
+        }
+        System.out.println();
+        System.out.println("CSV player-region-transitions (" + PLAYER_TRANSITION_TICKS + " publications per row)");
+        System.out.println(PLAYER_TRANSITION_HEADER);
+        for (final PlayerTransitionRow row : rows) {
+            System.out.printf(Locale.ROOT, "%d,%d,%s,%.3f,%.1f,%d,%d,%d%n",
+                    row.players(), row.ticks(), row.mode(), row.totalMs(), row.nanosPerPlayerTick(),
+                    row.transitions(), row.entries(), row.departures());
+        }
+    }
+
+    /**
+     * Measures {@value #PLAYER_TRANSITION_TICKS} publications of {@code players} players on a fresh engine.
+     *
+     * @param moving {@code true} when every player teleports to the other region before every publication
+     */
+    private static PlayerTransitionRow measurePlayerPublication(int players, boolean moving) {
+        final RegionThreadingEngine engine = new RegionThreadingEngine(2, false, false, true, false, false, false, RegionLayout.FIXED_3X3);
+        RegionThreadingManager.install(engine);
+        try {
+            final ServerLevel level = mockLevel();
+            engine.addRegionSection(level, 0, 0);
+            engine.addRegionSection(level, REGION_CHUNK_SIZE, 0);
+            final List<AtomicReference<BlockPos>> positions = new ArrayList<>(players);
+            for (int index = 0; index < players; index++) {
+                final AtomicReference<BlockPos> position = new AtomicReference<>(new BlockPos(1 + index, 64, 1));
+                positions.add(position);
+                // The tick list membership hook of the level tracks the player; the region mapping itself is
+                // published at the defined point measured below.
+                engine.entityTickStarted(level, benchmarkPlayer(level, position));
+            }
+            for (int tick = 0; tick < WARMUP_TICKS; tick++) {
+                publishPlayers(engine, level, positions, moving);
+            }
+            final RegionThreadingDiagnostics.PlayerRegionCounters before = engine.diagnostics().playerRegions();
+            final long start = System.nanoTime();
+            for (int tick = 0; tick < PLAYER_TRANSITION_TICKS; tick++) {
+                publishPlayers(engine, level, positions, moving);
+            }
+            final long elapsed = System.nanoTime() - start;
+            final RegionThreadingDiagnostics.PlayerRegionCounters after = engine.diagnostics().playerRegions();
+            final long transitions = after.walkTransitions() - before.walkTransitions()
+                    + after.teleportTransitions() - before.teleportTransitions()
+                    + after.portalTransitions() - before.portalTransitions()
+                    + after.dimensionTransitions() - before.dimensionTransitions();
+            final long expected = moving ? (long) PLAYER_TRANSITION_TICKS * players : 0L;
+            assertEquals(expected, transitions, () -> "the " + (moving ? "moving" : "steady") + " row of " + players
+                    + " players must publish one transition per player and publication");
+            assertEquals(0L, after.invariantFailures() - before.invariantFailures(), "the player region invariant must never fail");
+            final double totalMs = elapsed / 1_000_000.0;
+            return new PlayerTransitionRow(players, PLAYER_TRANSITION_TICKS, moving ? "moving" : "steady", totalMs,
+                    elapsed / (double) (PLAYER_TRANSITION_TICKS * players),
+                    transitions, after.entries() - before.entries(), after.departures() - before.departures());
+        } finally {
+            RegionThreadingManager.clear();
+        }
+    }
+
+    /** Runs one entity slice entry of the level, which is where the region of every player is published. */
+    private static void publishPlayers(RegionThreadingEngine engine, ServerLevel level, List<AtomicReference<BlockPos>> positions, boolean moving) {
+        if (moving) {
+            for (int index = 0; index < positions.size(); index++) {
+                // Alternate between the two regions: region 0 covers chunks 0..2, region 1 chunks 3..5.
+                final boolean second = index % 2 == 0;
+                positions.get(index).set(new BlockPos(second ? REGION_CHUNK_SIZE * 16 + 1 : 1, 64, 1));
+            }
+        }
+        engine.beginEntityTickPlan(level, entity -> true, BOUNDED_BARRIER);
+    }
+
+    /** {@return a player of {@code level} at the mutable position of {@code position}} */
+    private static ServerPlayer benchmarkPlayer(ServerLevel level, AtomicReference<BlockPos> position) {
+        final ServerPlayer player = mock(ServerPlayer.class);
+        when(player.level()).thenReturn(level);
+        when(player.blockPosition()).thenAnswer(invocation -> position.get());
+        when(player.chunkPosition()).thenAnswer(invocation -> {
+            final BlockPos pos = position.get();
+            return new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4);
+        });
+        when(player.getUUID()).thenReturn(UUID.randomUUID());
+        when(player.getId()).thenReturn(nextEntityId());
+        when(player.isRemoved()).thenReturn(false);
+        when(player.isAlwaysTicking()).thenReturn(true);
+        when(player.getPortalCooldown()).thenReturn(0);
+        when(player.toString()).thenReturn("benchmark-player");
+        return player;
+    }
+
+    private static int nextEntityId() {
+        return ENTITY_IDS.getAndIncrement();
     }
 
     /**
@@ -298,6 +415,22 @@ class RegionEngineBenchmark {
                 after.skippedScheduledTicks() - before.skippedScheduledTicks(),
                 after.rejectedWorkerTaskCount() - before.rejectedWorkerTaskCount());
     }
+
+    /**
+     * One row of the player region transition measurement.
+     *
+     * @param players            the players whose region was published per tick
+     * @param ticks              the publications the row measured
+     * @param mode               {@code steady} for players that stay in their region, {@code moving} for one
+     *                           teleport per player and publication
+     * @param totalMs            the wall time of the row
+     * @param nanosPerPlayerTick the wall time per player and publication
+     * @param transitions        the transitions the engine counted for the row
+     * @param entries            the region entries the engine counted for the row
+     * @param departures         the region departures the engine counted for the row
+     */
+    private record PlayerTransitionRow(int players, int ticks, String mode, double totalMs, double nanosPerPlayerTick,
+            long transitions, long entries, long departures) {}
 
     /**
      * {@return the median run of one configuration}

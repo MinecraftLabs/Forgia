@@ -34,15 +34,18 @@ import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.RandomSource;
 import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.projectile.FishingHook;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -218,6 +221,11 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong unindexedEntityTickStarts = new AtomicLong();
     /** Level ticks that fell back to the per-entity entity plan because the level's region index is unavailable. */
     private final AtomicLong entityTickIndexFallbacks = new AtomicLong();
+    /**
+     * The region transitions of players: the defined publication point of a player's region, the counters of the
+     * transitions by kind and the one-region invariant.
+     */
+    private final PlayerRegionTransitions playerRegions = new PlayerRegionTransitions();
     /**
      * Levels whose entity tick index was seeded from the level's authoritative tick list.
      */
@@ -2337,7 +2345,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 region = null;
                 retry = false;
             } else {
-                region = this.regionizer.moveEntity(entity, coordinate);
+                region = this.resolveEntityTickRegion(entity, coordinate);
                 // The level identity may have been unloaded for region threading; run the tick inline
                 // like vanilla instead of creating a region that the unload already excluded.
                 inline = region == null;
@@ -2373,6 +2381,24 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * {@return the region whose lease runs the tick of {@code entity}, or {@code null} when the tick has to run
+     * inline}
+     * <p>
+     * Every other entity publishes the region of its live position here, which is how a server-thread entity tick
+     * keeps its mapping current. A player's region is published at the start of its level's entity slice and
+     * nowhere else, so its tick leases the region the mapping names: a player that teleported during the tick is
+     * ticked under the region it is mapped to, and the transition is published at the next defined point. A
+     * player without a mapping runs its tick inline, exactly like an entity whose level identity closed.
+     */
+    @Nullable
+    private RegionState resolveEntityTickRegion(Entity entity, RegionCoordinate coordinate) {
+        if (entity instanceof ServerPlayer) {
+            return this.regionizer.regionFor(entity);
+        }
+        return this.regionizer.moveEntity(entity, coordinate);
+    }
+
+    /**
      * {@return the batch group that owns the current worker task, or {@code null} outside an entity batch}
      */
     @Nullable
@@ -2384,6 +2410,12 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * Starts collecting the entities of the current {@code level} tick that should tick on region workers.
+     * <p>
+     * This is also the publication point of the region of every player of the level: the call runs on the server
+     * thread at the start of the entity slice, before the batch of the slice is published and before any region
+     * of the level is leased, so walking, a teleport, a portal and a dimension change are all published here and
+     * the target region reads the migrated index entry in the batch of this same slice. See
+     * {@link PlayerRegionTransitions}.
      *
      * @return the plan to fill, or {@code null} when entity ticks have to stay on the server thread
      */
@@ -2410,7 +2442,11 @@ public final class RegionThreadingEngine implements RegionThreading {
             // batch for region state that no longer exists. The publication re-checks this atomically.
             return null;
         }
-        if (!this.seedEntityTickIndex(level)) {
+        final boolean seeded = this.seedEntityTickIndex(level);
+        // The defined point of every player region transition of this level: the region index of the level is
+        // seeded, the batch of this slice is not published yet and no region of the level is leased.
+        this.playerRegions.publish(this, level);
+        if (!seeded) {
             // The level's authoritative tick list could not be seeded into the region index (a level without
             // a tick list, or a retiring identity). The per-region index is then not a complete view of the
             // level's entities, so this tick keeps the per-entity collection instead of dropping entities the
@@ -2448,11 +2484,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         if (this.seededEntityTickLevels.contains(level)) {
             return true;
         }
-        if (!level.forEachEntityInTickListForRegionIndex(entity -> {
-            if (!this.regionizer.onEntityTickStarted(level, entity)) {
-                this.unindexedEntityTickStarts.incrementAndGet();
-            }
-        })) {
+        if (!level.forEachEntityInTickListForRegionIndex(entity -> this.entityTickStarted(level, entity))) {
             return false;
         }
         this.seededEntityTickLevels.add(level);
@@ -2465,10 +2497,18 @@ public final class RegionThreadingEngine implements RegionThreading {
      * <p>
      * Called by the entity tick list hook on the server thread. A server that does not execute entity ticks on
      * region workers keeps the vanilla tick list only.
+     * <p>
+     * A player that has no region mapping of this level yet - a login, or the arrival of a dimension change -
+     * does not publish one here: its mapping is published at the start of the level's entity slice, like every
+     * other player region transition. The membership is not lost, because every player of a level is in its tick
+     * list by the time that slice starts.
      */
     @ApiStatus.Internal
     public void entityTickStarted(ServerLevel level, Entity entity) {
         if (!this.entityTickWorkerExecutionEnabled || this.shutdown) {
+            return;
+        }
+        if (entity instanceof ServerPlayer player && this.playerRegions.deferArrival(this, level, player)) {
             return;
         }
         if (!this.regionizer.onEntityTickStarted(level, entity)) {
@@ -2486,6 +2526,9 @@ public final class RegionThreadingEngine implements RegionThreading {
     public void entityTickEnded(ServerLevel level, Entity entity) {
         if (!this.entityTickWorkerExecutionEnabled || this.shutdown) {
             return;
+        }
+        if (entity instanceof ServerPlayer player) {
+            this.playerRegions.untrackPlayer(level, player);
         }
         this.regionizer.onEntityTickEnded(level, entity);
     }
@@ -3688,6 +3731,112 @@ public final class RegionThreadingEngine implements RegionThreading {
             return null;
         }
         return region;
+    }
+
+    /**
+     * Publishes the region mapping and the tick membership of one player of {@code level}.
+     * <p>
+     * The mapping write, the index migration and the membership mark are one regionizer write, so a reader
+     * observes the player in exactly one region of the level at every point. The caller is
+     * {@link PlayerRegionTransitions}, which publishes every player of a level at the start of the level's entity
+     * slice.
+     *
+     * @return the region the player is mapped into, or {@code null} when the level identity closed
+     */
+    @Nullable
+    RegionState publishPlayerRegion(ServerLevel level, ServerPlayer player, RegionCoordinate coordinate) {
+        final RegionState region = this.regionizer.publishPlayerRegion(player, coordinate);
+        if (region != null) {
+            this.notifyEntityMoved(player);
+        }
+        return region;
+    }
+
+    /**
+     * {@return the number of regions whose entity tick index holds {@code entity}}
+     * <p>
+     * One region is the invariant: a player indexed by two regions would be handed to the server thread twice, and
+     * a player indexed by none is never handed over. The scan is the structural half of the player region
+     * invariant and only runs in an audit, never in the tick.
+     */
+    @ApiStatus.Internal
+    public int indexedRegionCount(Entity entity) {
+        return this.regionizer.indexedRegionCount(entity);
+    }
+
+    /** {@return true when a region tick batch of {@code level} is published and has not finished yet} */
+    boolean hasActiveBatch(ServerLevel level) {
+        for (final RegionTickBatch batch : this.activeTickBatches) {
+            if (batch.level() == level) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** {@return true once the engine shut down and no region state may be published any more} */
+    boolean isShutDown() {
+        return this.shutdown;
+    }
+
+    /** {@return true when the level identity of {@code level} finished a level clear} */
+    boolean isLevelClosed(ServerLevel level) {
+        return this.regionizer.isLevelClosed(level);
+    }
+
+    /**
+     * Records that {@code player} is about to change level, before the removal from its old level runs.
+     * <p>
+     * The region of a player is published at the start of the entity slice of the level the player is in, so this
+     * records the cause of the transition the publication will see and counts a transition that happens while a
+     * batch of the old level is in flight. The identity of the player is handed to the ledger of the destination
+     * level here, so the destination publishes the same identity as a continuation instead of reserving it
+     * again; see {@link EntityIdentityLedger#liveIdentity(Entity)}.
+     * <p>
+     * Runs on the thread that changes the dimension, which is the server thread of the level.
+     */
+    @ApiStatus.Internal
+    public void recordPlayerDimensionTransition(ServerPlayer player, ResourceKey<Level> destination) {
+        if (!(player.level() instanceof ServerLevel source)) {
+            return;
+        }
+        this.playerRegions.noteDimensionChange(this, player);
+        final MinecraftServer server = source.getServer();
+        final ServerLevel destinationLevel = server == null ? null : server.getLevel(destination);
+        if (destinationLevel == null || destinationLevel == source) {
+            return;
+        }
+        final EntityIdentity identity = source.entityIdentityLedger().liveIdentity(player);
+        if (identity != null) {
+            destinationLevel.entityIdentityLedger().expectTransfer(identity);
+            this.playerRegions.recordIdentityHandover();
+        }
+    }
+
+    /**
+     * {@return the audit of the player region invariant of {@code level}}
+     * <p>
+     * Every player of the level must be mapped into exactly one region of it. The audit counts its checks and its
+     * failures in the diagnostics and reports the first problem, so a caller can assert on the result without
+     * having to describe it again.
+     */
+    @ApiStatus.Internal
+    public PlayerRegionAudit auditPlayerRegions(ServerLevel level) {
+        return this.playerRegions.audit(this, level);
+    }
+
+    /**
+     * Asserts the player region invariant of {@code level}.
+     *
+     * @throws IllegalStateException when a player of the level is in no region of it or in more than one
+     */
+    @ApiStatus.Internal
+    public void assertPlayerRegions(ServerLevel level) {
+        final PlayerRegionAudit audit = this.auditPlayerRegions(level);
+        if (!audit.ok()) {
+            throw new IllegalStateException("A player is not in exactly one region of its level: " + audit.firstProblem()
+                    + " (players=" + audit.players() + ", unplaced=" + audit.unplaced() + ", duplicated=" + audit.duplicated() + ")");
+        }
     }
 
     /**
@@ -6835,9 +6984,17 @@ public final class RegionThreadingEngine implements RegionThreading {
 
     /**
      * Tracks an entity in the native regionizer facade.
+     * <p>
+     * A player is the exception: its region mapping is published at the start of its level's entity slice and not
+     * when the level announces it, so a dimension change - which announces the player in the destination level
+     * from inside the source level's tick - has one writer like every other transition. The tick membership hook
+     * records the player instead, and the publication point publishes it; see {@link PlayerRegionTransitions}.
      */
     @ApiStatus.Internal
     public void addRegionEntity(Entity entity) {
+        if (entity instanceof ServerPlayer) {
+            return;
+        }
         synchronized (this.admissionLock) {
             if (this.shutdown) {
                 return;
@@ -6875,9 +7032,17 @@ public final class RegionThreadingEngine implements RegionThreading {
      * Inside an entity tick batch the move is deferred until the batch finished. Publishing the new owner
      * while the old snapshot region is still ticking would make ownership checks fail and let scheduled
      * work move to the new region before the old tick completed.
+     * <p>
+     * A player is the exception: its region is published at the start of its level's entity slice and not from its
+     * own tick, because the tick of a player is the one entity tick the server thread runs while a batch is still
+     * published, and a mapping written there would be a mapping a worker of that batch could observe. See
+     * {@link PlayerRegionTransitions}.
      */
     @ApiStatus.Internal
     public void moveRegionEntity(Entity entity) {
+        if (entity instanceof ServerPlayer) {
+            return;
+        }
         final RegionEntityTickBatch.Group group = this.currentEntityTickGroup();
         if (group != null) {
             group.batch().deferEntityUpdate(entity, this.deferredEntityDestination(entity));
@@ -8192,6 +8357,19 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.gameEventSectionsDroppedNoRegion.get(),
                         this.gameEventSectionsDroppedNoChunk.get(),
                         this.gameEventDeliveryPasses.get()),
+                new RegionThreadingDiagnostics.PlayerRegionCounters(
+                        this.playerRegions.entries(),
+                        this.playerRegions.departures(),
+                        this.playerRegions.walkTransitions(),
+                        this.playerRegions.teleportTransitions(),
+                        this.playerRegions.portalTransitions(),
+                        this.playerRegions.dimensionTransitions(),
+                        this.playerRegions.transitionsDuringBatch(),
+                        this.playerRegions.refusedTransitions(),
+                        this.playerRegions.deferredArrivals(),
+                        this.playerRegions.identityHandovers(),
+                        this.playerRegions.invariantChecks(),
+                        this.playerRegions.invariantFailures()),
                 RegionPoiCounters.snapshot(),
                 new RegionThreadingDiagnostics.SaveCounters(
                         this.levelSaves.get(),

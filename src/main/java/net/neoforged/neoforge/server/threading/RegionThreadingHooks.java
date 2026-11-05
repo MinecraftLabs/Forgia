@@ -1495,4 +1495,25 @@ public final class RegionThreadingHooks {
             return Optional.empty();
         });
     }
+
+    /**
+     * Records that a player is about to change level, before it leaves the old one.
+     * <p>
+     * The region of a player is published at the start of the entity slice of the level the player is in, so this
+     * hook does not write a region mapping: it records the cause of the transition the publication will see and
+     * hands the player's identity to the ledger of the destination level, so the entry follows the player
+     * instead of being released by the old level and reserved again by the new one. Called from the
+     * dimension-travel event, which fires before the player's level changes. Without an installed engine this is
+     * a no-op.
+     *
+     * @param player      the player that is about to travel
+     * @param destination the dimension the player travels to
+     */
+    public static void recordPlayerDimensionTransition(net.minecraft.server.level.ServerPlayer player, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> destination) {
+        RegionThreadingManager.ifInstalled(threading -> {
+            if (threading instanceof RegionThreadingEngine engine) {
+                engine.recordPlayerDimensionTransition(player, destination);
+            }
+        });
+    }
 }
