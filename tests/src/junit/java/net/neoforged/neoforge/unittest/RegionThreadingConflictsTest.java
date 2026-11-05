@@ -47,6 +47,19 @@ class RegionThreadingConflictsTest {
     }
 
     @Test
+    void aForcedPlanKeepsEverySliceAndStillReportsTheConflicts() {
+        // The force flag exists for the compatibility harness, which has to observe what a conflicting mod
+        // actually does instead of trusting the table. It must not hide the conflict, only ignore its action.
+        final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("c2me"), true);
+
+        assertTrue(plan.installEngine(), "a forced plan still installs the engine");
+        assertTrue(plan.entityTickWorkers(), "a forced plan keeps the entity slice");
+        assertTrue(plan.spawnWorkers(), "a forced plan keeps the spawning slice");
+        assertEquals(1, plan.conflicts().size(), "the conflict is still detected and reported");
+        assertTrue(plan.leftOffSlices().isEmpty(), "a forced plan leaves no slice off");
+    }
+
+    @Test
     void aChunkSourceConflictRefusesTheEngineAndTheServerKeepsTicking() {
         final RegionThreadingConflicts.Plan plan = RegionThreadingConflicts.plan(true, true, true, loaded("c2me"));
 

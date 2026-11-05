@@ -123,10 +123,19 @@ public class ServerLifecycleHooks {
      */
     private static void installRegionThreading() {
         final boolean requested = NeoForgeConfig.SERVER.enableRegionThreadingBridge.get();
+        final boolean forced = NeoForgeConfig.SERVER.regionThreadingForceWithKnownConflicts.get();
         final RegionThreadingConflicts.Plan compatibility = RegionThreadingConflicts.plan(
                 requested,
                 NeoForgeConfig.SERVER.enableRegionThreadingEntityTicks.get(),
-                NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get());
+                NeoForgeConfig.SERVER.enableRegionThreadingSpawning.get(),
+                modId -> net.neoforged.fml.ModList.get().isLoaded(modId),
+                forced);
+        if (forced && requested) {
+            // Measurement only: the table's actions are suppressed, so say so loudly and never let a forced run
+            // look like a supported configuration in a log or a bug report.
+            LOGGER.warn(SERVERHOOKS, "Region threading runs FORCED with known conflicts present ({}); this configuration is for measurement and is not supported",
+                    compatibility.conflicts().stream().map(RegionThreadingConflicts.Conflict::modId).toList());
+        }
         final List<String> blockedBy = new ArrayList<>();
         RegionThreadingEngine installed = null;
         if (!compatibility.installEngine()) {

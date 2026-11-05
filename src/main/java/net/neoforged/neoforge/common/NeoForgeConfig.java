@@ -54,6 +54,13 @@ public class NeoForgeConfig {
 
         public final BooleanValue enableRegionThreadingBorderUpdates;
 
+        /**
+         * Experimental: installs the region threading engine even when the known-conflict table would remove a
+         * worker slice. Meant for the compatibility harness, which has to observe what a mod actually does
+         * instead of trusting a static table; every conflict is still detected and reported.
+         */
+        public final BooleanValue regionThreadingForceWithKnownConflicts;
+
         public final BooleanValue enableRegionThreadingGameEvents;
 
         public final BooleanValue enableRegionThreadingPersistentWorkers;
@@ -162,6 +169,12 @@ public class NeoForgeConfig {
                     .worldRestart()
                     .define("enableRegionThreadingPoi", false);
 
+            regionThreadingForceWithKnownConflicts = builder
+                    .comment(
+                            "EXPERIMENTAL: installs the region threading engine even when a known conflict would remove a worker slice, so a compatibility run can observe what a mod actually does. Every conflict is still detected and reported. Leave this off outside of measurement runs.")
+                    .translation("neoforge.configgui.regionThreadingForceWithKnownConflicts")
+                    .worldRestart()
+                    .define("regionThreadingForceWithKnownConflicts", false);
             enableRegionThreadingBorderUpdates = builder
                     .comment(
                             "EXPERIMENTAL: Captures the neighbor updates a region worker cannot apply because they target another region, and applies them on the target region's own worker in the same tick. The fixpoint repeats until no border update remains or the level's max-chained-neighbor-updates limit is reached; the rest falls back to the target region's next tick through the region mailbox and is counted as delayed. Requires enableRegionThreadingBridge. With the switch off, a region context uses the unchanged vanilla neighbor collector and no border update is recorded.")

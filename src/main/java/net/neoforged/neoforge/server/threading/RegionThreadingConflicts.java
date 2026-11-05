@@ -259,11 +259,24 @@ public final class RegionThreadingConflicts {
      */
     public static Plan plan(boolean engineRequested, boolean entityTickWorkers, boolean spawnWorkers,
             Predicate<String> modLoaded) {
+        return plan(engineRequested, entityTickWorkers, spawnWorkers, modLoaded, false);
+    }
+
+    /**
+     * {@return the plan, ignoring the actions of the known-conflict table when {@code force} is set}
+     * <p>
+     * The force flag exists for measurement, not for production: it lets the compatibility harness run the
+     * engine with a mod the table distrusts and observe what actually happens, so the table can be replaced by
+     * evidence instead of guesses. Every conflict is still detected, reported and logged; only the decision to
+     * drop a slice is suppressed, and the caller logs that the run is forced.
+     */
+    public static Plan plan(boolean engineRequested, boolean entityTickWorkers, boolean spawnWorkers,
+            Predicate<String> modLoaded, boolean force) {
         final List<Conflict> conflicts = detect(modLoaded);
         boolean installEngine = engineRequested;
         boolean entityTickSlice = entityTickWorkers;
         boolean spawnSlice = spawnWorkers;
-        for (final Conflict conflict : conflicts) {
+        for (final Conflict conflict : force ? List.<Conflict>of() : conflicts) {
             switch (conflict.action()) {
                 case DISABLE_ENGINE -> installEngine = false;
                 case DISABLE_ENTITY_TICKS -> entityTickSlice = false;
