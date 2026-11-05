@@ -88,8 +88,42 @@ First measurement, all 170 mods with the full engine:
 | Shutdown | **hangs** - the server thread parks in `MinecraftServer.waitForTasks` (modernfix's `waitLongerForTasks`) while the `c2me-worker-*` threads die |
 
 So the engine survives with the whole pack up, and **c2me is confirmed incompatible by evidence rather than by
-reputation**: it owns chunk threads that the engine's shutdown path does not wait for. The other nine conflicts
-are now open questions the harness can answer one at a time, with the same run repeated without the candidate.
+reputation**: it owns chunk threads that the engine's shutdown path does not wait for.
+
+### Without c2me, the other nine conflicts are fine
+
+Same harness, all 169 jars (everything but c2me), engine forced on, a flat world, 169 chunks force-loaded and
+32 mobs summoned through the console:
+
+| | Result |
+|---|---|
+| Boot to `Done` | yes |
+| Run window | 120 s |
+| Stop | clean, inside the grace period |
+| **Entity ticks on workers** | **96 309** |
+| Cross-region reads recorded | 6 566 |
+| Ownership violations | **0** |
+| Tick failures | 0 |
+
+So modernfix, moonlight, sable, byepregen, ftbchunks, alltheleaks, create, spawn and mobspawncontroller all
+coexist with the engine in this run - the static table is far more conservative than the evidence.
+
+Two things this run does **not** prove, and the harness cannot prove yet: chunk ticks on workers stayed at zero
+in the flat world with only force-loaded chunks, so the chunk slice is still unverified there; and an idle world
+with 32 mobs is not a loaded server.
+
+### A real API gap the pack exposed
+
+The first no-c2me run crashed in `ChunkMap` with
+
+```
+NoSuchMethodError: 'java.util.EnumSet ChunkStatus.getChunkSaveHeightmaps()'
+```
+
+from ByePregen: NeoForge added that method (the MC-308222 heightmap fix) after the snapshot this fork was
+based on. The upstream patch was taken verbatim and applied; the run then booted and stopped cleanly. Any other
+mod calling a newer NeoForge API will fail the same way, so a systematic patch-set comparison with upstream
+21.1.249 is now the known next step rather than a suspicion.
 
 ## Reproducing
 

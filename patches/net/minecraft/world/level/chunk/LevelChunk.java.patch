@@ -219,7 +219,7 @@
 +                    }
                  }
              }
-+    
++
 +        } finally {
 +            this.endChunkMutation();
          }
@@ -431,7 +431,7 @@
  
 -        this.removeBlockEntityTicker(p_62919_);
 +            this.removeBlockEntityTicker(p_62919_);
-+    
++
 +        } finally {
 +            this.endChunkMutation();
 +        }
@@ -489,7 +489,7 @@
 +            this.blockEntities.clear();
 +            this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
 +            this.tickersInLevel.clear();
-+    
++
 +        } finally {
 +            this.endChunkMutation();
 +        }
