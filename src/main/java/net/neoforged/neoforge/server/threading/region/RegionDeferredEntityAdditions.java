@@ -110,6 +110,13 @@ final class RegionDeferredEntityAdditions {
         }
     }
 
+    /** {@return the number of admissions that still wait for the barrier} */
+    int pendingCount() {
+        synchronized (this.additions) {
+            return this.additions.size();
+        }
+    }
+
     /** Takes the deferred admissions that wait for the end of the batch. */
     Drain drain() {
         synchronized (this.additions) {

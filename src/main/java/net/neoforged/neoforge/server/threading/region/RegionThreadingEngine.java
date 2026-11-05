@@ -390,6 +390,30 @@ public final class RegionThreadingEngine implements RegionThreading {
     private final AtomicLong gameEventSectionsDroppedNoChunk = new AtomicLong();
     /** Delivery rounds the server thread ran after a worker phase. */
     private final AtomicLong gameEventDeliveryPasses = new AtomicLong();
+    /** Level saves the engine observed since it was installed. */
+    private final AtomicLong levelSaves = new AtomicLong();
+    /**
+     * Level saves that started while a region tick batch of the level was still in flight.
+     * <p>
+     * A save may only observe a level whose last tick is fully applied: a batch that has not reached its
+     * barrier still holds a worker, a region lease and the deferred effects its groups recorded. This counter
+     * is therefore a correctness violation, not a diagnostic, and it is zero for every save of a server that
+     * ticks its levels normally.
+     */
+    private final AtomicLong levelSavesWithBatchInFlight = new AtomicLong();
+    /** Level saves that observed deferred effects of a batch that its barrier had not applied yet. */
+    private final AtomicLong levelSavesWithTickDeferredWork = new AtomicLong();
+    /** Level saves that observed cross-tick deferred work, which a crash loses by design. */
+    private final AtomicLong levelSavesWithCrossTickDeferredWork = new AtomicLong();
+    /** Entries of cross-tick deferred work the saves observed. */
+    private final AtomicLong levelSaveCrossTickDeferredEntries = new AtomicLong();
+    /** POI columns written in memory but not yet on disk when a save started. */
+    private final AtomicLong levelSaveDirtyPoiColumns = new AtomicLong();
+    /** POI columns a flushing save wrote and waited for before it returned. */
+    private final AtomicLong levelSaveFlushedPoiColumns = new AtomicLong();
+    /** Rate limiter of the save-point warning: the first few observations are logged, the rest only counted. */
+    private static final int MAX_LOGGED_SAVE_VIOLATIONS = 4;
+    private final AtomicLong loggedSaveViolations = new AtomicLong();
 
     /**
      * One block event phase of one level on the server thread.
@@ -6406,6 +6430,92 @@ public final class RegionThreadingEngine implements RegionThreading {
     }
 
     /**
+     * Records that {@code level} is about to save and checks that the save observes a quiescent level.
+     * <p>
+     * The save is the moment the world on disk is defined, so it has to observe a level whose last tick is
+     * fully applied: no region batch of the level in flight and no deferred effect of one waiting for a
+     * barrier that has not run. This method asserts exactly that and counts what it saw:
+     * <ul>
+     * <li>A batch of the level in flight is a <b>violation</b>: the batch still holds a worker, the lease of
+     * its region and the effects its groups recorded, so the chunk, entity and POI data a save reads would be
+     * a half-applied tick. {@link #levelSavesWithBatchInFlight} counts it and the first few are logged at
+     * error level. It is zero for a save of the server thread, because a batch is published and awaited by the
+     * same thread and the server thread can only save between two level ticks.</li>
+     * <li>Deferred effects of a batch that has not reached its barrier are counted separately
+     * ({@link #levelSavesWithTickDeferredWork}): they are the same violation one level down, and they are the
+     * work a crash in the middle of that tick loses.</li>
+     * <li>Cross-tick deferred work - border updates the fixpoint bound delayed to the target region's next
+     * tick through the mailbox, pending entity transfer decisions and the POI columns the level tick has not
+     * written yet - is <b>not</b> a violation: it is work the design defers across a tick boundary, and a
+     * crash loses it exactly like the vanilla block update of the tick that never ran. It is counted so the
+     * loss is observable instead of silent ({@link #levelSavesWithCrossTickDeferredWork},
+     * {@link #levelSaveCrossTickDeferredEntries}, {@link #levelSaveDirtyPoiColumns}).</li>
+     * </ul>
+     * Runs on the thread that saves, which is the server thread of a production server.
+     */
+    @ApiStatus.Internal
+    public void beginLevelSave(ServerLevel level) {
+        this.levelSaves.incrementAndGet();
+        long tickDeferred = 0L;
+        boolean batchInFlight = false;
+        for (final RegionTickBatch batch : this.activeTickBatches) {
+            if (batch.level() != level) {
+                continue;
+            }
+            batchInFlight = true;
+            tickDeferred += batch.pendingDeferredWork();
+        }
+        final RegionBorderUpdates borders = this.borderUpdates.get(level);
+        final long borderEntries = borders == null ? 0L : borders.pendingCount();
+        final RegionMailbox mailbox = this.mailboxes.get(level);
+        final long mailboxEntries = mailbox == null ? 0L : mailbox.pendingMessageCount();
+        final long pendingMoves;
+        synchronized (this.admissionLock) {
+            pendingMoves = this.pendingDeferredEntityMoves.size();
+        }
+        final RegionPoiStorage poiStorage = RegionPoiStorages.of(level);
+        final long dirtyPoiColumns = poiStorage == null ? 0L : poiStorage.dirtyColumnCount();
+        final long crossTickDeferred = borderEntries + mailboxEntries + pendingMoves + dirtyPoiColumns;
+        if (batchInFlight) {
+            this.levelSavesWithBatchInFlight.incrementAndGet();
+        }
+        if (tickDeferred > 0L) {
+            this.levelSavesWithTickDeferredWork.incrementAndGet();
+        }
+        if (crossTickDeferred > 0L) {
+            this.levelSavesWithCrossTickDeferredWork.incrementAndGet();
+            this.levelSaveCrossTickDeferredEntries.addAndGet(crossTickDeferred);
+        }
+        this.levelSaveDirtyPoiColumns.addAndGet(dirtyPoiColumns);
+        if ((batchInFlight || tickDeferred > 0L) && this.loggedSaveViolations.getAndIncrement() < MAX_LOGGED_SAVE_VIOLATIONS) {
+            LOGGER.error("A level save observed a region tick batch that had not finished: {} in flight, {} deferred effects of it"
+                    + " (level {}); the saved data is not a completed tick", batchInFlight, tickDeferred, level.dimension().location());
+        }
+    }
+
+    /**
+     * Writes the remaining POI columns of {@code level} and waits for them, at the end of a save that flushes.
+     * <p>
+     * The vanilla save waits for the chunk and entity IO of a flushing save, but the POI data of a level is a
+     * separate IO worker that nobody waits for: the vanilla section storage schedules a column write and
+     * forgets it, so a POI write of the last tick can still be missing after a save that reported success.
+     * The regionized storage writes its own columns, so the engine can close that window and does: a saved
+     * level holds every POI record and ticket count the level held at the save point.
+     * <p>
+     * Runs on the server thread, after the level's chunk and entity data was written.
+     */
+    @ApiStatus.Internal
+    public void endLevelSave(ServerLevel level) {
+        final RegionPoiStorage poiStorage = RegionPoiStorages.of(level);
+        if (poiStorage == null) {
+            return;
+        }
+        final int pending = poiStorage.dirtyColumnCount();
+        poiStorage.flushAll();
+        this.levelSaveFlushedPoiColumns.addAndGet(pending);
+    }
+
+    /**
      * Runs {@code task} under a freshly acquired lease of the region containing {@code pos}.
      *
      * @return {@code false} when the region is currently leased by another thread or the engine is shut
@@ -8083,6 +8193,14 @@ public final class RegionThreadingEngine implements RegionThreading {
                         this.gameEventSectionsDroppedNoChunk.get(),
                         this.gameEventDeliveryPasses.get()),
                 RegionPoiCounters.snapshot(),
+                new RegionThreadingDiagnostics.SaveCounters(
+                        this.levelSaves.get(),
+                        this.levelSavesWithBatchInFlight.get(),
+                        this.levelSavesWithTickDeferredWork.get(),
+                        this.levelSavesWithCrossTickDeferredWork.get(),
+                        this.levelSaveCrossTickDeferredEntries.get(),
+                        this.levelSaveDirtyPoiColumns.get(),
+                        this.levelSaveFlushedPoiColumns.get()),
                 this.workerDispatchCounters(),
                 RegionMetricsSummary.summarize(regionTicks),
                 regionTicks);

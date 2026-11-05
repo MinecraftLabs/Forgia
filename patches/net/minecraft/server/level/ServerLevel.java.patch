@@ -327,13 +327,28 @@
              profilerfiller.pop();
  
              for (Entity entity : p_8664_.getPassengers()) {
-@@ -807,6 +_,10 @@
+@@ -792,6 +_,10 @@
+     public void save(@Nullable ProgressListener p_8644_, boolean p_8645_, boolean p_8646_) {
+         ServerChunkCache serverchunkcache = this.getChunkSource();
+         if (!p_8646_) {
++            // Neo: the save point. The region threading engine checks here that the save observes a completed
++            // level tick - no region batch in flight and no deferred effect waiting for a barrier - and counts
++            // what it saw, so a save can never write a half-applied tick to disk.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.beginLevelSave(this);
+             if (p_8644_ != null) {
+                 p_8644_.progressStartNoAbort(Component.translatable("menu.savingLevel"));
+             }
+@@ -807,6 +_,14 @@
              } else {
                  this.entityManager.autoSave();
              }
 +            net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.level.LevelEvent.Save(this));
 +            if (p_8645_) {
 +                net.neoforged.neoforge.common.IOUtilities.waitUntilIOWorkerComplete();
++                // Neo: the chunk and entity data of a flushing save is on disk now. The regionized POI storage
++                // writes through its own IO worker, which the vanilla wait does not cover, so the engine writes
++                // the remaining POI columns and waits for them here.
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.endLevelSave(this);
 +            }
          }
      }

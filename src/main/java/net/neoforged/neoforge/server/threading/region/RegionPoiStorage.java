@@ -565,6 +565,18 @@ public final class RegionPoiStorage implements AutoCloseable {
     }
 
     /**
+     * {@return the number of POI columns written in memory but not yet on disk}
+     * <p>
+     * A dirty column is the POI half of the deferred work a save point can observe: it is written by the
+     * level tick, by the save of its chunk and by {@link #close()}, so a column that is still dirty when the
+     * server is killed is a POI change the crash loses. The vanilla section storage has the same window
+     * between a POI write and the write of its column.
+     */
+    public int dirtyColumnCount() {
+        return this.dirtyColumns.size();
+    }
+
+    /**
      * Publishes every region of the level and writes the dirty columns while {@code haveTime} allows it.
      * <p>
      * Called from the level tick on the server thread, after the chunk tick phase and before the entity
@@ -637,13 +649,31 @@ public final class RegionPoiStorage implements AutoCloseable {
         }
     }
 
-    @Override
-    public void close() {
-        this.publishLevel();
+    /**
+     * Writes every dirty column and waits until the writes reached the disk.
+     * <p>
+     * This is the durability point of the regionized storage: the vanilla section storage only schedules a
+     * column write and its {@code close} drops the writes its IO thread had not picked up yet, so a POI write
+     * of the last tick of a session could be lost by a clean shutdown. The regionized storage writes its
+     * columns itself, so it can and does wait for them: a save point and a level close leave every POI record
+     * and every ticket count it holds on disk.
+     * <p>
+     * Runs on the server thread, at a save point or at close, when no region worker of the level runs.
+     */
+    public void flushAll() {
         Long column;
         while ((column = this.pollDirtyColumn()) != null) {
             this.saveColumn(new ChunkPos(column));
         }
+        // The IO worker of the POI storage is the one that owns the writes above; wait for it instead of
+        // trusting that its queue drained before the storage is closed.
+        this.storage.synchronize(true).join();
+    }
+
+    @Override
+    public void close() {
+        this.publishLevel();
+        this.flushAll();
         RegionPoiStorages.detach(this);
     }
 

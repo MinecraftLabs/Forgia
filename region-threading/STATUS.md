@@ -27,6 +27,8 @@ disabled, which is the vanilla code path.
 | Spawning | Region states partition the level counts; the level-wide cap is enforced with an atomic check-and-reserve |
 | Cross-region reads | Seqlock: never torn; a stale read re-runs the region that made it (the test fails with the check disabled) |
 | Production soak | 6 000 ticks on generated terrain with villagers, mobs, a hopper/furnace line, a farm, a border-crossing redstone clock and a moving fake player: 0 ownership violations, 0 tick failures, item conservation, redstone identical in 6 200/6 200 ticks |
+| Save and reload | A whole fixture world saved, unloaded and reloaded from disk: every block, block entity, entity UUID and position, POI record with its free-ticket count and region mapping equal, with region threading on and off and across the two configurations |
+| Crash recovery | Six runs in three pairs kill the JVM mid-tick and restart on the same world: the save point is intact, no duplicate UUID, no leaked ticket, no dangling deferral, 600 further ticks green |
 
 ## Production soak (everything on, 3-chunk regions)
 
@@ -127,6 +129,97 @@ at 6.53 mspt mean (p50 5.84, p95 10.1, p99 13.8) against 6.35 (5.93/9.2/12.0) fo
 The one class of work the phase still serializes is the move itself, which runs on the server thread because
 the phase sits outside every region batch.
 
+## Save, reload and crash recovery
+
+A world saved with region threading enabled reloads to the same state, and a hard kill leaves a world that
+loads with the state of its last save point. Both are proven, not argued: one JUnit test drives the regionized
+POI storage through a save and a reload and compares it with a vanilla manager over the same directory, one
+GameTest saves a whole fixture world, unloads every chunk and loads it back from disk, and three pairs of
+runs kill the JVM in the middle of the activity and check what the next process loads.
+
+### What is authoritative and what is derived
+
+| State | Kind | Where it lives | Across a save/load |
+|---|---|---|---|
+| Chunk block states, block entities, entities | authoritative | region files + entity files, written by the vanilla save | written at the save point, read back by the chunk load |
+| POI records and their free-ticket counts | authoritative | the level's POI region files, written by `RegionPoiStorage.saveColumn` (`RegionPoiStorage.java:684`) in the vanilla `Sections`/`DataVersion` format | written by the level tick, by the save of their chunk and by `flushAll`; read by `loadColumn` (`:530`) |
+| Region mapping (chunk -> region coordinate) | derived | `RegionLayout` (`RegionLayout.java`) | a pure function of the position; nothing to persist |
+| Section partitions, admission caches, ticker indexes | derived | `FixedEntitySectionPartitions`, `RegionBlockEntityTickChunkCache`, `RegionEntityTickIndex` | rebuilt as the chunks load and the entities are ticked |
+| Entity identity ledger (`EntityIdentityLedger`) | derived | in memory, one per level | rebuilt on load from the vanilla UUID set; the process that died leaves nothing behind |
+| Deferred block updates, entity additions, removals, section updates | per tick batch | `RegionTickBatch` and its deferred queues | drained by the barrier of the batch, inside the level tick that published it; empty at a save point |
+| Border update fixpoint queue, mailbox, pending entity transfers | cross tick | `RegionThreadingEngine.borderUpdates`, `RegionMailbox`, `RegionEntityTransferJournal` | deferred work by design; a crash loses it, exactly like a block update of a tick that never ran |
+| Region entity storage mode, worker pool, leases | derived | `RegionWorkerPool`, `RegionState` | rebuilt on load |
+
+### What a save can observe
+
+`ServerLevel.save` brackets the save with `RegionThreadingHooks.beginLevelSave` / `endLevelSave`
+(`patches/net/minecraft/server/level/ServerLevel.java.patch`). `beginLevelSave`
+(`RegionThreadingEngine.java:6457`) asserts that the save observes a completed level tick:
+
+* a batch in flight is a violation and is counted in `savesWithBatchInFlight`. It cannot happen on a server
+  thread save: the server thread publishes and awaits a batch itself, so it can only save between two level
+  ticks, and the vanilla autosave runs after `tickChildren` returned.
+* deferred effects a barrier has not applied are counted in `savesWithTickDeferredWork`. Every per-tick queue
+  is drained by the barrier of its own batch, so both counters are zero in production; the mechanics seam that
+  could break that is counted instead of silently producing a half-applied world.
+* cross-tick work (border updates delayed to the next tick, mailbox messages, pending transfer decisions and
+  POI columns the tick has not written) is counted in `savesWithCrossTickDeferredWork`,
+  `crossTickDeferredEntries` and `dirtyPoiColumns`. It is not a violation - it is work the design defers
+  across a tick boundary - but a crash loses it, so it is counted instead of being invisible.
+
+The counters are in `RegionThreadingDiagnostics.SaveCounters` (`RegionThreadingDiagnostics.java:390`) and are
+asserted by the save/reload GameTest and by the hard-kill test.
+
+### One repair, and why it was needed
+
+The vanilla `SectionStorage` schedules its column writes on its own `IOWorker` and its `close()` drops the
+writes that worker has not picked up yet, and `ServerLevel.save(flush=true)` only waits for the chunk and
+entity IO. A POI write of the last tick could therefore be lost by a clean shutdown or by a save that reported
+flushing. `RegionPoiStorage.flushAll()` (`RegionPoiStorage.java:663`) writes the remaining columns and waits
+for its IO worker; it runs at every flushing save (`endLevelSave`, `RegionThreadingEngine.java:6508`) and at
+`close()` (`:674`). A world that never crashes sees one extra IO wait at the save point (10-20 ms in the
+fixture run) and nothing else: no behaviour changes, no data changes, and the level's data is the same as
+before because the wait only orders writes that were already scheduled. The vanilla POI path is untouched
+when the switch is off.
+
+### Evidence
+
+| What | Test | Result |
+|---|---|---|
+| POI save/reload equivalence | `RegionPoiSaveReloadTest` (JUnit): the same script of adds, removes and ticket changes into a vanilla `PoiManager` and into the regionized storage, both closed and reopened, then compared record by record and ticket by ticket | 4 tests: reloaded records, types, free tickets and village distance equal the vanilla manager's; the stored `Sections` compound is byte-equal to the vanilla one; every reloaded section answers from the region that owns its chunk with zero server-thread fallbacks; a close without a tick keeps every column the storage holds |
+| Save/reload of a whole world | `savesAndReloadsRegionThreadingState` (GameTest, batch `saveReload`): 5x5 chunks across two region borders with beds and workstations, containers with item stacks, a sign, a bee nest, a bell, a 5x5 farm, a lever-fed circuit that crosses the border, 3 villagers and 6 cows; save, release every ticket, wait until the chunk source reports every chunk absent, force them again, compare | 114 blocks, 13 block entities, 9 entities, 10 POI records and 2 taken tickets equal before and after the reload; 0 save-point violations |
+| Same state with region threading on and off | `runSaveReloadGameTestServer` and `runSaveReloadGameTestServerReference` | the reference run's reloaded state equals the on-run's reloaded state, position by position (114/13/9/10) |
+| Hard kill, same configuration twice | `runCrashPrepareGameTestServer` then `runCrashRecoverGameTestServer` on one world directory | the world loads, the save point is intact, 9 unique entity UUIDs, no leaked ticket, nothing deferred left, 600 further ticks green |
+| Hard kill, on saved and off loaded | `runCrashSaveOnGameTestServer` then `runCrashLoadOffGameTestServer` | same |
+| Hard kill, off saved and on loaded | `runCrashSaveOffGameTestServer` then `runCrashLoadOnGameTestServer` | same |
+
+The kill is a real hard kill: the prepare phase saves, records the state of that save point, keeps ticking and
+then calls `Runtime.halt(0)` from another thread while the server thread is in the middle of a tick. No
+shutdown hook, no chunk/entity/POI write and no flush of anything runs after the save point. What the next
+process loads is the save point, which is exactly vanilla's guarantee for the same situation: the block
+update, item transfer, entity move or POI write of the tick that never returned is lost, and nothing that was
+applied before the save point is. No entity is admitted twice (the durable identity of an entity is its UUID
+in one chunk's entity list, written once from a quiescent state), no identity reservation survives (the ledger
+is derived and rebuilt per process), and no POI ticket leaks (a ticket is the `free_tickets` field of a record
+that is written with its column, and the records are reconciled with the block states at chunk load by
+`checkConsistencyWithBlocks`, the vanilla mechanism).
+
+### Save and load wall time
+
+`saveReload` fixture, 5x5 chunks, 3-chunk regions, 25 chunks force-loaded, one flushing save plus a full
+unload and reload of the area:
+
+| profile | save (ms) | reload (ms) | blocks | block entities | entities | POI records | taken tickets |
+|---|---|---|---|---|---|---|---|
+| on (4 workers) | 765 | 8 | 114 | 13 | 9 | 10 | 2 |
+| off (vanilla) | 754 | 243 | 114 | 13 | 9 | 10 | 2 |
+
+The save time is dominated by the vanilla chunk save of 25 chunks and is the same on both sides. The reload is
+the force-load of the same chunks: with region threading on the chunk tasks are dispatched to the region
+workers, with it off they stay on the server thread, which is the 30x difference of this small fixture and not
+a claim about a large world. The hard-kill recovery of the same world (load, compare, 600 ticks) takes 20-30 s
+per pair, of which 600 ticks at 20 TPS dominate.
+
 ## Roadmap
 
 | # | Milestone | State |
@@ -140,7 +233,7 @@ the phase sits outside every region batch.
 | B2 | Structure leases (piston multi-block moves, Create contraptions) | measured, not worth it (see above) |
 | B3 | Player regionization (teleport, portals, cross-dimension) | planned |
 | B4 | Large randomized redstone soak | planned |
-| C1 | Save/load and crash recovery of regionized state | planned |
+| C1 | Save/load and crash recovery of regionized state | **done** |
 | C2 | Long-run soak (6+ hours, drift and leak detection) | planned |
 | C3 | Multiplayer concurrency (players, view distance, tickets) | planned |
 | D1 | Mod compatibility declarations (policy registry, conflict detection) | planned |

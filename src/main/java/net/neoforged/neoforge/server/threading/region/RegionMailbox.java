@@ -231,6 +231,21 @@ public final class RegionMailbox {
         return this.closed;
     }
 
+    /**
+     * {@return the number of messages that are queued and not delivered yet}
+     * <p>
+     * A queued message is cross-tick work by design: a region message runs at the target region's next tick
+     * and a global message at the level's next global phase, so a non-zero count at a save point is the work a
+     * crash loses. See {@code RegionThreadingEngine#beginLevelSave}.
+     */
+    public int pendingMessageCount() {
+        int pending = this.globalQueue.size();
+        for (final RegionQueue queue : this.regionQueues.values()) {
+            pending += queue.messages.size();
+        }
+        return pending;
+    }
+
     private void deliver(Runnable message) {
         try {
             message.run();

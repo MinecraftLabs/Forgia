@@ -87,6 +87,11 @@ final class RegionBorderUpdates {
         return this.updates.isEmpty();
     }
 
+    /** {@return the number of border updates that still wait for the fixpoint} */
+    int pendingCount() {
+        return this.queuedCount.get();
+    }
+
     /** {@return the number of records accepted so far} */
     int recordedCount() {
         return this.recorded.get();

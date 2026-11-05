@@ -230,6 +230,11 @@ final class RegionBlockEntityTickBatch extends RegionTickBatch {
         return this.deferredRemovals.drain();
     }
 
+    @Override
+    long pendingDeferredWork() {
+        return super.pendingDeferredWork() + this.deferredRemovals.pendingCount();
+    }
+
     /**
      * One region's share of the batch: the region lease, the chunks it ticks and the random source their
      * tickers draw from.

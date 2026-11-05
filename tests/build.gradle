@@ -206,6 +206,65 @@ runs {
             systemProperty("neoforge.soakReference", project.file("runs/soakGameTestServer/soak-report/redstone-on.csv").absolutePath)
             systemProperty("neoforge.soakReport", "soak-report")
     }
+    // The save/reload equivalence: the same fixture, the same save point and the same reload twice, once with
+    // region threading on and once with it off. The threading-on run writes the observable state it reloaded
+    // and the reference run compares its own reloaded state with that file. Each run starts from its own world
+    // directory and the default GameTest preset and seed, so the generated terrain of the two runs is the same.
+    saveReloadGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "saveReload")
+            systemProperty("neoforge.saveReloadRegionThreading", "true")
+            systemProperty("neoforge.saveReloadReport", "save-reload-report")
+            systemProperty("neoforge.saveReloadReference", "")
+    }
+    saveReloadGameTestServerReference {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "saveReload")
+            systemProperty("neoforge.saveReloadRegionThreading", "false")
+            systemProperty("neoforge.saveReloadReport", "save-reload-report")
+            systemProperty("neoforge.saveReloadReference", project.file("runs/saveReloadGameTestServer/save-reload-report/state-on.txt").absolutePath)
+    }
+    // The hard-kill recovery and the two cross-configuration loads share one machinery: a save phase builds the
+    // fixture, saves, records the state of that save point and halts the JVM in the middle of the activity; a
+    // load phase starts on the world the killed process left behind, compares it with that state file and runs
+    // the invariants. The load phase of each pair runs in the same game directory as its save phase, and the
+    // region threading configuration of a pair is what makes the two cross pairs cross.
+    crashPrepareGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "prepare")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashRecoveryGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
+    crashRecoverGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "recover")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashRecoveryGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
+    crashSaveOnGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "prepare")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashOnOffGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
+    crashLoadOffGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "recover")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashOnOffGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
+    crashSaveOffGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "prepare")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashOffOnGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
+    crashLoadOnGameTestServer {
+            type = "gameTestServer"
+            systemProperty("neoforge.gameTestServer.filter", "crashRecovery")
+            systemProperty("neoforge.crashRecovery", "recover")
+            systemProperty("neoforge.crashRecoveryState", project.file("runs/crashOffOnGameTestServer/crash-recovery-report/save-point.txt").absolutePath)
+    }
     data {
             data()
 
@@ -270,22 +329,46 @@ regionThreadingOwnershipViolationMode = "WARN"
 }
 
 [
-    soakGameTestServer       : [regionThreading: true],
-    soakGameTestServerReference: [regionThreading: false]
+    soakGameTestServer       : [regionThreading: true, freshWorld: true, gameDirectory: "soakGameTestServer"],
+    soakGameTestServerReference: [regionThreading: false, freshWorld: true, gameDirectory: "soakGameTestServerReference"],
+    // The save/reload equivalence: the fixture and its save point twice, on and off, each from a fresh world.
+    saveReloadGameTestServer : [regionThreading: true, freshWorld: true, gameDirectory: "saveReloadGameTestServer"],
+    saveReloadGameTestServerReference: [regionThreading: false, freshWorld: true, gameDirectory: "saveReloadGameTestServerReference"],
+    // The hard-kill recovery: a save phase and a load phase share one game directory, and only the save phase
+    // starts from a fresh world. The three pairs are the same configuration twice, on and loaded off, and off
+    // and loaded on, which is the cross-configuration half of the guarantee.
+    crashPrepareGameTestServer: [regionThreading: true, freshWorld: true, gameDirectory: "crashRecoveryGameTestServer"],
+    crashRecoverGameTestServer: [regionThreading: true, freshWorld: false, gameDirectory: "crashRecoveryGameTestServer"],
+    crashSaveOnGameTestServer : [regionThreading: true, freshWorld: true, gameDirectory: "crashOnOffGameTestServer"],
+    crashLoadOffGameTestServer: [regionThreading: false, freshWorld: false, gameDirectory: "crashOnOffGameTestServer"],
+    crashSaveOffGameTestServer: [regionThreading: false, freshWorld: true, gameDirectory: "crashOffOnGameTestServer"],
+    crashLoadOnGameTestServer : [regionThreading: true, freshWorld: false, gameDirectory: "crashOffOnGameTestServer"]
 ].each { String runName, Map options ->
+    def preparedStateFile = layout.projectDirectory.file("runs/${options.gameDirectory}/crash-recovery-report/save-point.txt").asFile
     def prepare = tasks.register("prepare${runName.capitalize()}") {
         group = "runs"
-        description = "Starts the ${runName} soak from a fresh world and writes its region threading config."
-        def worldDirectory = layout.projectDirectory.dir("runs/${runName}/world").asFile
-        def configFile = layout.projectDirectory.file("runs/${runName}/config/neoforge-server.toml").asFile
+        description = "Writes the region threading config of the ${runName} run and, for a run that starts from a fresh world, deletes its world."
+        def worldDirectory = layout.projectDirectory.dir("runs/${options.gameDirectory}/world").asFile
+        def configFile = layout.projectDirectory.file("runs/${options.gameDirectory}/config/neoforge-server.toml").asFile
         def configText = soakConfigText(options.regionThreading)
+        def freshWorld = options.freshWorld
         doLast {
-            worldDirectory.deleteDir()
+            if (freshWorld) {
+                worldDirectory.deleteDir()
+            }
             configFile.parentFile.mkdirs()
             configFile.text = configText
         }
     }
-    tasks.named("run${runName.capitalize()}").configure { dependsOn prepare }
+    tasks.named("run${runName.capitalize()}").configure {
+        dependsOn prepare
+        gameDirectory.set layout.projectDirectory.dir("runs/${options.gameDirectory}").asFile
+        if (runName.startsWith("crash")) {
+            // The kill point of the save phases is one property for every pair, so the window between the save
+            // point and the kill is the same in all of them.
+            systemProperty("neoforge.crashRecoveryKillTicks", providers.gradleProperty("crashKillTicks").getOrElse("40"))
+        }
+    }
 }
 
 license {

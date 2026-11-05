@@ -1438,6 +1438,38 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * Records that {@code level} is about to save, so the engine can check that the save observes a level whose
+     * last tick is fully applied.
+     * <p>
+     * A save may not observe a region batch in flight or a deferred effect its barrier has not applied: the
+     * world on disk would be a half-applied tick. The engine counts the observation and what it saw; see
+     * {@code RegionThreadingEngine#beginLevelSave}. Without an engine this is a no-op, because the vanilla
+     * save path already runs between two level ticks.
+     */
+    public static void beginLevelSave(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.beginLevelSave(level);
+        }
+    }
+
+    /**
+     * Records that {@code level} finished a save that flushes, so the regionized state the save owns can reach
+     * the disk.
+     * <p>
+     * The chunk and entity data of a flushing save is waited for by the vanilla path. The regionized POI
+     * storage writes its own columns through its own IO worker, which the vanilla wait does not cover, so the
+     * engine writes its remaining columns and waits for them here. Without an engine or without a regionized
+     * storage of the level this is a no-op.
+     */
+    public static void endLevelSave(ServerLevel level) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (threading instanceof RegionThreadingEngine engine) {
+            engine.endLevelSave(level);
+        }
+    }
+
+    /**
      * Runs {@code task} in the owning block region context when the native engine is installed.
      * <p>
      * Called once per block-entity ticker, so it reads the installed engine without allocating the

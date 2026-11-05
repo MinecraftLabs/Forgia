@@ -308,6 +308,7 @@ public record RegionThreadingDiagnostics(
         BlockEventPhaseCounters blockEventPhase,
         GameEventCounters gameEvents,
         PoiCounters poiCounters,
+        SaveCounters saveCounters,
         WorkerDispatchCounters workerDispatch,
         RegionMetricsSummary regionMetrics,
         List<RegionTickSnapshot> regionTicks) {
@@ -364,6 +365,36 @@ public record RegionThreadingDiagnostics(
             long loadedColumns,
             long savedColumns,
             long villageDistanceQueries) {}
+
+    /**
+     * The counters of the save point: what a level save observed when it started.
+     * <p>
+     * {@code saves} counts the level saves the engine observed, {@code savesWithBatchInFlight} the ones that
+     * started while a region tick batch of the level had not finished, and {@code savesWithTickDeferredWork}
+     * the ones that observed deferred effects a batch barrier had not applied. Both are correctness
+     * violations: a save may only observe a completed level tick, and a non-zero count means the data on disk
+     * is a half-applied tick. They are zero for every save of the server thread, which publishes and awaits a
+     * batch itself and therefore can only save between two ticks.
+     * <p>
+     * {@code savesWithCrossTickDeferredWork} and {@code crossTickDeferredEntries} count the work the design
+     * defers across a tick boundary - border updates the fixpoint bound pushed to the target region's next
+     * tick, pending entity transfer decisions and the POI columns the level tick has not written yet - and
+     * {@code dirtyPoiColumns} the POI columns of that kind. Such work is not a violation: a crash loses it,
+     * exactly like a vanilla block update of the tick that never ran. The counters exist so the loss is
+     * observable at a save point instead of silent.
+     * <p>
+     * {@code flushedPoiColumns} counts the POI columns a flushing save wrote and waited for before it
+     * returned, which is the part of the regionized state the vanilla save path leaves to an IO worker nobody
+     * waits for. It is an accumulator over the saves of the engine, not a count of one save.
+     */
+    public record SaveCounters(
+            long saves,
+            long savesWithBatchInFlight,
+            long savesWithTickDeferredWork,
+            long savesWithCrossTickDeferredWork,
+            long crossTickDeferredEntries,
+            long dirtyPoiColumns,
+            long flushedPoiColumns) {}
 
     /**
      * The counters of the cross-region border update fixpoint.

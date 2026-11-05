@@ -105,6 +105,11 @@ final class RegionDeferredBlockUpdates {
         return this.updates.isEmpty();
     }
 
+    /** {@return the number of effects that still wait for the server thread} */
+    int pendingCount() {
+        return this.updates.size();
+    }
+
     /**
      * Reserves the entries of one admitted unit of {@code slice}.
      * <p>

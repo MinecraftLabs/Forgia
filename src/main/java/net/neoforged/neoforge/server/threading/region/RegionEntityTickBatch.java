@@ -458,6 +458,14 @@ final class RegionEntityTickBatch extends RegionTickBatch {
         return this.deferredAdditions.drain();
     }
 
+    @Override
+    long pendingDeferredWork() {
+        return super.pendingDeferredWork()
+                + this.deferredAdditions.pendingCount()
+                + this.deferredRemovals.pendingCount()
+                + this.deferredSectionUpdates.pendingCount();
+    }
+
     /**
      * Records the portal transition of one entity for the barrier.
      *

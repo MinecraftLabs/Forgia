@@ -129,6 +129,18 @@ abstract class RegionTickBatch {
     }
 
     /**
+     * {@return the deferred effects of this batch that still wait for its barrier}
+     * <p>
+     * Every deferred queue of a batch is drained by the barrier of the batch, inside the level tick that
+     * published it, so this answers zero outside a batch. A save observes it to prove that a save never
+     * reads a half-applied batch; see {@code RegionThreadingEngine#beginLevelSave}. Subclasses add the
+     * entity admissions, removals and section updates their groups deferred.
+     */
+    long pendingDeferredWork() {
+        return this.blockUpdates.pendingCount();
+    }
+
+    /**
      * Reserves the entries of one unit this batch is about to admit to a worker group.
      *
      * @return {@code false} when the unit does not fit into the bound of this batch, so the caller has to refuse

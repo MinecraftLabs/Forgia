@@ -99,6 +99,13 @@ final class RegionDeferredEntitySectionUpdates {
         }
     }
 
+    /** {@return the number of section updates that still wait for the barrier} */
+    int pendingCount() {
+        synchronized (this.updates) {
+            return this.updates.size();
+        }
+    }
+
     /** Takes the deferred section updates that wait for the end of the batch. */
     List<DeferredSectionUpdate> drain() {
         synchronized (this.updates) {

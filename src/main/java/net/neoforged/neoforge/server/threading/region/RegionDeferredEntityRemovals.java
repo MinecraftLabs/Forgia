@@ -98,6 +98,13 @@ final class RegionDeferredEntityRemovals {
         }
     }
 
+    /** {@return the number of removals that still wait for the barrier} */
+    int pendingCount() {
+        synchronized (this.removals) {
+            return this.removals.size();
+        }
+    }
+
     /** Takes the deferred removals that wait for the end of the batch. */
     Drain drain() {
         synchronized (this.removals) {
