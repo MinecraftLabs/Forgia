@@ -69,10 +69,21 @@
          try {
              int i = this.getSectionIndex(p_62816_);
              if (i >= 0 && i < this.sections.length) {
-@@ -236,6 +_,21 @@
+@@ -236,74 +_,94 @@
      @Nullable
      @Override
      public BlockState setBlockState(BlockPos p_62865_, BlockState p_62866_, boolean p_62867_) {
+-        int i = p_62865_.getY();
+-        LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
+-        boolean flag = levelchunksection.hasOnlyAir();
+-        if (flag && p_62866_.isAir()) {
+-            return null;
+-        } else {
+-            int j = p_62865_.getX() & 15;
+-            int k = i & 15;
+-            int l = p_62865_.getZ() & 15;
+-            BlockState blockstate = levelchunksection.setBlockState(j, k, l, p_62866_);
+-            if (blockstate == p_62866_) {
 +        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
 +            return null;
 +        }
@@ -81,50 +92,138 @@
 +        }
 +        this.beginChunkMutation();
 +        try {
-+            return this.setBlockStateUnderMutation(p_62865_, p_62866_, p_62867_);
-+        } finally {
-+            this.endChunkMutation();
-+        }
-+    }
-+
-+    private BlockState setBlockStateUnderMutation(BlockPos p_62865_, BlockState p_62866_, boolean p_62867_) {
-         int i = p_62865_.getY();
-         LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
-         boolean flag = levelchunksection.hasOnlyAir();
-@@ -256,7 +_,11 @@
-                 this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
-                 boolean flag1 = levelchunksection.hasOnlyAir();
-                 if (flag != flag1) {
++            int i = p_62865_.getY();
++            LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
++            boolean flag = levelchunksection.hasOnlyAir();
++            if (flag && p_62866_.isAir()) {
+                 return null;
+             } else {
+-                Block block = p_62866_.getBlock();
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
+-                boolean flag1 = levelchunksection.hasOnlyAir();
+-                if (flag != flag1) {
 -                    this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
-+                    // Neo: a region worker may not drive the light engine of the level itself. It records the
-+                    // section status change and the server thread applies it at the batch barrier.
-+                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightSectionStatus(p_62865_, flag1)) {
-+                        this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
-+                    }
-                 }
- 
-                 if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
-@@ -264,7 +_,11 @@
-                     profilerfiller.push("updateSkyLightSources");
-                     this.skyLightSources.update(this, j, i, l);
-                     profilerfiller.popPush("queueCheckLight");
+-                }
+-
+-                if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
+-                    ProfilerFiller profilerfiller = this.level.getProfiler();
+-                    profilerfiller.push("updateSkyLightSources");
+-                    this.skyLightSources.update(this, j, i, l);
+-                    profilerfiller.popPush("queueCheckLight");
 -                    this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
-+                    // Neo: same for the recheck of one position; the sky light sources above are per chunk and stay
-+                    // on the worker.
-+                    if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightCheck(p_62865_)) {
-+                        this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
-+                    }
-                     profilerfiller.pop();
-                 }
- 
-@@ -278,7 +_,7 @@
-                 if (!levelchunksection.getBlockState(j, k, l).is(block)) {
+-                    profilerfiller.pop();
+-                }
+-
+-                boolean flag2 = blockstate.hasBlockEntity();
+-                if (!this.level.isClientSide) {
+-                    blockstate.onRemove(this.level, p_62865_, p_62866_, p_62867_);
+-                } else if (!blockstate.is(block) && flag2) {
+-                    this.removeBlockEntity(p_62865_);
+-                }
+-
+-                if (!levelchunksection.getBlockState(j, k, l).is(block)) {
++                int j = p_62865_.getX() & 15;
++                int k = i & 15;
++                int l = p_62865_.getZ() & 15;
++                BlockState blockstate = levelchunksection.setBlockState(j, k, l, p_62866_);
++                if (blockstate == p_62866_) {
                      return null;
                  } else {
--                    if (!this.level.isClientSide) {
-+                    if (!this.level.isClientSide && !this.level.captureBlockSnapshots) {
-                         p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
-                     }
++                    Block block = p_62866_.getBlock();
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
++                    boolean flag1 = levelchunksection.hasOnlyAir();
++                    if (flag != flag1) {
++                        // Neo: a region worker may not drive the light engine of the level itself. It records the
++                        // section status change and the server thread applies it at the batch barrier.
++                        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightSectionStatus(p_62865_, flag1)) {
++                            this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
++                        }
++                    }
++
++                    if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
++                        ProfilerFiller profilerfiller = this.level.getProfiler();
++                        profilerfiller.push("updateSkyLightSources");
++                        this.skyLightSources.update(this, j, i, l);
++                        profilerfiller.popPush("queueCheckLight");
++                        // Neo: same for the recheck of one position; the sky light sources above are per chunk and stay
++                        // on the worker.
++                        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightCheck(p_62865_)) {
++                            this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
++                        }
++                        profilerfiller.pop();
++                    }
++
++                    boolean flag2 = blockstate.hasBlockEntity();
+                     if (!this.level.isClientSide) {
+-                        p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
+-                    }
+-
+-                    if (p_62866_.hasBlockEntity()) {
+-                        BlockEntity blockentity = this.getBlockEntity(p_62865_, LevelChunk.EntityCreationType.CHECK);
+-                        if (blockentity != null && !blockentity.isValidBlockState(p_62866_)) {
+-                            this.removeBlockEntity(p_62865_);
+-                            blockentity = null;
+-                        }
+-
+-                        if (blockentity == null) {
+-                            blockentity = ((EntityBlock)block).newBlockEntity(p_62865_, p_62866_);
+-                            if (blockentity != null) {
+-                                this.addAndRegisterBlockEntity(blockentity);
+-                            }
+-                        } else {
+-                            blockentity.setBlockState(p_62866_);
+-                            this.updateBlockEntityTicker(blockentity);
+-                        }
+-                    }
+-
+-                    this.unsaved = true;
+-                    return blockstate;
++                        blockstate.onRemove(this.level, p_62865_, p_62866_, p_62867_);
++                    } else if (!blockstate.is(block) && flag2) {
++                        this.removeBlockEntity(p_62865_);
++                    }
++
++                    if (!levelchunksection.getBlockState(j, k, l).is(block)) {
++                        return null;
++                    } else {
++                        if (!this.level.isClientSide && !this.level.captureBlockSnapshots) {
++                            p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
++                        }
++
++                        if (p_62866_.hasBlockEntity()) {
++                            BlockEntity blockentity = this.getBlockEntity(p_62865_, LevelChunk.EntityCreationType.CHECK);
++                            if (blockentity != null && !blockentity.isValidBlockState(p_62866_)) {
++                                this.removeBlockEntity(p_62865_);
++                                blockentity = null;
++                            }
++
++                            if (blockentity == null) {
++                                blockentity = ((EntityBlock)block).newBlockEntity(p_62865_, p_62866_);
++                                if (blockentity != null) {
++                                    this.addAndRegisterBlockEntity(blockentity);
++                                }
++                            } else {
++                                blockentity.setBlockState(p_62866_);
++                                this.updateBlockEntityTicker(blockentity);
++                            }
++                        }
++
++                        this.unsaved = true;
++                        return blockstate;
++                    }
+                 }
+             }
++    
++        } finally {
++            this.endChunkMutation();
+         }
+     }
  
 @@ -326,7 +_,24 @@
  
@@ -178,7 +277,7 @@
          }
      }
  
-@@ -368,17 +_,39 @@
+@@ -368,42 +_,61 @@
      }
  
      boolean isTicking(BlockPos p_156411_) {
@@ -204,29 +303,68 @@
  
      @Override
      public void setBlockEntity(BlockEntity p_156374_) {
+-        BlockPos blockpos = p_156374_.getBlockPos();
+-        BlockState blockstate = this.getBlockState(blockpos);
+-        if (!blockstate.hasBlockEntity()) {
+-            LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
+-        } else {
+-            BlockState blockstate1 = p_156374_.getBlockState();
+-            if (blockstate != blockstate1) {
+-                if (!p_156374_.getType().isValid(blockstate)) {
+-                    LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
+-                    return;
+-                }
+-
+-                if (blockstate.getBlock() != blockstate1.getBlock()) {
+-                    LOGGER.warn("Block state mismatch on block entity {} in position {}, {} != {}, updating", p_156374_, blockpos, blockstate, blockstate1);
+-                }
+-
+-                p_156374_.setBlockState(blockstate);
+-            }
+-
+-            p_156374_.setLevel(this.level);
+-            p_156374_.clearRemoved();
+-            BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
+-            if (blockentity != null && blockentity != p_156374_) {
+-                blockentity.setRemoved();
+-            }
 +        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
 +            return;
 +        }
 +        this.beginChunkMutation();
 +        try {
-+            this.setBlockEntityUnderMutation(p_156374_);
++            BlockPos blockpos = p_156374_.getBlockPos();
++            BlockState blockstate = this.getBlockState(blockpos);
++            if (!blockstate.hasBlockEntity()) {
++                LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
++            } else {
++                BlockState blockstate1 = p_156374_.getBlockState();
++                if (blockstate != blockstate1) {
++                    if (!p_156374_.getType().isValid(blockstate)) {
++                        LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
++                        return;
++                    }
++
++                    if (blockstate.getBlock() != blockstate1.getBlock()) {
++                        LOGGER.warn("Block state mismatch on block entity {} in position {}, {} != {}, updating", p_156374_, blockpos, blockstate, blockstate1);
++                    }
++
++                    p_156374_.setBlockState(blockstate);
++                }
++
++                p_156374_.setLevel(this.level);
++                p_156374_.clearRemoved();
++                BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
++                if (blockentity != null && blockentity != p_156374_) {
++                    blockentity.setRemoved();
++                    auxLightManager.removeLightAt(blockpos);
++                }
++            }
 +        } finally {
 +            this.endChunkMutation();
-+        }
-+    }
-+
-+    private void setBlockEntityUnderMutation(BlockEntity p_156374_) {
-         BlockPos blockpos = p_156374_.getBlockPos();
-         BlockState blockstate = this.getBlockState(blockpos);
-         if (!blockstate.hasBlockEntity()) {
-@@ -403,6 +_,7 @@
-             BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
-             if (blockentity != null && blockentity != p_156374_) {
-                 blockentity.setRemoved();
-+                auxLightManager.removeLightAt(blockpos);
-             }
          }
      }
+ 
 @@ -412,9 +_,14 @@
      public CompoundTag getBlockEntityNbtForSaving(BlockPos p_62932_, HolderLookup.Provider p_323699_) {
          BlockEntity blockentity = this.getBlockEntity(p_62932_);
@@ -242,35 +380,44 @@
          } else {
              CompoundTag compoundtag = this.pendingBlockEntities.get(p_62932_);
              if (compoundtag != null) {
-@@ -428,6 +_,18 @@
+@@ -428,18 +_,28 @@
  
      @Override
      public void removeBlockEntity(BlockPos p_62919_) {
+-        if (this.isInLevel()) {
+-            BlockEntity blockentity = this.blockEntities.remove(p_62919_);
+-            if (blockentity != null) {
+-                if (this.level instanceof ServerLevel serverlevel) {
+-                    this.removeGameEventListener(blockentity, serverlevel);
+-                }
 +        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
 +            return;
 +        }
 +        this.beginChunkMutation();
 +        try {
-+            this.removeBlockEntityUnderMutation(p_62919_);
++            if (this.isInLevel()) {
++                BlockEntity blockentity = this.blockEntities.remove(p_62919_);
++                if (blockentity != null) {
++                    if (this.level instanceof ServerLevel serverlevel) {
++                        this.removeGameEventListener(blockentity, serverlevel);
++                    }
+ 
+-                blockentity.setRemoved();
++                    blockentity.setRemoved();
++                    auxLightManager.removeLightAt(p_62919_);
++                    }
+             }
+-        }
+ 
+-        this.removeBlockEntityTicker(p_62919_);
++            this.removeBlockEntityTicker(p_62919_);
++    
 +        } finally {
 +            this.endChunkMutation();
 +        }
-+    }
-+
-+    private void removeBlockEntityUnderMutation(BlockPos p_62919_) {
-         if (this.isInLevel()) {
-             BlockEntity blockentity = this.blockEntities.remove(p_62919_);
-             if (blockentity != null) {
-@@ -436,7 +_,8 @@
-                 }
+     }
  
-                 blockentity.setRemoved();
--            }
-+                auxLightManager.removeLightAt(p_62919_);
-+                }
-         }
- 
-         this.removeBlockEntityTicker(p_62919_);
+     private <T extends BlockEntity> void removeGameEventListener(T p_223413_, ServerLevel p_223414_) {
 @@ -459,9 +_,16 @@
      }
  
@@ -297,34 +444,35 @@
              }
          });
      }
-@@ -604,6 +_,26 @@
+@@ -604,13 +_,31 @@
      }
  
      public void clearAllBlockEntities() {
+-        this.blockEntities.values().forEach(BlockEntity::setRemoved);
+-        this.blockEntities.clear();
+-        this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
+-        this.tickersInLevel.clear();
 +        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
 +            return;
 +        }
 +        this.beginChunkMutation();
 +        try {
-+            this.clearAllBlockEntitiesUnderMutation();
++            ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
++            // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
++            // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
++            // plan's chunk index.
++            this.setBlockEntityTickAdmissionCache(null);
++            this.level.unregisterBlockEntityTickerChunk(this);
++            this.level.markBlockEntityTickerRemoved();
++            this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
++            this.blockEntities.values().forEach(BlockEntity::setRemoved);
++            this.blockEntities.clear();
++            this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
++            this.tickersInLevel.clear();
++    
 +        } finally {
 +            this.endChunkMutation();
 +        }
-+    }
-+
-+    private void clearAllBlockEntitiesUnderMutation() {
-+        ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
-+        // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
-+        // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
-+        // plan's chunk index.
-+        this.setBlockEntityTickAdmissionCache(null);
-+        this.level.unregisterBlockEntityTickerChunk(this);
-+        this.level.markBlockEntityTickerRemoved();
-+        this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
-         this.blockEntities.values().forEach(BlockEntity::setRemoved);
-         this.blockEntities.clear();
-         this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
-@@ -611,6 +_,7 @@
      }
  
      public void registerAllBlockEntitiesAfterLevelLoad() {

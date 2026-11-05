@@ -11,7 +11,7 @@ set -uo pipefail
 PACK=${1:?pack dir}
 LIST=${2:?jar list}
 NAME=${3:?run name}
-RUNS=${RUNS:-/tmp/modpack-matrix/runs}
+RUNS=${RUNS:-/home/yc/Minecraft/modpack-matrix-runs}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BASE=${BASE_CPU:-}
 

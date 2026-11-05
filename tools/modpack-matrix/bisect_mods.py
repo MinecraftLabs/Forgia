@@ -70,7 +70,7 @@ def main():
     ap.add_argument("pack")
     ap.add_argument("--parallel", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=180)
-    ap.add_argument("--out", default="results.csv")
+    ap.add_argument("--out", default="/home/yc/Minecraft/modpack-matrix-runs/results.csv")
     args = ap.parse_args()
 
     pack = Path(args.pack).resolve()
