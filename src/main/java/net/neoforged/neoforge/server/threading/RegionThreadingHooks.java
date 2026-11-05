@@ -16,7 +16,9 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.entity.EntityTypeTest;
+import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
+import net.minecraft.world.level.entity.PersistentEntitySectionManager;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.region.LevelTickPhase;
@@ -79,6 +81,37 @@ public final class RegionThreadingHooks {
     public static RegionLayout entitySectionStorageLayout() {
         return RegionThreadingManager.currentOrNull() instanceof RegionThreadingEngine engine
                 ? engine.regionLayout()
+                : RegionLayout.DYNAMIC;
+    }
+
+    /**
+     * {@return the owner check a section manager built with {@code callbacks} installs}
+     * <p>
+     * A level supplies its own callbacks object ({@link ServerEntityStorageOwner}), so the manager it builds
+     * for itself is guarded from construction on - without an installed engine, and while a worker is still
+     * unwinding after the manager was removed. Every other caller (the client, a test, a mod that builds its
+     * own manager) owns no level and keeps vanilla's single-threaded storage, so it gets the no-op check.
+     * <p>
+     * This is the level's construction seam, not its constructor: the manager's constructor keeps the
+     * three-argument shape vanilla has and mods mix into.
+     */
+    public static PersistentEntitySectionManager.EntityStorageAccessCheck serverEntityStorageAccessCheck(
+            LevelCallback<?> callbacks) {
+        return callbacks instanceof ServerEntityStorageOwner
+                ? RegionThreadingHooks::assertServerEntityStorageAccess
+                : operation -> {};
+    }
+
+    /**
+     * {@return the physical section storage layout a section manager built with {@code callbacks} partitions with}
+     * <p>
+     * Only a level assigns the section storage a region partition, and it is the same layout
+     * {@link #entitySectionStorageLayout()} captures at level construction; a manager built by any other caller
+     * stays on the legacy section map.
+     */
+    public static RegionLayout serverEntityStorageLayout(LevelCallback<?> callbacks) {
+        return callbacks instanceof ServerEntityStorageOwner
+                ? entitySectionStorageLayout()
                 : RegionLayout.DYNAMIC;
     }
 

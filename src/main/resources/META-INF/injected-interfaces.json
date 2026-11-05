@@ -104,6 +104,9 @@
     "net/minecraft/server/level/ServerChunkCache": [
         "net/neoforged/neoforge/common/extensions/IServerChunkCacheExtension"
     ],
+    "net/minecraft/server/level/ServerLevel$EntityCallbacks": [
+        "net/neoforged/neoforge/server/threading/ServerEntityStorageOwner"
+    ],
     "net/minecraft/server/packs/PackResources": [
         "net/neoforged/neoforge/common/extensions/IPackResourcesExtension"
     ],

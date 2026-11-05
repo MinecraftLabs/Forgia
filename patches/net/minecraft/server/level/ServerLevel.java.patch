@@ -34,15 +34,14 @@
              this,
              p_214999_
          );
--        this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage);
-+        // Neo: the persistent entity storage is server-owned. The owner check rejects native region workers
-+        // before events, UUID registration or section mutation, and on the manager's public reads (isLoaded,
-+        // status, diagnostics) and on every operation of the getter returned by getEntityGetter(). It does
-+        // not require an installed engine, so a level constructed before the bridge is installed, and a
-+        // worker still unwinding after the manager was removed, are both still guarded.
-+        this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage,
-+                net.neoforged.neoforge.server.threading.RegionThreadingHooks::assertServerEntityStorageAccess,
-+                net.neoforged.neoforge.server.threading.RegionThreadingHooks.entitySectionStorageLayout());
++        // Neo: vanilla's construction, byte for byte, so a mod's wrap of this call still matches. The level
++        // owns the persistent entity storage and reaches the manager through its own EntityCallbacks, which is
++        // a ServerEntityStorageOwner: the manager installs the owner check (it rejects native region workers
++        // before events, UUID registration or section mutation, and on its public reads and on every operation
++        // of the getter returned by getEntityGetter()) and the region layout of the physical section partitions
++        // from that callback. It does not require an installed engine, so a level constructed before the bridge
++        // is installed, and a worker still unwinding after the manager was removed, are both still guarded.
+         this.entityManager = new PersistentEntitySectionManager<>(Entity.class, new ServerLevel.EntityCallbacks(), entitypersistentstorage);
 +        // Neo: the vanilla section/index storage stays owned by the server thread. In production this view
 +        // rejects every legacy entity query issued from a native region worker before its predicate,
 +        // consumer or result escapes. Non-worker callers, the client level and the ordinary server thread
@@ -599,7 +598,7 @@
          p_184103_.unpackTicks(this.getLevelData().getGameTime());
      }
  
-@@ -1679,6 +_,19 @@
+@@ -1679,7 +_,27 @@
          return crashreportcategory;
      }
  
@@ -616,9 +615,17 @@
 +        return this.entityManager.identityLedger();
 +    }
 +
-     final class EntityCallbacks implements LevelCallback<Entity> {
+     final class EntityCallbacks implements LevelCallback<Entity>, net.neoforged.neoforge.server.threading.ServerEntityStorageOwner {
++        // Neo: the owner seam. The entity section manager reaches this level from the callback it is
++        // constructed with, which keeps that construction at vanilla's three-argument shape.
++        @Override
++        public ServerLevel owningLevel() {
++            return ServerLevel.this;
++        }
++
          public void onCreated(Entity p_143355_) {
          }
+ 
 @@ -1713,8 +_,8 @@
                  ServerLevel.this.navigatingMobs.add(mob);
              }

@@ -14,11 +14,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.LongAVLTreeSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
+import java.io.InputStream;
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -32,6 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.AbortableIterationConsumer.Continuation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
@@ -49,6 +53,7 @@ import net.minecraft.world.level.entity.Visibility;
 import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.ServerEntityStorageOwner;
 import net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions;
 import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -491,6 +496,69 @@ class FixedEntitySectionPartitionsTest {
         }
     }
 
+    /**
+     * The level builds its entity section manager with vanilla's three-argument constructor, which is the call
+     * site a mod wraps: moonlight's {@code @WrapOperation} on {@code new PersistentEntitySectionManager<>(...)}
+     * fails its injection check as soon as the argument list grows, and moonlight is mandatory for
+     * {@code supplementaries}. This reads the compiled {@code ServerLevel} constructor call,
+     * so it fails on the shape a mod sees and not on a copy of the line in this repository.
+     */
+    @Test
+    void vanillaConstructionSiteKeepsTheThreeArgumentDescriptor() throws Exception {
+        byte[] bytes;
+        try (InputStream in = ServerLevel.class.getResourceAsStream("ServerLevel.class")) {
+            assertNotNull(in, "ServerLevel.class must be readable as a resource");
+            bytes = in.readAllBytes();
+        }
+        String classFile = new String(bytes, StandardCharsets.ISO_8859_1);
+        assertTrue(classFile.contains("(Ljava/lang/Class;Lnet/minecraft/world/level/entity/LevelCallback;Lnet/minecraft/world/level/entity/EntityPersistentStorage;)V"),
+                "ServerLevel must construct the entity section manager with vanilla's three-argument constructor");
+        assertFalse(classFile.contains("EntityStorageAccessCheck;Lnet/neoforged/neoforge/server/threading/region/RegionLayout;)V"),
+                "ServerLevel must not construct the entity section manager with the storage arguments");
+    }
+
+    /**
+     * A manager built through vanilla's three-argument constructor by a level still gets both guarantees: the
+     * level's callbacks object is the {@link ServerEntityStorageOwner} the manager reads, so a native region
+     * worker is rejected on the manager and on its getter, and the physical section storage is partitioned with
+     * the installed engine's layout. A manager built with callbacks that own no level keeps vanilla storage and
+     * the no-op check.
+     */
+    @Test
+    void levelCallbacksInstallTheOwnerCheckAndTheRegionLayout() throws Exception {
+        RegionThreadingManager.clear();
+        var engine = new RegionThreadingEngine(1, true, false, false, false, false, false, RegionLayout.FIXED_3X3);
+        RegionThreadingManager.install(engine);
+        try {
+            var level = mock(ServerLevel.class);
+            var owned = new PersistentEntitySectionManager<>(TestEntity.class, new OwningCallbacks(level), new Fixture());
+            var unowned = new PersistentEntitySectionManager<>(TestEntity.class, callbacks(new ArrayList<>()), new Fixture());
+            assertEquals(RegionLayout.FIXED_3X3, field(field(managerStorage(owned), "partitions"), "layout"));
+            assertNull(field(managerStorage(unowned), "partitions"));
+            owned.addNewEntity(new TestEntity(1, BlockPos.ZERO));
+            CountDownLatch finished = new CountDownLatch(1);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            RegionWorkerExecutor workers = (RegionWorkerExecutor) field(engine, "workerPool");
+            assertTrue(workers.execute("vanilla construction guard", () -> {
+                try {
+                    assertThrows(IllegalStateException.class, owned::count);
+                    assertThrows(IllegalStateException.class, () -> owned.getEntityGetter().getAll());
+                    assertThrows(IllegalStateException.class, () -> owned.addNewEntity(new TestEntity(2, BlockPos.ZERO)));
+                    assertEquals(0, unowned.count());
+                } catch (Throwable t) {
+                    failure.set(t);
+                } finally {
+                    finished.countDown();
+                }
+            }));
+            assertTrue(finished.await(10, TimeUnit.SECONDS));
+            if (failure.get() != null) throw new AssertionError(failure.get());
+        } finally {
+            RegionThreadingManager.clear();
+            engine.shutdown();
+        }
+    }
+
     private static List<Integer> query(EntitySectionStorage<TestEntity> storage, AABB bounds, int stop, boolean typed) {
         List<Integer> ids = new ArrayList<>();
         if (typed) {
@@ -572,6 +640,37 @@ class FixedEntitySectionPartitionsTest {
                 events.add("section:" + entity.id);
             }
         };
+    }
+
+    /**
+     * The callbacks object a level passes to its entity section manager: it is the {@link ServerEntityStorageOwner}
+     * the manager reads its level from. The callbacks themselves are not what this fixture observes.
+     */
+    private static final class OwningCallbacks implements LevelCallback<TestEntity>, ServerEntityStorageOwner {
+        private final ServerLevel level;
+
+        OwningCallbacks(ServerLevel level) {
+            this.level = level;
+        }
+
+        @Override
+        public ServerLevel owningLevel() {
+            return this.level;
+        }
+
+        public void onCreated(TestEntity entity) {}
+
+        public void onDestroyed(TestEntity entity) {}
+
+        public void onTickingStart(TestEntity entity) {}
+
+        public void onTickingEnd(TestEntity entity) {}
+
+        public void onTrackingStart(TestEntity entity) {}
+
+        public void onTrackingEnd(TestEntity entity) {}
+
+        public void onSectionChange(TestEntity entity) {}
     }
 
     private record Scenario(List<String> events, List<String> firstSave, List<String> allStores, List<Integer> query) {}

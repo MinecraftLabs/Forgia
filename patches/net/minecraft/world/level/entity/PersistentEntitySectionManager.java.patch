@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -37,19 +_,73 @@
+@@ -37,19 +_,79 @@
      private final EntityLookup<T> visibleEntityStorage;
      final EntitySectionStorage<T> sectionStorage;
      private final LevelEntityGetter<T> entityGetter;
@@ -13,7 +13,12 @@
 +    private final net.neoforged.neoforge.server.threading.region.EntityIdentityLedger identityLedger = new net.neoforged.neoforge.server.threading.region.EntityIdentityLedger();
  
      public PersistentEntitySectionManager(Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_) {
-+        this(p_157503_, p_157504_, p_157505_, operation -> {});
++        // Neo: this is vanilla's construction shape, and the one a mod mixes into. The level owns the storage and
++        // hands out both the owner check and the region layout the storage is partitioned with through its own
++        // callbacks object, so neither is a constructor argument and this call keeps the call site a mod wraps.
++        this(p_157503_, p_157504_, p_157505_,
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.serverEntityStorageAccessCheck(p_157504_),
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.serverEntityStorageLayout(p_157504_));
 +    }
 +
 +    public PersistentEntitySectionManager(
@@ -40,8 +45,9 @@
 +
 +    /**
 +     * Neo: owner check for the server-owned section/index storage. A level supplies a check that rejects
-+     * native region workers before the operation reads or changes shared state; the generic constructor
-+     * keeps a no-op check for tests and other users.
++     * native region workers before the operation reads or changes shared state, and reaches the manager
++     * through the callbacks object it passes to the vanilla three-argument constructor; a caller that builds
++     * its own manager without a level keeps a no-op check.
 +     * <p>
 +     * The check covers both halves of the storage surface. The mutating entry points (add, status, load,
 +     * unload, save, move, remove) are rejected before they change state, and the public read surface
