@@ -72,6 +72,25 @@ signature, or change which instructions follow a call a mod offsets from.
 The pack's own `netherexp` and `modernfix` mixins also log optional injection failures for the same reason
 (instruction-level assumptions) but are non-fatal.
 
+## With the engine forced on
+
+The table above disables every worker slice for this pack, which made it impossible to tell whether the mods
+actually work. `regionThreadingForceWithKnownConflicts` (measurement only, logged loudly) installs the engine
+anyway, with every conflict still detected and reported.
+
+First measurement, all 170 mods with the full engine:
+
+| | Result |
+|---|---|
+| Boot to `Done` | **37.7 s** |
+| Region workers | 7 alive |
+| Ownership violations, tick failures over 11 minutes | **0** |
+| Shutdown | **hangs** - the server thread parks in `MinecraftServer.waitForTasks` (modernfix's `waitLongerForTasks`) while the `c2me-worker-*` threads die |
+
+So the engine survives with the whole pack up, and **c2me is confirmed incompatible by evidence rather than by
+reputation**: it owns chunk threads that the engine's shutdown path does not wait for. The other nine conflicts
+are now open questions the harness can answer one at a time, with the same run repeated without the candidate.
+
 ## Reproducing
 
 ```bash
