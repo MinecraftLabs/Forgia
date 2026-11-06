@@ -381,14 +381,15 @@ class RegionEngineBenchmark {
     /**
      * Runs one scheduled block tick phase through the dispatcher the engine hands to {@code LevelTicks}.
      * The callbacks only burn the fixed CPU cost; they do not touch the level, so the measured time is
-     * the batch barrier and the region lease.
+     * the batch barrier and the region lease. The will-tick hook of {@code LevelTicks} is a no-op here: this
+     * harness hands the ticks to the dispatcher directly, so there is no collected-tick set to maintain.
      */
     private static void dispatchScheduledTicks(RegionThreadingEngine engine, ServerLevel level, List<ScheduledTick<Block>> ticks) {
         final LevelTicks.TickDispatcher<Block> dispatcher = engine.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, BOUNDED_BARRIER);
         if (dispatcher == null) {
             throw new IllegalStateException("the scheduled tick slice must be enabled for the benchmark");
         }
-        dispatcher.runCollected(ticks, (pos, type) -> burnCpu(), (pos, type) -> burnCpu());
+        dispatcher.runCollected(ticks, (pos, type) -> burnCpu(), (pos, type) -> burnCpu(), tick -> {});
     }
 
     private static RegionThreadingEngine installEngine(int workerThreads, boolean blockEntityTickWorkers, boolean scheduledTickWorkers) {

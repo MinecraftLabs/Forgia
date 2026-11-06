@@ -25,8 +25,10 @@ import org.jetbrains.annotations.Nullable;
  * <p>
  * The ticks are the snapshot {@code LevelTicks} selected for this tick. Each group owns the lease of
  * exactly one region and executes the snapshot ticks of that region in their original order, so different
- * regions run in parallel while a region never ticks against itself. Ticks whose region cannot be leased
- * safely are executed on the server thread after the batch instead of being dropped.
+ * regions run in parallel while a region never ticks against itself. Every tick is reported to the
+ * {@code LevelTicks} per-tick hook immediately before its callback runs, so the will-tick predicate answers
+ * for the ticks of this tick that have not run yet exactly as it does in the inline loop. Ticks whose region
+ * cannot be leased safely are executed on the server thread after the batch instead of being dropped.
  * <p>
  * Every group owns its own {@link RandomSource}, derived from one server-thread seed source per batch.
  * A worker therefore never draws from the shared level random, and the sequence a region observes only

@@ -28,6 +28,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.minecraft.SharedConstants;
@@ -2884,7 +2885,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             // publishing a batch for region state that no longer exists.
             return null;
         }
-        return (collected, callback, fallbackCallback) -> this.tickScheduledTicks(level, phase, collected, callback, fallbackCallback, barrier);
+        return (collected, callback, fallbackCallback, beginTick) -> this.tickScheduledTicks(level, phase, collected, callback, fallbackCallback, beginTick, barrier);
     }
 
     /**
@@ -5389,12 +5390,15 @@ public final class RegionThreadingEngine implements RegionThreading {
      * <p>
      * The server thread waits for the whole phase before it applies the mutations the callbacks
      * requested, so a worker never mutates the scheduling structures and a tick scheduled by a callback
-     * is never executed early by this batch. Ticks whose region could not be leased run through
+     * is never executed early by this batch. The one exception is the per-tick hook: every tick is reported
+     * to {@code beginTick} immediately before its callback runs, on the worker that runs it, so
+     * {@code LevelTicks.willTickThisTick} answers for a tick of this phase that has not run yet exactly as the
+     * inline loop does. Ticks whose region could not be leased run through
      * {@code fallbackCallback} directly on the server thread after the workers finished; the callback
      * must not hand them to a region queue because {@code LevelTicks} already removed them.
      */
     <T> void tickScheduledTicks(ServerLevel level, ScheduledTickPhase phase, List<ScheduledTick<T>> ticks, BiConsumer<BlockPos, T> callback,
-            BiConsumer<BlockPos, T> fallbackCallback, RegionTickBarrier barrier) {
+            BiConsumer<BlockPos, T> fallbackCallback, Consumer<ScheduledTick<T>> beginTick, RegionTickBarrier barrier) {
         if (ticks.isEmpty()) {
             return;
         }
@@ -5412,6 +5416,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             // The engine was shut down between the snapshot and the batch; the collected ticks still have
             // to tick, but no batch may be published after shutdown started.
             for (final ScheduledTick<T> tick : ticks) {
+                beginTick.accept(tick);
                 fallbackCallback.accept(tick.pos(), tick.type());
             }
             return;
@@ -5432,7 +5437,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         Throwable failure = null;
         try {
             try {
-                this.leaseScheduledTickGroups(batch, admittedTicks, callback, barrier);
+                this.leaseScheduledTickGroups(batch, admittedTicks, callback, beginTick, barrier);
             } catch (Throwable throwable) {
                 failure = throwable;
             } finally {
@@ -5448,7 +5453,7 @@ public final class RegionThreadingEngine implements RegionThreading {
             // A scheduled callback that wrote a block recorded its light recheck and block update; they run before
             // the server-thread fallback ticks of this phase observe the written state.
             failure = runBatchCompletion(failure, () -> this.applyDeferredBlockUpdates(batch));
-            failure = runBatchCompletion(failure, () -> this.tickFallbackScheduledTicks(batch, fallbackCallback));
+            failure = runBatchCompletion(failure, () -> this.tickFallbackScheduledTicks(batch, fallbackCallback, beginTick));
             failure = runBatchCompletion(failure, () -> this.applyRegionTickMutations(batch.scheduledTickMutations()));
             batch.finish();
             this.activeTickBatches.remove(batch);
@@ -5469,7 +5474,8 @@ public final class RegionThreadingEngine implements RegionThreading {
      * taken here. A region that dies while its lease is acquired is re-resolved on the next attempt.
      * Anything that cannot be resolved to a live, leasable region is recorded as a server-thread fallback.
      */
-    private <T> void leaseScheduledTickGroups(RegionScheduledTickBatch<T> batch, List<ScheduledTick<T>> pending, BiConsumer<BlockPos, T> callback, RegionTickBarrier barrier) {
+    private <T> void leaseScheduledTickGroups(RegionScheduledTickBatch<T> batch, List<ScheduledTick<T>> pending, BiConsumer<BlockPos, T> callback,
+            Consumer<ScheduledTick<T>> beginTick, RegionTickBarrier barrier) {
         List<ScheduledTick<T>> remaining = pending;
         int batchedTicks = 0;
         for (int attempt = 0; attempt < MAX_REGION_LEASE_ATTEMPTS && !remaining.isEmpty(); attempt++) {
@@ -5504,7 +5510,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 leasedAny = true;
                 batchedTicks += grouping.size(region);
                 this.addLeasedGroup(region, () -> batch.addGroup(region, grouping.items(region), batch.nextRandomSeed(),
-                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.scheduledTickGroup(group, callback))));
+                        group -> this.withRegionMailboxDelivery(batch.level(), region, this.scheduledTickGroup(group, callback, beginTick))));
             }
             remaining = next;
             if (!leasedAny) {
@@ -5521,7 +5527,7 @@ public final class RegionThreadingEngine implements RegionThreading {
         }
     }
 
-    private <T> Runnable scheduledTickGroup(RegionScheduledTickBatch.Group<T> group, BiConsumer<BlockPos, T> callback) {
+    private <T> Runnable scheduledTickGroup(RegionScheduledTickBatch.Group<T> group, BiConsumer<BlockPos, T> callback, Consumer<ScheduledTick<T>> beginTick) {
         final RegionState region = group.region();
         final RegionCoordinate coordinate = region.coordinate();
         final ServerLevel level = group.level();
@@ -5540,6 +5546,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                             try {
                                 this.currentPropagationOrigin.set(tick.pos());
                                 try {
+                                    beginTick.accept(tick);
                                     callback.accept(tick.pos(), tick.type());
                                 } finally {
                                     this.currentPropagationOrigin.remove();
@@ -5579,9 +5586,11 @@ public final class RegionThreadingEngine implements RegionThreading {
      * region handoff again: that could defer them to a later region tick or drop them on a closed level.
      * Instead they run through the direct server-thread callback before the dispatcher returns. A tick
      * whose level identity closed while the batch ran is handled by the existing closed-level policy and
-     * counted as skipped, exactly like the collected snapshot of a closed level.
+     * counted as skipped, exactly like the collected snapshot of a closed level; a tick that does run is
+     * reported to {@code beginTick} here, at the point its fallback callback runs.
      */
-    private <T> void tickFallbackScheduledTicks(RegionScheduledTickBatch<T> batch, BiConsumer<BlockPos, T> fallbackCallback) {
+    private <T> void tickFallbackScheduledTicks(RegionScheduledTickBatch<T> batch, BiConsumer<BlockPos, T> fallbackCallback,
+            Consumer<ScheduledTick<T>> beginTick) {
         final ServerLevel level = batch.level();
         for (final ScheduledTick<T> tick : batch.fallbackTicks()) {
             if (this.regionizer.isLevelClosed(level)) {
@@ -5589,6 +5598,7 @@ public final class RegionThreadingEngine implements RegionThreading {
                 continue;
             }
             this.fallbackScheduledTicks.incrementAndGet();
+            beginTick.accept(tick);
             fallbackCallback.accept(tick.pos(), tick.type());
         }
     }

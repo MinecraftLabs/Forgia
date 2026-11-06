@@ -8,68 +8,34 @@ package net.neoforged.neoforge.unittest;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
-import static org.mockito.ArgumentMatchers.anyFloat;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.withSettings;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.Holder;
-import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
-import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.Container;
-import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
-import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ButtonBlock;
-import net.minecraft.world.level.block.DiodeBlock;
-import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.LeverBlock;
 import net.minecraft.world.level.block.RedstoneTorchBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
-import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
-import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.AttachFace;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.ComparatorMode;
 import net.minecraft.world.level.block.state.properties.RailShape;
-import net.minecraft.world.level.border.WorldBorder;
-import net.minecraft.world.level.gameevent.GameEvent;
-import net.minecraft.world.phys.AABB;
-import net.minecraft.world.phys.Vec3;
-import net.minecraft.world.ticks.LevelChunkTicks;
 import net.minecraft.world.ticks.LevelTicks;
-import net.minecraft.world.ticks.ScheduledTick;
-import net.minecraft.world.ticks.TickPriority;
-import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
-import net.neoforged.neoforge.server.threading.region.RegionAwareNeighborUpdater;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
@@ -224,7 +190,7 @@ class RegionRedstoneComponentEquivalenceTest {
     private double[] measureRedstoneGrid(int chains, boolean borderUpdates) {
         RegionThreadingManager.clear();
         this.gameTime.set(0L);
-        final ComponentWorld world = new ComponentWorld();
+        final RegionRedstoneWorld world = new RegionRedstoneWorld(this.gameTime);
         final ServerLevel level = world.level;
         final Layout layout = Layout.interiorGrid(0xB12E5L, chains);
         layout.build(world);
@@ -252,7 +218,7 @@ class RegionRedstoneComponentEquivalenceTest {
             final LevelTicks.TickDispatcher<Block> dispatcher = installed.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, PARKING_BARRIER);
             world.blockTicks.tick(tick, 65536, (pos, block) -> level.getBlockState(pos).tick(level, pos, world.scheduledRandom), dispatcher);
             world.runBlockEvents(true);
-            world.tickPistonMovingBlockEntities(true);
+            world.tickBlockEntities(true);
             final long duration = System.nanoTime() - start;
             if (tick > BENCHMARK_WARMUP) {
                 elapsed += duration;
@@ -300,7 +266,7 @@ class RegionRedstoneComponentEquivalenceTest {
         RegionThreadingManager.clear();
         this.engine = null;
         this.gameTime.set(0L);
-        final ComponentWorld world = new ComponentWorld();
+        final RegionRedstoneWorld world = new RegionRedstoneWorld(this.gameTime);
         final ServerLevel level = world.level;
         layout.build(world);
         if (regionThreading) {
@@ -333,7 +299,7 @@ class RegionRedstoneComponentEquivalenceTest {
             }
             world.blockTicks.tick(tick, 65536, (pos, block) -> level.getBlockState(pos).tick(level, pos, world.scheduledRandom), dispatcher);
             world.runBlockEvents(regionThreading);
-            world.tickPistonMovingBlockEntities(regionThreading);
+            world.tickBlockEntities(regionThreading);
             final String snapshot = world.snapshot(layout.trace());
             perTick.add(snapshot);
             for (final String entry : snapshot.split("\n")) {
@@ -375,9 +341,6 @@ class RegionRedstoneComponentEquivalenceTest {
 
     private record RunResult(List<String> perTick, Map<String, Integer> firstSeen, List<String> events) {}
 
-    /** The box of positions a layout traces: the state and block entity of every position inside it. */
-    record TraceBox(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {}
-
     /**
      * One deterministic redstone layout: the placements, the traced box and the actions the server thread
      * applies at named ticks.
@@ -407,23 +370,23 @@ class RegionRedstoneComponentEquivalenceTest {
 
         private record Placement(BlockPos pos, BlockState state) {}
 
-        private record TimedAction(int tick, Consumer<ComponentWorld> body) {}
+        private record TimedAction(int tick, Consumer<RegionRedstoneWorld> body) {}
 
         private void place(int x, int y, int z, BlockState state) {
             this.actions.add(new TimedAction(-1, world -> world.level.setBlock(new BlockPos(x, y, z), state, 3)));
         }
 
-        private void action(int tick, Consumer<ComponentWorld> body) {
+        private void action(int tick, Consumer<RegionRedstoneWorld> body) {
             this.actions.add(new TimedAction(tick, body));
         }
 
-        private void build(ComponentWorld world) {
+        private void build(RegionRedstoneWorld world) {
             // The placement actions use tick -1, so the build pass only runs them. They are applied in list
             // order, exactly like the placement of the circuit by a player.
             this.applyActions(world, -1);
         }
 
-        private void applyActions(ComponentWorld world, int tick) {
+        private void applyActions(RegionRedstoneWorld world, int tick) {
             for (final TimedAction action : this.actions) {
                 if (action.tick() == tick) {
                     action.body().accept(world);
@@ -726,416 +689,12 @@ class RegionRedstoneComponentEquivalenceTest {
             return layout;
         }
 
-        private static void fillChest(ComponentWorld world, int x, int count) {
+        private static void fillChest(RegionRedstoneWorld world, int x, int count) {
             final BlockPos chestPos = new BlockPos(x, Y, Z);
             if (world.blockEntities.get(chestPos) instanceof Container container) {
                 container.setItem(0, new ItemStack(Items.STONE, count));
                 ((BlockEntity) container).setChanged();
             }
-        }
-    }
-
-    /**
-     * A level mock with the production write, signal, block-entity and block-event seams. The block states and
-     * block entities live in concurrent maps so the propagation passes and the region workers can read each
-     * other's committed state, and the scheduled ticks are the real {@link LevelTicks} scheduler.
-     */
-    private final class ComponentWorld {
-        private final ServerLevel level = mock(ServerLevel.class, withSettings().stubOnly());
-        private final Thread serverThread = Thread.currentThread();
-        private final Map<BlockPos, BlockState> states = new ConcurrentHashMap<>();
-        private final Map<BlockPos, BlockEntity> blockEntities = new ConcurrentHashMap<>();
-        private final ConcurrentLinkedQueue<BlockEvent> blockEvents = new ConcurrentLinkedQueue<>();
-        /**
-         * The block events the phase of one tick drained, in order, as {@code tick:pos:block:id:param}.
-         * <p>
-         * Recorded before the event body runs, so the trace is the phase's input and not its effect: an event
-         * whose block changed since it was queued is part of the stream of both runs alike.
-         */
-        private final List<String> eventTrace = new java.util.concurrent.CopyOnWriteArrayList<>();
-        private final LevelTicks<Block> blockTicks = new LevelTicks<>(pos -> true, () -> InactiveProfiler.INSTANCE);
-        private final RandomSource scheduledRandom = RandomSource.create(0x5EEDL);
-        private final RegionAwareNeighborUpdater neighborUpdater;
-
-        private record BlockEvent(BlockPos pos, Block block, int id, int param) {}
-
-        private ComponentWorld() {
-            for (int chunkX = -2; chunkX <= 12; chunkX++) {
-                this.blockTicks.addContainer(new ChunkPos(chunkX, 0), new LevelChunkTicks<>());
-            }
-            this.neighborUpdater = new RegionAwareNeighborUpdater(this.level, 1000000);
-            setLevelField(this.level, "random", RandomSource.create(4321L));
-            doReturn(InactiveProfiler.INSTANCE).when(this.level).getProfiler();
-            doReturn(1234L).when(this.level).getSeed();
-            doAnswer(invocation -> gameTime.get()).when(this.level).getGameTime();
-            doReturn(ResourceKey.create(Registries.DIMENSION, ResourceLocation.parse("minecraft:overworld"))).when(this.level).dimension();
-            doReturn(1000000).when(this.level).maxChainedNeighborUpdates();
-            doReturn(this.blockTicks).when(this.level).getBlockTicks();
-            doReturn(0).when(this.level).getMinBuildHeight();
-            doReturn(384).when(this.level).getMaxBuildHeight();
-            doReturn(false).when(this.level).isOutsideBuildHeight(any(BlockPos.class));
-            doReturn(true).when(this.level).hasChunkAt(any(BlockPos.class));
-            doReturn(new WorldBorder()).when(this.level).getWorldBorder();
-            doAnswer(invocation -> BuiltInRegistries.BLOCK.asLookup()).when(this.level).holderLookup(any());
-            doAnswer(invocation -> this.states.getOrDefault(invocation.getArgument(0), Blocks.AIR.defaultBlockState()))
-                    .when(this.level).getBlockState(any(BlockPos.class));
-            doAnswer(invocation -> this.states.getOrDefault(invocation.getArgument(0), Blocks.AIR.defaultBlockState()).getFluidState())
-                    .when(this.level).getFluidState(any(BlockPos.class));
-            doAnswer(invocation -> this.setBlock(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2)))
-                    .when(this.level).setBlock(any(BlockPos.class), any(BlockState.class), anyInt());
-            doAnswer(invocation -> this.removeBlock(invocation.getArgument(0), invocation.getArgument(1)))
-                    .when(this.level).removeBlock(any(BlockPos.class), anyBoolean());
-            doAnswer(invocation -> {
-                this.neighborUpdater.updateNeighborsAtExceptFromFacing(invocation.getArgument(0), invocation.getArgument(1), null);
-                return null;
-            }).when(this.level).updateNeighborsAt(any(BlockPos.class), any(Block.class));
-            doAnswer(invocation -> {
-                this.neighborUpdater.updateNeighborsAtExceptFromFacing(invocation.getArgument(0), invocation.getArgument(1),
-                        invocation.getArgument(2));
-                return null;
-            }).when(this.level).updateNeighborsAtExceptFromFacing(any(BlockPos.class), any(Block.class), any());
-            doAnswer(invocation -> {
-                this.neighborUpdater.neighborChanged(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
-                return null;
-            }).when(this.level).neighborChanged(any(BlockPos.class), any(Block.class), any(BlockPos.class));
-            doAnswer(invocation -> {
-                this.neighborUpdater.neighborChanged(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2),
-                        invocation.getArgument(3), invocation.getArgument(4));
-                return null;
-            }).when(this.level).neighborChanged(any(BlockState.class), any(BlockPos.class), any(Block.class), any(BlockPos.class),
-                    anyBoolean());
-            doAnswer(invocation -> {
-                this.neighborUpdater.shapeUpdate(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2),
-                        invocation.getArgument(3), invocation.getArgument(4), invocation.getArgument(5));
-                return null;
-            }).when(this.level).neighborShapeChanged(any(Direction.class), any(BlockState.class), any(BlockPos.class),
-                    any(BlockPos.class), anyInt(), anyInt());
-            doAnswer(invocation -> {
-                this.updateNeighboursAt(invocation.getArgument(0), invocation.getArgument(1));
-                return null;
-            }).when(this.level).blockUpdated(any(BlockPos.class), any(Block.class));
-            doAnswer(invocation -> {
-                this.updateNeighbourForOutputSignal(invocation.getArgument(0), invocation.getArgument(1));
-                return null;
-            }).when(this.level).updateNeighbourForOutputSignal(any(BlockPos.class), any(Block.class));
-            doAnswer(invocation -> {
-                final BlockPos pos = invocation.getArgument(0);
-                final BlockState state = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-                int signal = state.getSignal(this.level, pos, invocation.getArgument(1));
-                if (state.shouldCheckWeakPower(this.level, pos, invocation.getArgument(1))) {
-                    signal = Math.max(signal, this.directSignalTo(pos));
-                }
-                return signal;
-            }).when(this.level).getSignal(any(BlockPos.class), any(Direction.class));
-            doAnswer(invocation -> this.states.getOrDefault(invocation.getArgument(0), Blocks.AIR.defaultBlockState())
-                    .getDirectSignal(this.level, invocation.getArgument(0), invocation.getArgument(1)))
-                            .when(this.level).getDirectSignal(any(BlockPos.class), any(Direction.class));
-            doAnswer(invocation -> {
-                final BlockPos pos = invocation.getArgument(0);
-                final Direction direction = invocation.getArgument(1);
-                final boolean diodesOnly = invocation.getArgument(2);
-                final BlockState state = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-                if (diodesOnly) {
-                    return DiodeBlock.isDiode(state) ? this.level.getDirectSignal(pos, direction) : 0;
-                }
-                if (state.is(Blocks.REDSTONE_BLOCK)) {
-                    return 15;
-                }
-                if (state.is(Blocks.REDSTONE_WIRE)) {
-                    return state.getValue(BlockStateProperties.POWER);
-                }
-                return state.isSignalSource() ? this.level.getDirectSignal(pos, direction) : 0;
-            }).when(this.level).getControlInputSignal(any(BlockPos.class), any(Direction.class), anyBoolean());
-            doAnswer(invocation -> {
-                final BlockPos pos = invocation.getArgument(0);
-                int best = 0;
-                for (final Direction direction : Direction.values()) {
-                    final int signal = this.level.getSignal(pos.relative(direction), direction);
-                    if (signal >= 15) {
-                        return 15;
-                    }
-                    best = Math.max(best, signal);
-                }
-                return best;
-            }).when(this.level).getBestNeighborSignal(any(BlockPos.class));
-            doAnswer(invocation -> {
-                final BlockPos pos = invocation.getArgument(0);
-                for (final Direction direction : Direction.values()) {
-                    if (this.level.getSignal(pos.relative(direction), direction) > 0) {
-                        return true;
-                    }
-                }
-                return false;
-            }).when(this.level).hasNeighborSignal(any(BlockPos.class));
-            doAnswer(invocation -> this.level.getSignal(invocation.getArgument(0), invocation.getArgument(1)) > 0)
-                    .when(this.level).hasSignal(any(BlockPos.class), any(Direction.class));
-            doAnswer(invocation -> this.getBlockEntity(invocation.getArgument(0)))
-                    .when(this.level).getBlockEntity(any(BlockPos.class));
-            doAnswer(invocation -> {
-                final BlockEntity blockEntity = invocation.getArgument(0);
-                blockEntity.setLevel(this.level);
-                blockEntity.clearRemoved();
-                this.blockEntities.put(blockEntity.getBlockPos().immutable(), blockEntity);
-                return null;
-            }).when(this.level).setBlockEntity(any(BlockEntity.class));
-            doAnswer(invocation -> {
-                final BlockPos pos = invocation.getArgument(0);
-                this.blockEntities.remove(pos);
-                this.updateNeighbourForOutputSignal(pos, this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState()).getBlock());
-                return null;
-            }).when(this.level).removeBlockEntity(any(BlockPos.class));
-            doAnswer(invocation -> {
-                final BlockPos pos = ((BlockPos) invocation.getArgument(0)).immutable();
-                final Block block = invocation.getArgument(1);
-                final int id = invocation.getArgument(2);
-                final int param = invocation.getArgument(3);
-                if (!RegionThreadingHooks.deferBlockEvent(this.level, pos, block, id, param)) {
-                    if (Thread.currentThread() != this.serverThread) {
-                        throw new IllegalStateException("a region worker mutated the level-wide block event set");
-                    }
-                    this.blockEvents.add(new BlockEvent(pos, block, id, param));
-                }
-                return null;
-            }).when(this.level).blockEvent(any(BlockPos.class), any(Block.class), anyInt(), anyInt());
-            doAnswer(invocation -> {
-                this.blockTicks.schedule(new ScheduledTick<>(invocation.getArgument(1, Block.class),
-                        ((BlockPos) invocation.getArgument(0)).immutable(), gameTime.get() + invocation.getArgument(2, Integer.class), 0));
-                return null;
-            }).when(this.level).scheduleTick(any(BlockPos.class), any(Block.class), anyInt());
-            doAnswer(invocation -> {
-                this.blockTicks.schedule(new ScheduledTick<>(invocation.getArgument(1, Block.class),
-                        ((BlockPos) invocation.getArgument(0)).immutable(), gameTime.get() + invocation.getArgument(2, Integer.class),
-                        invocation.getArgument(3, TickPriority.class), 0L));
-                return null;
-            }).when(this.level).scheduleTick(any(BlockPos.class), any(Block.class), anyInt(), any(TickPriority.class));
-            doAnswer(invocation -> null).when(this.level).playSound(any(), any(BlockPos.class), any(), any(), anyFloat(), anyFloat());
-            doAnswer(invocation -> null).when(this.level).levelEvent(any(), anyInt(), any(BlockPos.class), anyInt());
-            doAnswer(invocation -> null).when(this.level).gameEvent(any(Holder.class), any(BlockPos.class), any(GameEvent.Context.class));
-            doAnswer(invocation -> null).when(this.level).gameEvent(any(Holder.class), any(Vec3.class), any(GameEvent.Context.class));
-            doAnswer(invocation -> null).when(this.level).gameEvent(any(Entity.class), any(Holder.class), any(BlockPos.class));
-            doAnswer(invocation -> null).when(this.level).addDestroyBlockEffect(any(BlockPos.class), any(BlockState.class));
-            doAnswer(invocation -> null).when(this.level).addFreshEntity(any());
-            doReturn(List.of()).when(this.level).getEntities(any(), any(AABB.class));
-            doReturn(List.of()).when(this.level).getEntities(any(Entity.class), any(AABB.class), any());
-            doReturn(List.of()).when(this.level).getEntitiesOfClass(any(), any(AABB.class));
-            final ServerChunkCache chunkSource = mock(ServerChunkCache.class);
-            doAnswer(invocation -> {
-                final BooleanSupplier condition = invocation.getArgument(0);
-                while (!condition.getAsBoolean()) {
-                    LockSupport.parkNanos(100_000L);
-                }
-                return null;
-            }).when(chunkSource).managedBlockOnMainThread(any());
-            doReturn(chunkSource).when(this.level).getChunkSource();
-            setLevelField(this.level, "neighborUpdater", this.neighborUpdater);
-        }
-
-        private int directSignalTo(BlockPos pos) {
-            int best = 0;
-            best = Math.max(best, this.level.getDirectSignal(pos.below(), Direction.DOWN));
-            best = Math.max(best, this.level.getDirectSignal(pos.above(), Direction.UP));
-            best = Math.max(best, this.level.getDirectSignal(pos.north(), Direction.NORTH));
-            best = Math.max(best, this.level.getDirectSignal(pos.south(), Direction.SOUTH));
-            best = Math.max(best, this.level.getDirectSignal(pos.west(), Direction.WEST));
-            best = Math.max(best, this.level.getDirectSignal(pos.east(), Direction.EAST));
-            return best;
-        }
-
-        private void updateNeighboursAt(BlockPos pos, Block block) {
-            this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, block, null);
-        }
-
-        private void updateNeighbourForOutputSignal(BlockPos pos, Block block) {
-            for (final Direction direction : Direction.values()) {
-                if (!this.level.hasChunkAt(pos.relative(direction))) {
-                    continue;
-                }
-                final BlockPos neighbourPos = pos.relative(direction);
-                BlockState neighbourState = this.level.getBlockState(neighbourPos);
-                neighbourState.onNeighborChange(this.level, neighbourPos, pos);
-                if (neighbourState.isRedstoneConductor(this.level, neighbourPos)) {
-                    final BlockPos weakPos = neighbourPos.relative(direction);
-                    final BlockState weakState = this.level.getBlockState(weakPos);
-                    if (weakState.getWeakChanges(this.level, weakPos)) {
-                        this.level.neighborChanged(weakState, weakPos, block, neighbourPos, false);
-                    }
-                }
-            }
-        }
-
-        private boolean removeBlock(BlockPos pos, boolean isMoving) {
-            final BlockState state = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-            return this.setBlock(pos, state.getFluidState().createLegacyBlock(), 3 | (isMoving ? 64 : 0));
-        }
-
-        /**
-         * The vanilla chunk write, block entity lifecycle and neighbor/shape publication of
-         * {@code Level.setBlock}, condensed to what the redstone components reach.
-         */
-        private boolean setBlock(BlockPos pos, BlockState state, int flags) {
-            pos = pos.immutable();
-            final BlockState previous = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-            final boolean moving = (flags & 64) != 0;
-            if (previous == state) {
-                return false;
-            }
-            this.states.put(pos, state);
-            previous.onRemove(this.level, pos, state, moving);
-            if (!this.states.get(pos).is(state.getBlock())) {
-                return false;
-            }
-            state.onPlace(this.level, pos, previous, moving);
-            if (state.hasBlockEntity()) {
-                BlockEntity blockEntity = this.blockEntities.get(pos);
-                if (blockEntity != null && !blockEntity.isValidBlockState(state)) {
-                    this.blockEntities.remove(pos);
-                    blockEntity = null;
-                }
-                if (blockEntity == null) {
-                    blockEntity = ((EntityBlock) state.getBlock()).newBlockEntity(pos, state);
-                    if (blockEntity != null) {
-                        blockEntity.setLevel(this.level);
-                        blockEntity.clearRemoved();
-                        this.blockEntities.put(pos, blockEntity);
-                    }
-                } else {
-                    blockEntity.setBlockState(state);
-                }
-            }
-            // Level.markAndNotifyBlock: a reentrant onPlace may already have written another state at this
-            // position, in which case the outer write publishes nothing (vanilla compares the state again).
-            if (this.states.get(pos) != state) {
-                return true;
-            }
-            if ((flags & 1) != 0) {
-                this.updateNeighboursAt(pos, previous.getBlock());
-                if (state.hasAnalogOutputSignal()) {
-                    this.updateNeighbourForOutputSignal(pos, state.getBlock());
-                }
-            }
-            if ((flags & 16) == 0) {
-                final int shapeFlags = flags & ~34;
-                previous.updateIndirectNeighbourShapes(this.level, pos, shapeFlags, 511);
-                state.updateNeighbourShapes(this.level, pos, shapeFlags, 511);
-                state.updateIndirectNeighbourShapes(this.level, pos, shapeFlags, 511);
-            }
-            return true;
-        }
-
-        private BlockEntity getBlockEntity(BlockPos pos) {
-            pos = pos.immutable();
-            if (Thread.currentThread() != this.serverThread
-                    && !RegionThreadingHooks.isRegionTickOwnedByCurrentThread(this.level, pos)
-                    && !RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, pos)) {
-                return null;
-            }
-            return this.blockEntities.get(pos);
-        }
-
-        private List<String> drainEventTrace() {
-            final List<String> drained = new ArrayList<>(this.eventTrace);
-            this.eventTrace.clear();
-            return drained;
-        }
-
-        private void runBlockEvents(boolean regionThreading) {
-            if (regionThreading) {
-                // The production phase opens its quiescent scope around the whole drain; the harness mirrors it so
-                // the same lease pool and the same inline cross-region writes are exercised.
-                RegionThreadingHooks.beginBlockEventPhase(this.level);
-            }
-            try {
-                BlockEvent event;
-                while ((event = this.blockEvents.poll()) != null) {
-                    final BlockEvent current = event;
-                    this.eventTrace.add(gameTime.get() + ":" + current.pos().toShortString() + ":"
-                            + BuiltInRegistries.BLOCK.getKey(current.block()) + ":" + current.id() + ":" + current.param());
-                    final BlockState state = this.states.getOrDefault(current.pos(), Blocks.AIR.defaultBlockState());
-                    if (!state.is(current.block())) {
-                        continue;
-                    }
-                    final Runnable body = () -> state.triggerEvent(this.level, current.pos(), current.id(), current.param());
-                    if (regionThreading) {
-                        RegionThreadingHooks.runBlockTickTask(this.level, current.pos(), body);
-                    } else {
-                        body.run();
-                    }
-                }
-            } finally {
-                if (regionThreading) {
-                    RegionThreadingHooks.endBlockEventPhase(this.level);
-                }
-            }
-        }
-
-        private void tickPistonMovingBlockEntities(boolean regionThreading) {
-            for (final Map.Entry<BlockPos, BlockEntity> entry : new ArrayList<>(this.blockEntities.entrySet())) {
-                if (!(entry.getValue() instanceof PistonMovingBlockEntity piston)) {
-                    continue;
-                }
-                final BlockPos pos = entry.getKey();
-                final BlockState state = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-                final Runnable body = () -> PistonMovingBlockEntity.tick(this.level, pos, state, piston);
-                if (regionThreading) {
-                    RegionThreadingHooks.runBlockTickTask(this.level, pos, body);
-                } else {
-                    body.run();
-                }
-            }
-        }
-
-        /**
-         * The state and block entity of every non-air position of the trace box, ordered by x, y, z.
-         * <p>
-         * Air without a block entity is omitted: it is the constant background of the box, and a position
-         * that changes between air and a block still changes the lines of the other ticks. Omitting it keeps
-         * the trace of one run small enough for the test worker's heap.
-         */
-        private String snapshot(TraceBox trace) {
-            final StringBuilder snapshot = new StringBuilder();
-            for (int x = trace.minX(); x <= trace.maxX(); x++) {
-                for (int y = trace.minY(); y <= trace.maxY(); y++) {
-                    for (int z = trace.minZ(); z <= trace.maxZ(); z++) {
-                        final BlockPos pos = new BlockPos(x, y, z);
-                        final BlockState state = this.states.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-                        final BlockEntity blockEntity = this.blockEntities.get(pos);
-                        if (state.isAir() && blockEntity == null) {
-                            continue;
-                        }
-                        snapshot.append(x).append(',').append(y).append(',').append(z).append('=').append(state);
-                        if (blockEntity != null) {
-                            snapshot.append(' ').append(describe(blockEntity));
-                        }
-                        snapshot.append('\n');
-                    }
-                }
-            }
-            return snapshot.toString();
-        }
-
-        private String describe(BlockEntity blockEntity) {
-            if (blockEntity instanceof ComparatorBlockEntity comparator) {
-                return "comparator[output=" + comparator.getOutputSignal() + "]";
-            }
-            if (blockEntity instanceof PistonMovingBlockEntity piston) {
-                return "movingPiston[moved=" + piston.getMovedState()
-                        + ",direction=" + piston.getDirection()
-                        + ",extending=" + piston.isExtending()
-                        + ",source=" + piston.isSourcePiston()
-                        + ",progress=" + piston.getProgress(0.0F)
-                        + ",lastTicked=" + piston.getLastTicked() + "]";
-            }
-            return blockEntity.getType().toString();
-        }
-    }
-
-    private static void setLevelField(ServerLevel level, String name, Object value) {
-        try {
-            final java.lang.reflect.Field field = Level.class.getDeclaredField(name);
-            field.setAccessible(true);
-            field.set(level, value);
-        } catch (ReflectiveOperationException exception) {
-            throw new IllegalStateException(exception);
         }
     }
 }

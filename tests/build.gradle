@@ -56,6 +56,15 @@ junitTest {
     classpath = sourceSets.junit.output + sourceSets.junit.runtimeClasspath
     testClassesDirs = sourceSets.junit.output.classesDirs
     outputs.upToDateWhen { false }
+    // The randomized redstone soak takes its scale from system properties; a Gradle property of the same name
+    // forwards it to the test JVM, so a shorter or a longer run is one flag away:
+    //   ./gradlew :tests:junitTest --tests '*RegionRandomizedRedstoneSoakTest' -PsoakShortSeeds=2 -PsoakShortTicks=100
+    ["ShortSeeds", "ShortTicks", "ShortCircuits", "LongSeeds", "LongTicks", "LongCircuits", "StraddlingFraction", "Kind", "DebugChanges"].each { suffix ->
+        def value = providers.gradleProperty("soak" + suffix).getOrNull()
+        if (value != null) {
+            systemProperty("neoforge.redstoneSoak" + suffix, value)
+        }
+    }
 }
 
 // Dedicated timing harness task. It runs only the classes tagged "benchmark" and prints their tables to

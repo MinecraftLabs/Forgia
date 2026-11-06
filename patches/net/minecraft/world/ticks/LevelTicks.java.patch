@@ -1,5 +1,17 @@
 --- a/net/minecraft/world/ticks/LevelTicks.java
 +++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -39,6 +_,11 @@
+     private final Queue<ScheduledTick<T>> toRunThisTick = new ArrayDeque<>();
+     private final List<ScheduledTick<T>> alreadyRunThisTick = new ArrayList<>();
+     private final Set<ScheduledTick<?>> toRunThisTickSet = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
++    /**
++     * Guards {@link #toRunThisTickSet} and {@link #alreadyRunThisTick}. A region worker removes the tick it is
++     * about to run while the callbacks of other workers still query the predicate.
++     */
++    private final Object tickSetLock = new Object();
+     private final BiConsumer<LevelChunkTicks<T>, ScheduledTick<T>> chunkScheduleUpdater = (p_193249_, p_193250_) -> {
+         if (p_193250_.equals(p_193249_.peek())) {
+             this.updateContainerScheduling(p_193250_);
 @@ -51,6 +_,15 @@
      }
  
@@ -48,7 +60,7 @@
          long i = ChunkPos.asLong(p_193252_.pos());
          LevelChunkTicks<T> levelchunkticks = this.allContainers.get(i);
          if (levelchunkticks == null) {
-@@ -82,12 +_,37 @@
+@@ -82,12 +_,38 @@
      }
  
      public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_) {
@@ -58,9 +70,10 @@
 +    /**
 +     * Runs one level tick, handing the collected ticks to {@code dispatcher} when one is supplied.
 +     * <p>
-+     * The collection, the budget, the de-duplication and the per-tick bookkeeping stay on the calling
-+     * thread. A dispatcher only receives the ticks that were selected for this tick; it has to execute
-+     * every callback before it returns. Passing {@code null} keeps the vanilla inline loop.
++     * The collection, the budget and the de-duplication stay on the calling thread. A dispatcher only
++     * receives the ticks that were selected for this tick; it has to execute every callback before it
++     * returns and to report every tick to the per-tick hook immediately before that tick's callback runs.
++     * Passing {@code null} keeps the vanilla inline loop.
 +     */
 +    public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_, @org.jetbrains.annotations.Nullable TickDispatcher<T> dispatcher) {
 +        this.tick(p_193226_, p_193227_, p_193228_, p_193228_, dispatcher);
@@ -87,7 +100,7 @@
          profilerfiller.popPush("cleanup");
          this.cleanupAfterTick();
          profilerfiller.pop();
-@@ -181,15 +_,48 @@
+@@ -181,22 +_,65 @@
      }
  
      private void runCollectedTicks(BiConsumer<BlockPos, T> p_193273_) {
@@ -105,30 +118,39 @@
 +            return;
 +        }
 +
-+        // Snapshot and update the vanilla per-tick bookkeeping before any callback runs. A worker must
-+        // never observe or mutate a queue that is still being drained on the server thread.
++        // The dispatcher drains toRunThisTick before any callback runs, so the collected ticks are published to
++        // the predicate set here, where the inline loop publishes them lazily from its own queue. Every collected
++        // tick stays in the set until its own callback is about to run, so willTickThisTick answers true for a
++        // tick of this tick that has not run yet and false for one that already ran, exactly like the inline loop.
 +        final List<ScheduledTick<T>> collected = new ArrayList<>(this.toRunThisTick);
 +        this.toRunThisTick.clear();
-+        for (final ScheduledTick<T> scheduledtick : collected) {
-             if (!this.toRunThisTickSet.isEmpty()) {
-                 this.toRunThisTickSet.remove(scheduledtick);
-             }
--
-             this.alreadyRunThisTick.add(scheduledtick);
--            p_193273_.accept(scheduledtick.pos(), scheduledtick.type());
--        }
++        synchronized (this.tickSetLock) {
++            this.toRunThisTickSet.addAll(collected);
 +        }
 +
-+        dispatcher.runCollected(collected, callback, fallbackCallback);
++        dispatcher.runCollected(collected, callback, fallbackCallback, this::beginCollectedTick);
++    }
++
++    /**
++     * Removes {@code tick} from the ticks that still have to run this tick and records it as executed, at the
++     * point where the inline loop polls it: immediately before its callback runs.
++     */
++    private void beginCollectedTick(ScheduledTick<T> tick) {
++        synchronized (this.tickSetLock) {
+             if (!this.toRunThisTickSet.isEmpty()) {
+-                this.toRunThisTickSet.remove(scheduledtick);
++                this.toRunThisTickSet.remove(tick);
+             }
+-
+-            this.alreadyRunThisTick.add(scheduledtick);
+-            p_193273_.accept(scheduledtick.pos(), scheduledtick.type());
++            this.alreadyRunThisTick.add(tick);
+         }
 +    }
 +
 +    private void runCollectedTick(BiConsumer<BlockPos, T> callback) {
 +        ScheduledTick<T> scheduledtick = this.toRunThisTick.poll();
-+        if (!this.toRunThisTickSet.isEmpty()) {
-+            this.toRunThisTickSet.remove(scheduledtick);
-+        }
-+
-+        this.alreadyRunThisTick.add(scheduledtick);
++        this.beginCollectedTick(scheduledtick);
 +        callback.accept(scheduledtick.pos(), scheduledtick.type());
 +    }
 +
@@ -141,6 +163,36 @@
      }
  
      private void cleanupAfterTick() {
+         this.toRunThisTick.clear();
+         this.containersToTick.clear();
+-        this.alreadyRunThisTick.clear();
+-        this.toRunThisTickSet.clear();
++        synchronized (this.tickSetLock) {
++            this.alreadyRunThisTick.clear();
++            this.toRunThisTickSet.clear();
++        }
+     }
+ 
+     @Override
+@@ -207,10 +_,16 @@
+ 
+     @Override
+     public boolean willTickThisTick(BlockPos p_193282_, T p_193283_) {
+-        this.calculateTickSetIfNeeded();
+-        return this.toRunThisTickSet.contains(ScheduledTick.probe(p_193283_, p_193282_));
++        synchronized (this.tickSetLock) {
++            this.calculateTickSetIfNeeded();
++            return this.toRunThisTickSet.contains(ScheduledTick.probe(p_193283_, p_193282_));
++        }
+     }
+ 
++    /**
++     * Publishes the queue of this tick to the predicate set the first time it is asked about. The caller holds
++     * {@link #tickSetLock}.
++     */
+     private void calculateTickSetIfNeeded() {
+         if (this.toRunThisTickSet.isEmpty() && !this.toRunThisTick.isEmpty()) {
+             this.toRunThisTickSet.addAll(this.toRunThisTick);
 @@ -235,6 +_,15 @@
      }
  
@@ -173,7 +225,7 @@
          List<ScheduledTick<T>> list = new ArrayList<>();
          Predicate<ScheduledTick<T>> predicate = p_200922_ -> p_265172_.isInside(p_200922_.pos());
          p_265554_.alreadyRunThisTick.stream().filter(predicate).forEach(list::add);
-@@ -286,5 +_,20 @@
+@@ -286,5 +_,21 @@
      @FunctionalInterface
      interface PosAndContainerConsumer<T> {
          void accept(long p_193289_, LevelChunkTicks<T> p_193290_);
@@ -182,15 +234,16 @@
 +    /**
 +     * Executes the ticks that {@link LevelTicks} selected for the current tick.
 +     * <p>
-+     * The dispatcher is called on the thread that owns the tick, after the collection and the per-tick
-+     * bookkeeping are complete, and it must execute every callback before returning. Ticks it cannot
-+     * execute on a region worker are passed to {@code fallbackCallback} on the server thread before it
-+     * returns. An implementation may execute the worker callbacks concurrently, but all mutations of the
-+     * scheduling structures have to go through the server-owned queue exposed by
-+     * {@code RegionThreadingHooks.regionTickMutationQueue()}.
++     * The dispatcher is called on the thread that owns the tick, after the collection is complete, and it
++     * must execute every callback before returning. Ticks it cannot execute on a region worker are passed to
++     * {@code fallbackCallback} on the server thread before it returns. An implementation may execute the
++     * worker callbacks concurrently, but every tick has to be reported to {@code beginTick} immediately before
++     * its callback runs, and all other mutations of the scheduling structures have to go through the
++     * server-owned queue exposed by {@code RegionThreadingHooks.regionTickMutationQueue()}.
 +     */
 +    @FunctionalInterface
 +    public interface TickDispatcher<T> {
-+        void runCollected(List<ScheduledTick<T>> collected, BiConsumer<BlockPos, T> callback, BiConsumer<BlockPos, T> fallbackCallback);
++        void runCollected(List<ScheduledTick<T>> collected, BiConsumer<BlockPos, T> callback, BiConsumer<BlockPos, T> fallbackCallback,
++                java.util.function.Consumer<ScheduledTick<T>> beginTick);
      }
  }

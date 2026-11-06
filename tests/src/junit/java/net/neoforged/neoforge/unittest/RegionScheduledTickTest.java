@@ -56,6 +56,7 @@ import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
 import net.neoforged.neoforge.server.threading.region.RegionTickBarrier;
 import net.neoforged.neoforge.server.threading.region.RegionTickSlice;
 import net.neoforged.neoforge.server.threading.region.ScheduledTickPhase;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -474,6 +475,69 @@ class RegionScheduledTickTest {
         ticks.tick(15L, 65536, callback, dispatcher);
 
         assertEquals(List.of(original, now, later), ran);
+    }
+
+    /**
+     * A tick's callback has to see the collected ticks of this tick that have not run yet, exactly like the
+     * inline loop does.
+     * <p>
+     * Vanilla removes a collected tick from the will-tick set immediately before that tick's own callback runs,
+     * so a running tick answers {@code false} for itself, {@code true} for another tick of this tick and
+     * {@code false} for a tick of a later tick. Redstone blocks consult the predicate to decide whether to
+     * schedule a follow-up tick, so a dispatcher that cleared the whole set before any worker ran made every
+     * second notification in a tick schedule a tick that vanilla suppresses.
+     */
+    @Test
+    void runningDispatchedTickSeesTheTicksOfThisTickThatHaveNotRunYet() {
+        this.installEngine(true);
+        final ServerLevel level = mockLevel();
+        final LevelTicks.TickDispatcher<Block> dispatcher = this.engine.beginScheduledTickDispatcher(level, ScheduledTickPhase.BLOCK, PARKING_BARRIER);
+        assertNotNull(dispatcher);
+
+        assertEquals("self=false,queued=true,later=false", willTickAnswersFromTheFirstTickOf(dispatcher));
+    }
+
+    /**
+     * {@return the answers the callback of the first of two ticks of this tick observes for itself, for the
+     * other tick of this tick and for a tick of the next tick}
+     * <p>
+     * The ticks are scheduled in the opposite order of their sub-tick order, so the inspected tick is not the
+     * first one the container returns. {@code dispatcher} is {@code null} for the vanilla inline loop.
+     */
+    private static String willTickAnswersFromTheFirstTickOf(@Nullable LevelTicks.TickDispatcher<Block> dispatcher) {
+        final ServerLevel level = mockLevel();
+        final LevelTicks<Block> ticks = newTicks();
+        addContainer(ticks, 0, 0);
+        final Block running = mock(Block.class);
+        final Block queued = mock(Block.class);
+        final Block later = mock(Block.class);
+        final BlockPos runningPos = new BlockPos(1, 64, 1);
+        final BlockPos queuedPos = new BlockPos(2, 64, 2);
+        final BlockPos laterPos = new BlockPos(3, 64, 3);
+        ticks.schedule(new ScheduledTick<>(queued, queuedPos, 10L, 2L));
+        ticks.schedule(new ScheduledTick<>(running, runningPos, 10L, 1L));
+        ticks.schedule(new ScheduledTick<>(later, laterPos, 11L, 0L));
+        final List<String> answers = new CopyOnWriteArrayList<>();
+        final BiConsumer<BlockPos, Block> callback = (tickPos, tickType) -> {
+            if (tickPos.equals(runningPos)) {
+                answers.add("self=" + ticks.willTickThisTick(runningPos, running)
+                        + ",queued=" + ticks.willTickThisTick(queuedPos, queued)
+                        + ",later=" + ticks.willTickThisTick(laterPos, later));
+            }
+        };
+
+        ticks.tick(10L, 65536, callback, dispatcher);
+
+        assertEquals(1, answers.size(), "the inspected tick has to run exactly once, on the server thread or on a worker");
+        return answers.get(0);
+    }
+
+    @Test
+    void runningInlineTickSeesTheSameTicksAsADispatchedOne() {
+        assertNull(RegionThreadingHooks.scheduledTickDispatcher(mockLevel(), ScheduledTickPhase.BLOCK, PARKING_BARRIER),
+                "the inline path must not have a dispatcher");
+
+        assertEquals("self=false,queued=true,later=false", willTickAnswersFromTheFirstTickOf(null));
     }
 
     @Test

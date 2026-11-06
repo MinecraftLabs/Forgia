@@ -105,3 +105,44 @@ The remaining lever the numbers do support is the worker makespan (34.5-86.3 % o
 better intra-slice balance (A2b work stealing), or longer bursts, which needs a region to own its whole tick -
 regionized world ticking, a different milestone with its own correctness argument, not a bounded window.
 Full tables, the ordering table and the two-tick observability list are in `tmp/continuous-tick/SUMMARY.md`.
+
+## 6. Parallel dispatch of the collected scheduled ticks - open blocker, not enabled
+
+**Hypothesis:** the collected block and fluid ticks of one level tick can be split by target region and run on
+region workers in parallel. `LevelTicks` collects, budgets and de-duplicates on the server thread and hands the
+snapshot to a `TickDispatcher`; the engine runs one lease per region and executes that region's ticks in their
+collected order.
+
+**Measurement:** the randomized redstone soak (`RegionRandomizedRedstoneSoakTest`), 20 seeds x 1000 ticks x
+24 circuits and 5 seeds x 4000 ticks x 12 circuits, half of the circuits straddling a region border, comparing
+the region run against the single-threaded inline run at every tick (block states, block entities, scheduled-tick
+counts, block-event queue, item conservation). Two configurations are measured against the same inline
+reference: the shipped one (scheduled ticks on the server thread, every other slice on) and the internal seam
+(`enableUnclassifiedWorkerCallbacksForTesting`, scheduled ticks dispatched to region workers).
+
+**Result:** the shipped configuration is equivalent on the whole matrix (0 unexplained state differences). The
+parallel seam is not, and the divergence is not the `willTickThisTick` defect that the soak found first (that one
+is fixed: the collected ticks now stay in the predicate set until their own callback is about to run, reported
+per tick by the dispatcher on the worker that runs it; seeds `0xB4_5000..02` at 24 circuits x 200 ticks are the
+regression cases and fail without the fix).
+
+The remaining divergence is an ordering property of the seam, traced on seed `0xB4_5003` (24 circuits, 500
+ticks, first state difference at tick 46): at tick 25 the repeater at `47,64,72` (region 0) notifies the dust at
+`48,64,72` (region 1) across the `x=48` border. A cross-region update is applied by the *target* region in the
+fixpoint, i.e. after that region's own collected ticks of the tick, so the comparator at `49,64,72` schedules the
+follow-up that the single-threaded collected order suppresses (its tick was still pending when the notification
+arrived inline). The seam schedules 4 extra comparator ticks at trigger 48 and the comparator is `powered=true`
+at tick 46 where the inline run is `powered=false`. Delivering the border write before the target region's own
+collected ticks instead would trade this divergence for the opposite one: when the writer's tick *follows* the
+reader's in the collected order, vanilla applies the write after the reader's tick ran. Neither policy
+converges to the single-threaded order, because one ordered tick list is being run on parallel groups.
+
+**What was done instead:** the slice stays disabled. `beginScheduledTickDispatcher` returns `null` unless the
+internal mechanics seam is enabled, so production runs the vanilla inline loop for scheduled ticks - that was
+already gated on unclassified-callback admission. This is the **second, independent** blocker for enabling the
+slice for real: enabling it needs an ordering design that does not exist yet (reproducing the collected order
+across parallel groups when a write crosses a border, e.g. a per-region tick ordering derived from the collected
+order, or a serialization of exactly the border-crossing ticks). The soak keeps the seam table
+(`randomizedCircuitsOfTheParallelScheduledTickSeamAreMeasured`) to measure the distance, and it counts exactly
+one shape: a differing circuit that straddles a border, whose region run holds more pending evaluations than the
+inline run, in a tick that recorded a cross-region update. Every other state difference fails the table.
