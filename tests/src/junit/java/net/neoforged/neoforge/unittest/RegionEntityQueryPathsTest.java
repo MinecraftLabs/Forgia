@@ -8,6 +8,7 @@ package net.neoforged.neoforge.unittest;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -57,6 +58,7 @@ import net.neoforged.neoforge.entity.PartEntity;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
+import net.neoforged.neoforge.server.threading.region.RegionEntityIdentitySnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
@@ -232,37 +234,55 @@ class RegionEntityQueryPathsTest {
     }
 
     @Test
-    void getAllOnAWorkerWithoutALeaseKeepsTheLegacyRejection() {
+    void getAllOnAWorkerWithoutALeaseAnswersEmptyAndCountsIt() {
+        // A worker that holds no lease has no region to answer from, so the lookup answers the empty view vanilla
+        // answers for a level without entities and counts the truncation. Throwing here used to turn an ordinary
+        // "no entity is here" into a server crash.
         this.installEngine(1, false, RegionPolicy.FIXED_3X3, RegionEntityStorageMode.REGION_OWNED);
         final ServerLevel level = mockLevel(newManager(RegionLayout.FIXED_3X3));
-        final AtomicReference<Throwable> rejection = new AtomicReference<>();
+        final List<Entity> seen = new CopyOnWriteArrayList<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
 
-        this.runOnNativeWorker(() -> rejection.set(assertThrows(IllegalStateException.class, () -> level.getAllEntities().iterator().next())));
+        this.runOnNativeWorker(() -> {
+            try {
+                level.getAllEntities().forEach(seen::add);
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
+        });
 
-        assertTrue(rejection.get().getMessage().contains("RegionAwareEntityGetter.getAll"),
-                () -> "the rejection must name the operation, got: " + rejection.get().getMessage());
-        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_ALL, RegionEntityQueryCounters.Path.REFUSED));
-        assertEquals(1L, this.engine.diagnostics().entityQueriesRejected());
+        assertTrue(failures.isEmpty(), () -> "a lookup must not throw on a worker, got: " + failures);
+        assertTrue(seen.isEmpty(), "a worker without a lease has no region to answer from");
+        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_ALL, RegionEntityQueryCounters.Path.TRUNCATED));
+        assertEquals(0L, this.engine.diagnostics().entityQueriesRejected(),
+                "an unanswered lookup is a truncation, not a rejected query");
     }
 
     @Test
-    void getAllOnAWorkerOfALevelWithoutAPublishedIndexKeepsTheLegacyRejection() {
+    void getAllOnAWorkerOfALevelWithoutAPublishedIndexAnswersEmptyAndCountsIt() {
         this.installEngine(1, true, RegionPolicy.FIXED_3X3, RegionEntityStorageMode.REGION_OWNED);
         final PersistentEntitySectionManager<Entity> manager = newManager(RegionLayout.FIXED_3X3);
         final ServerLevel level = mockLevel(manager);
         final TestEntity self = this.entity(level, 1.0, 64.0, 1.0);
         addEntity(manager, 0, 0, self);
 
-        final AtomicReference<Throwable> rejection = new AtomicReference<>();
-        self.tickAction = entity -> rejection.set(assertThrows(IllegalStateException.class, () -> level.getAllEntities().iterator().next()));
+        final List<Entity> seen = new CopyOnWriteArrayList<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        self.tickAction = entity -> {
+            try {
+                level.getAllEntities().forEach(seen::add);
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
+        };
 
-        // No seed pass, so the level's region entity index is not a complete view: the answer would be a
-        // subset, so the worker keeps the guard instead of receiving an empty list.
+        // No seed pass, so the level's region entity index is not a complete view: the answer is the empty view
+        // and the truncation is counted, instead of a crash out of an ordinary query.
         this.runEntityTickWithoutSeeding(level, self);
 
-        assertTrue(rejection.get().getMessage().contains("RegionAwareEntityGetter.getAll"),
-                () -> "the rejection must name the operation, got: " + rejection.get().getMessage());
-        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_ALL, RegionEntityQueryCounters.Path.REFUSED));
+        assertTrue(failures.isEmpty(), () -> "a lookup must not throw on a worker, got: " + failures);
+        assertTrue(seen.isEmpty(), "an unpublished index cannot answer with entities");
+        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_ALL, RegionEntityQueryCounters.Path.TRUNCATED));
     }
 
     @Test
@@ -307,24 +327,78 @@ class RegionEntityQueryPathsTest {
         this.tickList.add(neighbour);
         this.tickList.add(self);
 
-        final AtomicReference<Throwable> byUuid = new AtomicReference<>();
-        final AtomicReference<Throwable> byId = new AtomicReference<>();
+        final AtomicReference<Entity> byUuid = new AtomicReference<>();
+        final AtomicReference<Entity> byId = new AtomicReference<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
         self.tickAction = entity -> {
-            byUuid.set(assertThrows(IllegalStateException.class, () -> level.getEntity(neighbour.getUUID())));
-            byId.set(assertThrows(IllegalStateException.class, () -> level.getEntity(neighbour.getId())));
+            try {
+                byUuid.set(level.getEntity(neighbour.getUUID()));
+                byId.set(level.getEntity(neighbour.getId()));
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
         };
 
         this.runEntityTick(level, self);
 
-        assertTrue(byUuid.get().getMessage().contains("RegionAwareEntityGetter.get(UUID)"),
-                () -> "the rejection must name the operation, got: " + byUuid.get().getMessage());
-        assertTrue(byId.get().getMessage().contains("RegionAwareEntityGetter.get(int)"),
-                () -> "the rejection must name the operation, got: " + byId.get().getMessage());
+        assertTrue(failures.isEmpty(), () -> "a cross-region lookup must not throw, got: " + failures);
+        assertNull(byUuid.get(), "a foreign entity is not visible from this lease");
+        assertNull(byId.get(), "a foreign entity is not visible from this lease");
         assertEquals(0L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_UUID, RegionEntityQueryCounters.Path.LOCAL));
-        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_UUID, RegionEntityQueryCounters.Path.REFUSED),
-                "a cross-region owner stays a visible refusal instead of a silent null");
-        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.REFUSED));
-        assertEquals(2L, this.engine.diagnostics().entityQueriesRejected());
+        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_UUID, RegionEntityQueryCounters.Path.TRUNCATED),
+                "a cross-region owner is a counted truncation, answered like an absent entity");
+        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.TRUNCATED));
+    }
+
+    /**
+     * A refusal of a by-uuid or by-id lookup of another region's entity names the region that owns it, and the
+     * lookup is counted separately from a genuine miss of an identity no region of the level holds.
+     */
+    @Test
+    void byUuidLookupOfAForeignEntityNamesTheOwningRegion() {
+        this.installEngine(1, true, RegionPolicy.FIXED_3X3, RegionEntityStorageMode.REGION_OWNED);
+        RegionEntityIdentitySnapshots.reset();
+        final PersistentEntitySectionManager<Entity> manager = newManager(RegionLayout.FIXED_3X3);
+        final ServerLevel level = mockLevel(manager);
+        // Chunk 3 is region 1 of the fixed 3x3 layout; chunk 0 is region 0.
+        final TestEntity neighbour = this.entity(level, 60.0, 64.0, 5.0);
+        final TestEntity self = this.entity(level, 1.0, 64.0, 1.0);
+        addEntity(manager, 3, 0, neighbour);
+        addEntity(manager, 0, 0, self);
+        this.tickList.add(neighbour);
+        this.tickList.add(self);
+
+        final AtomicReference<Entity> byUuid = new AtomicReference<>();
+        final AtomicReference<Entity> byId = new AtomicReference<>();
+        final AtomicReference<Entity> miss = new AtomicReference<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        self.tickAction = entity -> {
+            try {
+                byUuid.set(level.getEntity(neighbour.getUUID()));
+                byId.set(level.getEntity(neighbour.getId()));
+                miss.set(level.getEntity(UUID.randomUUID()));
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
+        };
+
+        this.engine.beginEntityTickPlan(level, entity -> true, PARKING_BARRIER);
+        // The head of the level tick publishes the ownership of every identity the regionizer knows.
+        this.publishLevelTick(level);
+        this.runEntityTickWithoutSeeding(level, self);
+
+        assertEquals(2L, RegionEntityIdentitySnapshots.publishedEntries(),
+                "the publication has to name every identity of the level");
+        assertTrue(failures.isEmpty(), () -> "a lookup must not throw on a worker, got: " + failures);
+        assertNull(byUuid.get(), "a foreign entity is not handed to another worker");
+        assertNull(byId.get(), "a foreign entity is not handed to another worker");
+        assertNull(miss.get(), "an identity no region holds is absent");
+        assertEquals(2L, RegionEntityIdentitySnapshots.namedCrossRegionLookups(),
+                "the cross-region lookups are named by the publication, the genuine miss is not");
+        final RegionEntityIdentitySnapshots.Owner owner = RegionEntityIdentitySnapshots.ownerOf(level, neighbour.getUUID());
+        assertNotNull(owner, "the publication must name the region that owns the entity, so the one-shot log can say it");
+        assertEquals(1, owner.regionX());
+        assertEquals(0, owner.regionZ());
     }
 
     @Test
@@ -631,16 +705,23 @@ class RegionEntityQueryPathsTest {
         // vanilla index would already answer null for it.
         owner.setRemoved(Entity.RemovalReason.DISCARDED);
 
-        final AtomicReference<Throwable> byId = new AtomicReference<>();
-        self.tickAction = entity -> byId.set(assertThrows(IllegalStateException.class, () -> level.getEntity(owner.getId())));
+        final AtomicReference<Entity> byId = new AtomicReference<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        self.tickAction = entity -> {
+            try {
+                byId.set(level.getEntity(owner.getId()));
+            } catch (Throwable throwable) {
+                failures.add(throwable);
+            }
+        };
 
         this.runEntityTick(level, self);
 
-        assertTrue(byId.get().getMessage().contains("RegionAwareEntityGetter.get(int)"),
-                () -> "the rejection must name the operation, got: " + byId.get().getMessage());
+        assertTrue(failures.isEmpty(), () -> "a lookup must not throw on a worker, got: " + failures);
+        assertNull(byId.get(), "a removed entity is answered like vanilla answers for an absent entity");
         assertEquals(0L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.LOCAL),
                 "a removed entity is not a local answer");
-        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.REFUSED));
+        assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.TRUNCATED));
     }
 
     @Test
@@ -710,6 +791,12 @@ class RegionEntityQueryPathsTest {
                 false, false, false, RegionLayout.of(policy), storageMode);
         RegionThreadingManager.install(created);
         this.engine = created;
+    }
+
+    /** Publishes the entity ownership of {@code level}, exactly like the head of its level tick. */
+    private void publishLevelTick(ServerLevel level) {
+        this.engine.beginLevelTick(level);
+        this.engine.endLevelTick(level);
     }
 
     /**

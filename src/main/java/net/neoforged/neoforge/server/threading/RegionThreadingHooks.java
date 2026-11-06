@@ -1138,6 +1138,28 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * {@return the published stand-in of a block entity the caller may not read live, or {@code null} when the
+     * position is not a published border block entity}
+     * <p>
+     * This is the answer a refused foreign block-entity read receives instead of {@code null}: the immutable
+     * values the server thread published for that position at the head of the tick. The stand-in is a value,
+     * never the live block entity of the owning region, so a caller cannot read or mutate region state through
+     * it; {@link net.neoforged.neoforge.server.threading.region.RegionSnapshotBlockEntity} lists exactly what it
+     * answers and what it refuses. A level without an engine has no publication and keeps the vanilla
+     * {@code null}.
+     *
+     * @param level the level the read was issued on
+     * @param pos   the position of the block entity that was asked for
+     */
+    @Nullable
+    public static net.minecraft.world.level.block.entity.BlockEntity snapshotBlockEntity(net.minecraft.world.level.Level level, BlockPos pos) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return null;
+        }
+        return net.neoforged.neoforge.server.threading.region.RegionBlockEntitySnapshots.standIn(serverLevel, pos);
+    }
+
+    /**
      * Records the version of one chunk a region worker is about to read.
      * <p>
      * The chunk source of a level serves any loaded chunk to a region worker, including a chunk another region

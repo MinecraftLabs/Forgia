@@ -60,6 +60,8 @@ import net.minecraft.world.ticks.ScheduledTick;
 import net.minecraft.world.ticks.TickPriority;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.region.RegionAwareNeighborUpdater;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntitySnapshots;
+import net.neoforged.neoforge.server.threading.region.RegionLayout;
 import org.jetbrains.annotations.Nullable;
 
 /** The box of positions a layout traces: the state and block entity of every position inside it. */
@@ -124,10 +126,16 @@ final class RegionRedstoneWorld {
     private List<String> positionEvents;
     /**
      * Block-entity reads a region worker had to answer with {@code null} because the position belongs to
-     * another region that is not quiescent. This is the documented approximation of the block-entity gate, and
-     * a comparison harness has to count it instead of failing on the state difference it can cause.
+     * another region that is not quiescent and the position is not a published border block entity. This is the
+     * documented approximation of the block-entity gate, and a comparison harness has to count it instead of
+     * failing on the state difference it can cause.
      */
     private final java.util.concurrent.atomic.AtomicLong refusedBlockEntityReads = new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * Block-entity reads a region worker answered from the per-tick publication instead of {@code null}: the
+     * read was refused by the gate and the position is a published border block entity of another region.
+     */
+    private final java.util.concurrent.atomic.AtomicLong publishedBlockEntityReads = new java.util.concurrent.atomic.AtomicLong();
     /** Writes a native region worker made to a position outside the region it leases. */
     private final java.util.concurrent.atomic.AtomicLong foreignWriteAttempts = new java.util.concurrent.atomic.AtomicLong();
     /** Of those, the writes the border capture did not take. */
@@ -379,6 +387,11 @@ final class RegionRedstoneWorld {
         return this.refusedBlockEntityReads.get();
     }
 
+    /** {@return the block-entity reads the region gate answered from the per-tick publication} */
+    long publishedBlockEntityReads() {
+        return this.publishedBlockEntityReads.get();
+    }
+
     /** {@return the writes a native region worker made to another region} */
     long foreignWriteAttempts() {
         return this.foreignWriteAttempts.get();
@@ -587,11 +600,28 @@ final class RegionRedstoneWorld {
         if (Thread.currentThread() != this.serverThread
                 && !RegionThreadingHooks.isRegionTickOwnedByCurrentThread(this.level, pos)
                 && !RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, pos)) {
+            // The production read answers the value published for a border block entity of another region
+            // instead of null; a position that is not published keeps the null answer and is counted.
+            final BlockEntity published = RegionThreadingHooks.snapshotBlockEntity(this.level, pos);
+            if (published != null) {
+                this.publishedBlockEntityReads.incrementAndGet();
+                return published;
+            }
             this.refusedBlockEntityReads.incrementAndGet();
             this.refusedReadPositions.add(pos);
             return null;
         }
         return this.blockEntities.get(pos);
+    }
+
+    /**
+     * Publishes the border block entities of this world for the tick that is about to run, exactly like the
+     * engine publishes them at the head of a level tick: the immutable values of every block entity whose 3x3
+     * chunk neighbourhood touches another region. The world owns its block entities in a map instead of in
+     * loaded chunks, so it publishes them through the explicit block-entity source of the publication.
+     */
+    void publishBlockEntitySnapshot() {
+        RegionBlockEntitySnapshots.publish(this.level, RegionLayout.FIXED_3X3, this.blockEntities.values());
     }
 
     List<String> drainEventTrace() {
