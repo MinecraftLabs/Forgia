@@ -1046,7 +1046,14 @@ public final class RegionThreadingEngine implements RegionThreading {
         return this.entityScheduler;
     }
 
-    @Override
+    /**
+     * {@return the region coordinate the layout assigns to {@code pos}, for the mutation refusal diagnosis}
+     */
+    @ApiStatus.Internal
+    public RegionCoordinate regionCoordinateForDiagnostics(ServerLevel level, BlockPos pos) {
+        return this.layout.regionAt(level, pos);
+    }
+
     public boolean isOwnedByCurrentRegion(ServerLevel level, BlockPos pos) {
         final RegionThreadingContext context = this.currentContext();
         if (!(context instanceof BasicRegionThreadingContext basicContext)

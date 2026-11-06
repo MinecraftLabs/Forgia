@@ -146,12 +146,80 @@ class RegionEntityOwnershipLeaseTest {
     }
 
     @Test
-    void leaseNeverGrantsARemovedEntity() throws ReflectiveOperationException {
+    void aRemovedEntityStillFinishesItsOwnTick() throws ReflectiveOperationException {
+        // A mob killed in its own tick runs the rest of its AI, and LivingEntity.travel reaches Entity.move
+        // after the removal was marked. Vanilla allows that write; a worker must allow it too, and skip the two
+        // server-owned effects the inline body would run - the section publication and the chunk acquisition -
+        // because the entity has no section left to publish.
         final Entity removed = mock(Entity.class);
         when(removed.isRemoved()).thenReturn(true);
-        try (RegionEntityOwnershipScope lease = openLease(removed)) {
-            assertFalse(RegionEntityOwnershipScope.grantsEntityMutation(this.level, removed, SET_POS_RAW));
+        when(removed.isAddedToLevel()).thenReturn(true);
+        runAsNativeWorker(() -> {
+            try (RegionEntityOwnershipScope lease = openLeaseUnchecked(removed)) {
+                assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, removed, MOVE),
+                        "the position write of a removed entity is a field write vanilla runs");
+                assertTrue(RegionEntityOwnershipScope.skipsSectionUpdateOfRemovedEntity(removed),
+                        "the worker must skip the section publication of a removed entity");
+            }
+        });
+    }
+
+    @Test
+    void aRemovalThatWasAlreadyDeferredStaysGranted() throws ReflectiveOperationException {
+        // The deferred removal marks the entity removed while its level callback is still pending at the
+        // barrier, so isAddedToLevel() answers true for the rest of the tick. The removal itself stays granted.
+        final Entity removed = mock(Entity.class);
+        when(removed.isRemoved()).thenReturn(true);
+        when(removed.isAddedToLevel()).thenReturn(true);
+        runAsNativeWorker(() -> {
+            try (RegionEntityOwnershipScope lease = openLeaseUnchecked(removed)) {
+                assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, removed, "Entity.setRemoved"));
+            }
+        });
+    }
+
+    /** Runs {@code action} while the current thread answers as a native region worker. */
+    private static void runAsNativeWorker(Runnable action) {
+        try {
+            final Class<?> scope = Class.forName("net.neoforged.neoforge.server.threading.region.RegionWorkerScope");
+            final var enter = scope.getDeclaredMethod("enter");
+            final var exit = scope.getDeclaredMethod("exit");
+            enter.setAccessible(true);
+            exit.setAccessible(true);
+            enter.invoke(null);
+            try {
+                action.run();
+            } finally {
+                exit.invoke(null);
+            }
+        } catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException(exception);
         }
+    }
+
+    /** {@link #openLease(Entity...)} for the call sites inside a lambda. */
+    private RegionEntityOwnershipScope openLeaseUnchecked(Entity... members) {
+        try {
+            return openLease(members);
+        } catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException(exception);
+        }
+    }
+
+    @Test
+    void aLiveEntityStillNeedsTheSectionSeamForItsPositionWrite() throws ReflectiveOperationException {
+        // The removed-entity grant must not widen the grant of a live entity: its move still needs the batch
+        // to accept the deferred section publication.
+        final Entity live = mock(Entity.class);
+        when(live.isAddedToLevel()).thenReturn(true);
+        runAsNativeWorker(() -> {
+            try (RegionEntityOwnershipScope lease = openLeaseUnchecked(live)) {
+                assertTrue(RegionEntityOwnershipScope.grantsEntityMutation(this.level, live, MOVE),
+                        "a live entity of an open batch keeps its deferred section update");
+                assertFalse(RegionEntityOwnershipScope.skipsSectionUpdateOfRemovedEntity(live),
+                        "a live entity publishes its section, so the worker must not skip it");
+            }
+        });
     }
 
     @Test

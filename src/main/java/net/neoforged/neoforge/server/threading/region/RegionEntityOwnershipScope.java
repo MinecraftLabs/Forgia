@@ -13,8 +13,12 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
+import net.neoforged.neoforge.server.threading.RegionThreading;
+import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Entity ownership lease of exactly one region worker group.
@@ -73,6 +77,8 @@ import org.jetbrains.annotations.Nullable;
  */
 @ApiStatus.Internal
 public final class RegionEntityOwnershipScope implements AutoCloseable {
+    private static final Logger LOGGER = LoggerFactory.getLogger("RegionEntityOwnershipScope");
+    private static final boolean REJECT_DIAGNOSIS_ENABLED = Boolean.getBoolean("neoforge.regionOwnershipDiagnosis");
     /**
      * The vanilla entity mutations a lease may grant.
      * <p>
@@ -221,7 +227,31 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
             RegionOwnershipViolationHandler.recordEntityAdditionRejection();
         }
         REJECTED_MUTATION_COUNT.incrementAndGet();
+        if (REJECT_DIAGNOSIS_ENABLED) {
+            LOGGER.error("Region entity mutation refused: operation={} entity={} addedToLevel={} removed={} "
+                    + "leaseRegion={} ownedByGroup={} entityRegion={} deferredSectionUpdates={} "
+                    + "thread={}",
+                    operation, entity.getType(), entity.isAddedToLevel(), entity.isRemoved(),
+                    scope.coordinate, scope.group.owns(entity),
+                    entityRegionForDiagnostics(level, entity),
+                    scope.group.acceptsDeferredSectionUpdates(), Thread.currentThread().getName());
+        }
         return false;
+    }
+
+    /**
+     * {@return the region the layout assigns to the current position of {@code entity}, for the refusal diagnosis}
+     * <p>
+     * The ownership decision compares the lease coordinate with the group membership, so a refusal is almost
+     * always a membership miss. Naming the region the entity's position maps to tells whether the entity moved
+     * out of its region during its own tick, which is the case a lease cannot cover by construction.
+     */
+    private static String entityRegionForDiagnostics(ServerLevel level, Entity entity) {
+        final RegionThreading threading = RegionThreadingManager.currentOrNull();
+        if (!(threading instanceof RegionThreadingEngine engine)) {
+            return "no-engine";
+        }
+        return engine.regionCoordinateForDiagnostics(level, entity.blockPosition()).toString();
     }
 
     /**
@@ -238,9 +268,18 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
             return !entity.isAddedToLevel()
                     || (RegionWorkerScope.isNativeWorkerThread() && scope.group.acceptsDeferredRemovals());
         }
-        return GRANTABLE_OPERATIONS.contains(operation)
-                && !entity.isRemoved()
-                && (!entity.isAddedToLevel() || defersSectionUpdate(entity));
+        if (!GRANTABLE_OPERATIONS.contains(operation)) {
+            return false;
+        }
+        if (entity.isRemoved()) {
+            // A removed entity still finishes its own tick in vanilla: a mob killed in the same tick runs the
+            // rest of its AI, and LivingEntity.travel reaches Entity.move after the removal was marked. Its
+            // position write must not publish a section or acquire a chunk - there is no section left to
+            // publish - so the caller skips both instead of running the level callback inline on the worker.
+            // {@link #skipsSectionUpdateOfRemovedEntity} tells the patched body which case it is.
+            return RegionWorkerScope.isNativeWorkerThread();
+        }
+        return !entity.isAddedToLevel() || defersSectionUpdate(entity);
     }
 
     /**
@@ -499,6 +538,25 @@ public final class RegionEntityOwnershipScope implements AutoCloseable {
      * non-worker caller - the server thread, the client and every ordinary thread - never defers, so it
      * keeps the inline vanilla effect.
      */
+    /**
+     * {@return true when a position write of {@code entity} must skip the inline level callback because the
+     * entity is already removed}
+     * <p>
+     * Vanilla lets a removed entity finish its own tick, so its AI still reaches {@code Entity.move}. The
+     * inline body would then publish the entity section and acquire the target chunk - both server-owned
+     * storage - although the entity is leaving the level and has no section to publish. A worker that holds
+     * the lease of the entity skips both effects instead of running them, and the grant of the mutation does
+     * not depend on the section seam of the batch, because no update is recorded for a removed entity.
+     */
+    public static boolean skipsSectionUpdateOfRemovedEntity(Entity entity) {
+        final RegionEntityOwnershipScope scope = CURRENT.get();
+        return entity.isRemoved()
+                && scope != null
+                && scope.isActive()
+                && RegionWorkerScope.isNativeWorkerThread()
+                && scope.group.owns(entity);
+    }
+
     private static boolean defersSectionUpdate(Entity entity) {
         final RegionEntityOwnershipScope scope = sectionUpdateOwner(entity);
         return scope != null && scope.group.acceptsDeferredSectionUpdates();

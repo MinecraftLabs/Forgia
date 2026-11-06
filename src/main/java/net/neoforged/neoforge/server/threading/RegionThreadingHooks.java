@@ -346,6 +346,20 @@ public final class RegionThreadingHooks {
     }
 
     /**
+     * {@return true when a position write of {@code entity} has to skip the inline section publication and
+     * target chunk acquisition because the entity was already removed}
+     * <p>
+     * A removed entity still finishes its own tick in vanilla - a mob killed in the same tick runs the rest of
+     * its AI and reaches {@code Entity.move} - but it has no section left to publish and is leaving the level.
+     * A native region worker that leases the entity skips both server-owned effects instead of running them
+     * inline; the barrier records nothing for it, so no deferred update is lost. Every other caller keeps the
+     * vanilla inline behaviour.
+     */
+    public static boolean skipsSectionUpdateOfRemovedEntity(Entity entity) {
+        return RegionEntityOwnershipScope.skipsSectionUpdateOfRemovedEntity(entity);
+    }
+
+    /**
      * Defers the server-owned storage effect of a worker entity removal to the entity batch barrier.
      * <p>
      * {@code Entity.setRemoved} sets the entity's own removal state and then runs its level callback, which
