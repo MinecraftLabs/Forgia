@@ -57,6 +57,7 @@ import net.neoforged.neoforge.entity.PartEntity;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
 import net.neoforged.neoforge.server.threading.region.RegionAwareEntityGetter;
+import net.neoforged.neoforge.server.threading.region.RegionEntityIdentitySnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters;
 import net.neoforged.neoforge.server.threading.region.RegionEntityStorageMode;
 import net.neoforged.neoforge.server.threading.region.RegionEntityTickPlan;
@@ -325,6 +326,55 @@ class RegionEntityQueryPathsTest {
                 "a cross-region owner stays a visible refusal instead of a silent null");
         assertEquals(1L, RegionEntityQueryCounters.count(RegionEntityQueryCounters.Operation.GET_BY_ID, RegionEntityQueryCounters.Path.REFUSED));
         assertEquals(2L, this.engine.diagnostics().entityQueriesRejected());
+    }
+
+    /**
+     * A refusal of a by-uuid or by-id lookup of another region's entity names the region that owns it, and the
+     * lookup is counted separately from a genuine miss of an identity no region of the level holds.
+     */
+    @Test
+    void byUuidLookupOfAForeignEntityNamesTheOwningRegion() {
+        this.installEngine(1, true, RegionPolicy.FIXED_3X3, RegionEntityStorageMode.REGION_OWNED);
+        RegionEntityIdentitySnapshots.reset();
+        final PersistentEntitySectionManager<Entity> manager = newManager(RegionLayout.FIXED_3X3);
+        final ServerLevel level = mockLevel(manager);
+        // Chunk 3 is region 1 of the fixed 3x3 layout; chunk 0 is region 0.
+        final TestEntity neighbour = this.entity(level, 60.0, 64.0, 5.0);
+        final TestEntity self = this.entity(level, 1.0, 64.0, 1.0);
+        addEntity(manager, 3, 0, neighbour);
+        addEntity(manager, 0, 0, self);
+        this.tickList.add(neighbour);
+        this.tickList.add(self);
+
+        final AtomicReference<Throwable> byUuid = new AtomicReference<>();
+        final AtomicReference<Throwable> byId = new AtomicReference<>();
+        final AtomicReference<Throwable> miss = new AtomicReference<>();
+        self.tickAction = entity -> {
+            byUuid.set(assertThrows(IllegalStateException.class, () -> level.getEntity(neighbour.getUUID())));
+            byId.set(assertThrows(IllegalStateException.class, () -> level.getEntity(neighbour.getId())));
+            miss.set(assertThrows(IllegalStateException.class, () -> level.getEntity(UUID.randomUUID())));
+        };
+
+        this.engine.beginEntityTickPlan(level, entity -> true, PARKING_BARRIER);
+        // The head of the level tick publishes the ownership of every identity the regionizer knows.
+        this.publishLevelTick(level);
+        this.runEntityTickWithoutSeeding(level, self);
+
+        assertEquals(2L, RegionEntityIdentitySnapshots.publishedEntries(),
+                "the publication has to name every identity of the level");
+        assertTrue(byUuid.get().getMessage().contains("RegionAwareEntityGetter.get(UUID)"),
+                () -> "the rejection must name the operation, got: " + byUuid.get().getMessage());
+        assertTrue(byUuid.get().getMessage().contains("owned by region(1,0)"),
+                () -> "the rejection must name the region that owns the entity, got: " + byUuid.get().getMessage());
+        assertTrue(byId.get().getMessage().contains("owned by region(1,0)"),
+                () -> "the rejection must name the region that owns the entity, got: " + byId.get().getMessage());
+        assertTrue(miss.get().getMessage().contains("RegionAwareEntityGetter.get(UUID)"),
+                () -> "the rejection must name the operation, got: " + miss.get().getMessage());
+        assertFalse(miss.get().getMessage().contains("owned by"),
+                () -> "a genuine miss must not name an owner, got: " + miss.get().getMessage());
+        assertEquals(2L, RegionEntityIdentitySnapshots.namedCrossRegionLookups(),
+                "the cross-region lookups are counted, the genuine miss is not");
+        assertEquals(3L, this.engine.diagnostics().entityQueriesRejected());
     }
 
     @Test
@@ -710,6 +760,12 @@ class RegionEntityQueryPathsTest {
                 false, false, false, RegionLayout.of(policy), storageMode);
         RegionThreadingManager.install(created);
         this.engine = created;
+    }
+
+    /** Publishes the entity ownership of {@code level}, exactly like the head of its level tick. */
+    private void publishLevelTick(ServerLevel level) {
+        this.engine.beginLevelTick(level);
+        this.engine.endLevelTick(level);
     }
 
     /**

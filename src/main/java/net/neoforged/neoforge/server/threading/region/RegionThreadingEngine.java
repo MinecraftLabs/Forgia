@@ -916,6 +916,8 @@ public final class RegionThreadingEngine implements RegionThreading {
         RegionEntityOwnershipScope.resetCounters();
         RegionEntityQueryCounters.reset();
         RegionPlayerSnapshots.reset();
+        RegionBlockEntitySnapshots.reset();
+        RegionEntityIdentitySnapshots.reset();
     }
 
     /**
@@ -1462,6 +1464,13 @@ public final class RegionThreadingEngine implements RegionThreading {
         // batch of it runs, so a worker answers a player lookup from an immutable view instead of walking the
         // level's live list. See RegionPlayerSnapshots for the one-tick staleness this buys.
         RegionPlayerSnapshots.publish(level);
+        // The same quiescent point publishes the values a foreign read needs: the analog signal and copied
+        // contents of every border block entity, and the region every entity of the level belongs to. A refused
+        // foreign block-entity read is answered from the first instead of computing a wrong value, and a refused
+        // cross-region entity lookup names the owner it finds in the second. See RegionBlockEntitySnapshots and
+        // RegionEntityIdentitySnapshots for what is published and how old a published answer can be.
+        RegionBlockEntitySnapshots.publish(level, this.layout, this.regionizer);
+        RegionEntityIdentitySnapshots.publish(level, this.regionizer);
         this.drainGlobalMessages(level);
     }
 
@@ -7062,6 +7071,8 @@ public final class RegionThreadingEngine implements RegionThreading {
                     this.chunkLoadAnswers.remove(level);
                     this.seededEntityTickLevels.remove(level);
                     RegionPlayerSnapshots.detach(level);
+                    RegionBlockEntitySnapshots.detach(level);
+                    RegionEntityIdentitySnapshots.detach(level);
                     this.regionizer.clearLevel(level);
                     // The mailbox and the phase state of the level die with its region state: the queued
                     // messages are dropped and counted, and a later post is refused instead of waiting for a

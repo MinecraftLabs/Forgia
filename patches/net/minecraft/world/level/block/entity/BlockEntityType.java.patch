@@ -8,17 +8,30 @@
      private final Set<Block> validBlocks;
      private final Type<?> dataType;
      private final Holder.Reference<BlockEntityType<?>> builtInRegistryHolder = BuiltInRegistries.BLOCK_ENTITY_TYPE.createIntrusiveHolder(this);
-@@ -295,6 +_,13 @@
-     @Nullable
-     public T create(BlockPos p_155265_, BlockState p_155266_) {
+@@ -297,6 +_,13 @@
          return (T)this.factory.create(p_155265_, p_155266_);
-+    }
-+
+     }
+ 
 +    /**
 +     * Neo: Add getter for an immutable view of the set of valid blocks.
 +     */
 +    public Set<Block> getValidBlocks() {
 +        return java.util.Collections.unmodifiableSet(this.validBlocks);
++    }
++
+     public boolean isValid(BlockState p_155263_) {
+         return this.validBlocks.contains(p_155263_.getBlock());
+     }
+@@ -309,6 +_,12 @@
+     @Nullable
+     public T getBlockEntity(BlockGetter p_58950_, BlockPos p_58951_) {
+         BlockEntity blockentity = p_58950_.getBlockEntity(p_58951_);
++        // Neo: a read-only stand-in reports the type it was published with, but it is not an instance of that
++        // block entity's class. Handing it out as one would make the caller's cast fail, so a typed read refuses
++        // the stand-in and keeps the null answer the read had before the publication existed.
++        if (blockentity instanceof net.neoforged.neoforge.server.threading.region.RegionSnapshotBlockEntity) {
++            return null;
++        }
+         return (T)(blockentity != null && blockentity.getType() == this ? blockentity : null);
      }
  
-     public boolean isValid(BlockState p_155263_) {

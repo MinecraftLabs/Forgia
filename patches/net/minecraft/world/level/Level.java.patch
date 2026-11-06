@@ -408,14 +408,20 @@
          explosion.explode();
          explosion.finalizeExplosion(p_312145_);
          return explosion;
-@@ -709,6 +_,7 @@
+@@ -708,8 +_,12 @@
+         if (this.isOutsideBuildHeight(p_46716_)) {
              return null;
          } else {
++            // Neo: a caller that is not the server thread and does not own the region of the position is answered
++            // the value the server thread published for a border block entity of another region, instead of null.
++            // The publication is immutable and at most one tick old; a level without one keeps the null answer.
              return !this.isClientSide && Thread.currentThread() != this.thread
+-                ? null
 +                    && !net.neoforged.neoforge.server.threading.RegionThreadingHooks.isRegionTickOwnedByCurrentThread(this, p_46716_)
-                 ? null
++                ? net.neoforged.neoforge.server.threading.RegionThreadingHooks.snapshotBlockEntity(this, p_46716_)
                  : this.getChunkAt(p_46716_).getBlockEntity(p_46716_, LevelChunk.EntityCreationType.IMMEDIATE);
          }
+     }
 @@ -725,6 +_,7 @@
          if (!this.isOutsideBuildHeight(p_46748_)) {
              this.getChunkAt(p_46748_).removeBlockEntity(p_46748_);

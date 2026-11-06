@@ -40,7 +40,9 @@ import org.jetbrains.annotations.Nullable;
  * What is left on the legacy guard is a query with no local and no published answer: a by-uuid or by-id
  * lookup of an entity of another region, a worker without a lease, a level with shared (DYNAMIC) section
  * storage, and a level whose region entity index is not published. Each of those is refused with the
- * operation name, counted, and reported by {@code /neoforge regionthreading status}.
+ * operation name, counted, and reported by {@code /neoforge regionthreading status}. A by-uuid or by-id
+ * lookup whose entity this tick's {@link RegionEntityIdentitySnapshots} publication names is refused with the
+ * region that owns it, counted as a cross-region lookup, and never answered with the foreign entity.
  * <p>
  * The internal mechanics seam ({@code enableLegacyEntityQueryHandoffForTesting()}) keeps the handoff
  * transport covered by tests: it runs the complete query (including its predicate/consumer and, for
@@ -66,7 +68,8 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         if (scoped != null) {
             return scoped;
         }
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(int)", RegionEntityQueryCounters.Operation.GET_BY_ID);
+        rejectOnNativeWorker(lookupOperation("RegionAwareEntityGetter.get(int)", null, id),
+                RegionEntityQueryCounters.Operation.GET_BY_ID);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(id));
         }
@@ -80,7 +83,8 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         if (scoped != null) {
             return scoped;
         }
-        rejectOnNativeWorker("RegionAwareEntityGetter.get(UUID)", RegionEntityQueryCounters.Operation.GET_BY_UUID);
+        rejectOnNativeWorker(lookupOperation("RegionAwareEntityGetter.get(UUID)", uuid, 0),
+                RegionEntityQueryCounters.Operation.GET_BY_UUID);
         if (RegionThreadingHooks.shouldHandOffEntityQuery()) {
             return RegionThreadingHooks.runEntityQueryOnServerThread(this.level, () -> this.delegate.get(uuid));
         }
@@ -197,6 +201,30 @@ public final class RegionAwareEntityGetter implements LevelEntityGetter<Entity> 
         RegionEntityQueryCounters.record(uuid != null ? RegionEntityQueryCounters.Operation.GET_BY_UUID : RegionEntityQueryCounters.Operation.GET_BY_ID,
                 RegionEntityQueryCounters.Path.LOCAL);
         return entity;
+    }
+
+    /**
+     * {@return the operation a refusal reports, naming the region that owns the entity when this tick's identity
+     * publication knows it}
+     * <p>
+     * The local lookup already failed, so an identity the publication names belongs to another region: the
+     * refusal says which one, and the lookup is counted separately from a genuine miss of an identity no region
+     * of the level holds. The entity itself is never returned - a live entity of a running region cannot be
+     * handed to another worker, and the publication answers a value so that a crash report names the owner
+     * instead of only the operation.
+     */
+    private String lookupOperation(String operation, @Nullable UUID uuid, int id) {
+        if (!RegionWorkerScope.isNativeWorkerThread()) {
+            return operation;
+        }
+        final RegionEntityIdentitySnapshots.Owner owner = uuid != null
+                ? RegionEntityIdentitySnapshots.ownerOf(this.level, uuid)
+                : RegionEntityIdentitySnapshots.ownerOf(this.level, id);
+        if (owner == null) {
+            return operation;
+        }
+        RegionEntityIdentitySnapshots.recordNamedCrossRegionLookup();
+        return operation + " of " + (uuid != null ? "uuid " + uuid : "network id " + id) + " owned by " + owner;
     }
 
     private static void rejectOnNativeWorker(String operation, RegionEntityQueryCounters.Operation path) {

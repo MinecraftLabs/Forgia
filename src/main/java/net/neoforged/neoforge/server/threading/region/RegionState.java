@@ -355,6 +355,17 @@ final class RegionState {
         return this.entitiesById.get(id);
     }
 
+    /**
+     * {@return the region's by-uuid index, for the per-tick publication of the entity ownership of the level}
+     * <p>
+     * The map is the live concurrent one and is only read, by the server thread at the head of the level tick
+     * while every region is quiescent: {@link RegionEntityIdentitySnapshots} copies it so that a region worker
+     * can name the owner of an entity of another region without reading this index.
+     */
+    java.util.Map<java.util.UUID, Entity> entitiesByUuid() {
+        return this.entitiesByUuid;
+    }
+
     List<RegionEntityTickEntry> entityTickEntries() {
         return new ArrayList<>(this.entityTickOrder);
     }

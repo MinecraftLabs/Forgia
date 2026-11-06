@@ -40,6 +40,8 @@ import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.ticks.LevelTicks;
 import net.neoforged.neoforge.server.threading.RegionThreadingManager;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntitySnapshots;
+import net.neoforged.neoforge.server.threading.region.RegionEntityIdentitySnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionPolicy;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingEngine;
@@ -100,8 +102,11 @@ import org.junit.jupiter.api.Test;
  * notified a second time in the same tick scheduled a tick that vanilla suppresses. That tick fired after the
  * block's input changed and flipped it. The collected ticks now stay in the set until their own callback is about
  * to run, reported per tick by the dispatcher on the worker that runs it, and those seeds are the regression cases
- * of {@link #regressionSeedsStayEquivalent()}. The remaining tolerated difference is named and counted: a foreign
- * block-entity read answered null.
+ * of {@link #regressionSeedsStayEquivalent()}. A refused foreign block-entity read is now answered from the value
+ * the server thread publishes for a border block entity (see {@code RegionBlockEntitySnapshots}) instead of
+ * {@code null}, and the harness asserts that the publication answered it. The remaining tolerated difference of
+ * the parallel table is a queue-only one - a redundant evaluation whose state is identical in both runs - and it
+ * is named and counted rather than failed.
  */
 class RegionRandomizedRedstoneSoakTest {
     private static final RegionTickBarrier PARKING_BARRIER = condition -> {
@@ -149,6 +154,8 @@ class RegionRandomizedRedstoneSoakTest {
     private long phaseDeferredBlockEvents;
     /** Block-entity reads a phase's region workers had to answer across a border, accumulated over the phase. */
     private long phaseForeignBlockEntityReads;
+    /** Block-entity reads a phase's region workers answered from the per-tick publication of the phase. */
+    private long phasePublishedBlockEntityReads;
     private static final boolean DEBUG_CHANGES = Boolean.getBoolean("neoforge.redstoneSoakDebugChanges");
 
     @AfterEach
@@ -267,6 +274,7 @@ class RegionRandomizedRedstoneSoakTest {
         final List<String> failures = new ArrayList<>();
         this.phaseDeferredBlockEvents = 0L;
         this.phaseForeignBlockEntityReads = 0L;
+        this.phasePublishedBlockEntityReads = 0L;
         for (int index = 0; index < seeds; index++) {
             try {
                 this.assertSeedEquivalent(BASE_SEED + index, circuits, ticks, label, mode);
@@ -283,6 +291,9 @@ class RegionRandomizedRedstoneSoakTest {
             assertTrue(this.phaseForeignBlockEntityReads > 0,
                     "the " + label + " phase never read a foreign block entity on a region worker, so the comparator "
                             + "seam was not exercised");
+            assertTrue(this.phasePublishedBlockEntityReads > 0,
+                    "the " + label + " phase never answered a refused foreign block-entity read from the per-tick "
+                            + "publication, so the value snapshot was not exercised");
         }
         if (!failures.isEmpty()) {
             fail(failures.size() + " of " + seeds + " seeds of the " + label + " phase failed: " + String.join(" | ", failures));
@@ -418,6 +429,10 @@ class RegionRandomizedRedstoneSoakTest {
                 + ",borderWrites=" + on.diagnostics.borderUpdates().blockWritesRecorded()
                 + ",deferredBlockEvents=" + on.deferredBlockEvents
                 + ",foreignBlockEntityReads=" + on.foreignBlockEntityReads
+                + ",publishedBlockEntityReads=" + on.publishedBlockEntityReads
+                + ",snapshotEntries=" + on.snapshotEntries
+                + ",snapshotPublishNanos=" + on.snapshotPublishNanos
+                + ",identityPublishNanos=" + on.identityPublishNanos
                 + ",readAfterDeferredWrite=" + on.diagnostics.borderUpdates().readAfterBlockWrite()
                 + ",fallbackScheduled=" + on.diagnostics.fallbackScheduledTicks()
                 + ",skippedScheduled=" + on.diagnostics.skippedScheduledTicks()
@@ -460,6 +475,7 @@ class RegionRandomizedRedstoneSoakTest {
         }
         this.phaseDeferredBlockEvents += on.deferredBlockEvents;
         this.phaseForeignBlockEntityReads += on.foreignBlockEntityReads;
+        this.phasePublishedBlockEntityReads += on.publishedBlockEntityReads;
         this.assertSeamsExercised(mode, off, on, seed, circuitCount);
     }
 
@@ -694,6 +710,12 @@ class RegionRandomizedRedstoneSoakTest {
             for (final SoakCircuit circuit : circuits) {
                 circuit.applyActions(world, tick);
             }
+            if (regionThreading) {
+                // The head of the level tick: the scripted input of the tick is applied by the server thread,
+                // every region of the tick is quiescent, and the production engine publishes the values a
+                // foreign read needs here. See RegionBlockEntitySnapshots.
+                world.publishBlockEntitySnapshot();
+            }
             // The production configuration leaves the scheduled ticks on the server thread: LevelTicks runs its
             // own inline loop and only the other slices reach region workers.
             final LevelTicks.TickDispatcher<Block> dispatcher = mode == Mode.PARALLEL_SEAM
@@ -747,6 +769,10 @@ class RegionRandomizedRedstoneSoakTest {
             this.engine = null;
         }
         result.refusedBlockEntityReads = world.refusedBlockEntityReads();
+        result.publishedBlockEntityReads = world.publishedBlockEntityReads();
+        result.snapshotEntries = RegionBlockEntitySnapshots.publishedEntries();
+        result.snapshotPublishNanos = RegionBlockEntitySnapshots.meanPublishNanos();
+        result.identityPublishNanos = RegionEntityIdentitySnapshots.meanPublishNanos();
         result.foreignWriteAttempts = world.foreignWriteAttempts();
         result.uncapturedForeignWrites = world.uncapturedForeignWrites();
         result.finish(world);
@@ -798,6 +824,10 @@ class RegionRandomizedRedstoneSoakTest {
         private int itemsMax;
         private long millis;
         private long refusedBlockEntityReads;
+        private long publishedBlockEntityReads;
+        private long snapshotEntries;
+        private long snapshotPublishNanos;
+        private long identityPublishNanos;
         private long foreignWriteAttempts;
         private long uncapturedForeignWrites;
         private List<String> scheduleTrace = List.of();

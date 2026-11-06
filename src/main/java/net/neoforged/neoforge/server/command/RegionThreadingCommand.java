@@ -15,7 +15,9 @@ import net.neoforged.neoforge.common.NeoForgeConfig;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatReport;
 import net.neoforged.neoforge.server.threading.RegionThreadingCompatibility;
 import net.neoforged.neoforge.server.threading.RegionThreadingHooks;
+import net.neoforged.neoforge.server.threading.region.RegionBlockEntitySnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAttribution;
+import net.neoforged.neoforge.server.threading.region.RegionEntityIdentitySnapshots;
 import net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters;
 import net.neoforged.neoforge.server.threading.region.RegionMetricsReport;
 import net.neoforged.neoforge.server.threading.region.RegionThreadingDiagnostics;
@@ -226,6 +228,10 @@ final class RegionThreadingCommand {
         // diagnostics carry instead of re-reading the counters, so the report and the line cannot disagree.
         source.sendSuccess(() -> Component.literal(RegionEntityQueryCounters.summaryLine(diagnostics.entityQueryPaths())
                 + " playerSnapshots=" + diagnostics.playerSnapshotsPublished()), false);
+        // An eighth independent line for the values published for foreign readers: the border block entities a
+        // refused foreign read is answered from, and the entity ownership a refused cross-region lookup names.
+        source.sendSuccess(() -> Component.literal("Region value snapshots: "
+                + RegionBlockEntitySnapshots.statusLine() + " " + RegionEntityIdentitySnapshots.statusLine()), false);
     }
 
     /**

@@ -225,7 +225,7 @@
          }
      }
  
-@@ -324,9 +_,39 @@
+@@ -324,9 +_,43 @@
          return this.getBlockEntity(p_62912_, LevelChunk.EntityCreationType.CHECK);
      }
  
@@ -234,14 +234,18 @@
 +     * <p>
 +     * It lives in its own method so that {@link #getBlockEntity(BlockPos, LevelChunk.EntityCreationType)}
 +     * keeps the instruction neighbourhood vanilla has: mods inject there with instruction-level offsets, and a
-+     * foreign branch inlined into that method moved the anchors they rely on. The behaviour is unchanged - the
-+     * lookup returns the live block entity of the chunk or {@code null}, and never promotes pending NBT,
-+     * creates one, or removes a stale entry, because a foreign worker must not mutate this chunk.
++     * foreign branch inlined into that method moved the anchors they rely on. It never promotes pending NBT,
++     * creates a block entity, or removes a stale entry, because a foreign worker must not mutate this chunk.
++     * <p>
++     * A readable live block entity is returned as it always was. A read that the gate refuses is answered with
++     * the value the server thread published for that border block entity at the head of the tick - an immutable
++     * read-only stand-in, never the live block entity of the owning region - or with {@code null} when the
++     * position is not a published border block entity or the level has no publication.
 +     */
 +    @Nullable
 +    private BlockEntity foreignBlockEntityOrNull(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
 +        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, p_62868_)) {
-+            return null;
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.snapshotBlockEntity(this.level, p_62868_);
 +        }
 +        BlockEntity existing = this.blockEntities.get(p_62868_);
 +        if ((existing != null && existing.isRemoved()) || this.pendingBlockEntities.containsKey(p_62868_)
