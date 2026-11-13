@@ -1,27 +1,133 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -71,7 +_,16 @@
+@@ -37,19 +_,79 @@
+     private final EntityLookup<T> visibleEntityStorage;
+     final EntitySectionStorage<T> sectionStorage;
+     private final LevelEntityGetter<T> entityGetter;
++    private final LevelEntityGetter<T> guardedEntityGetter;
+     private final Long2ObjectMap<Visibility> chunkVisibility = new Long2ObjectOpenHashMap<>();
+     private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = new Long2ObjectOpenHashMap<>();
+     private final LongSet chunksToUnload = new LongOpenHashSet();
+     private final Queue<ChunkEntities<T>> loadingInbox = Queues.newConcurrentLinkedQueue();
++    private final EntityStorageAccessCheck storageAccessCheck;
++    private final net.neoforged.neoforge.server.threading.region.EntityIdentityLedger identityLedger = new net.neoforged.neoforge.server.threading.region.EntityIdentityLedger();
+ 
+     public PersistentEntitySectionManager(Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_) {
++        // Neo: this is vanilla's construction shape, and the one a mod mixes into. The level owns the storage and
++        // hands out both the owner check and the region layout the storage is partitioned with through its own
++        // callbacks object, so neither is a constructor argument and this call keeps the call site a mod wraps.
++        this(p_157503_, p_157504_, p_157505_,
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.serverEntityStorageAccessCheck(p_157504_),
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.serverEntityStorageLayout(p_157504_));
++    }
++
++    public PersistentEntitySectionManager(
++        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_
++    ) {
++        this(p_157503_, p_157504_, p_157505_, p_157506_, net.neoforged.neoforge.server.threading.region.RegionLayout.DYNAMIC);
++    }
++
++    public PersistentEntitySectionManager(
++        Class<T> p_157503_, LevelCallback<T> p_157504_, EntityPersistentStorage<T> p_157505_, EntityStorageAccessCheck p_157506_,
++        net.neoforged.neoforge.server.threading.region.RegionLayout layout
++    ) {
+         this.visibleEntityStorage = new EntityLookup<>();
+-        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility);
++        this.sectionStorage = new EntitySectionStorage<>(p_157503_, this.chunkVisibility, layout);
+         this.chunkVisibility.defaultReturnValue(Visibility.HIDDEN);
+         this.chunkLoadStatuses.defaultReturnValue(PersistentEntitySectionManager.ChunkLoadStatus.FRESH);
+         this.callbacks = p_157504_;
+         this.permanentStorage = p_157505_;
++        this.storageAccessCheck = p_157506_;
+         this.entityGetter = new LevelEntityGetterAdapter<>(this.visibleEntityStorage, this.sectionStorage);
++        this.guardedEntityGetter = new net.neoforged.neoforge.server.threading.region.EntityStorageGuardedGetter<>(this.entityGetter, p_157506_);
++    }
++
++    /**
++     * Neo: owner check for the server-owned section/index storage. A level supplies a check that rejects
++     * native region workers before the operation reads or changes shared state, and reaches the manager
++     * through the callbacks object it passes to the vanilla three-argument constructor; a caller that builds
++     * its own manager without a level keeps a no-op check.
++     * <p>
++     * The check covers both halves of the storage surface. The mutating entry points (add, status, load,
++     * unload, save, move, remove) are rejected before they change state, and the public read surface
++     * ({@link #isLoaded}, {@link #areEntitiesLoaded}, {@link #canPositionTick}, {@link #gatherStats},
++     * {@link #count}, {@link #dumpSections}) and every operation of the getter returned by
++     * {@link #getEntityGetter()} are rejected before they touch the section map, the section id tree or
++     * the by-id/by-uuid lookup. The getter is guarded per operation, not only when it is obtained, so a
++     * getter captured on the server thread before a native worker started still rejects the worker.
++     */
++    @FunctionalInterface
++    public interface EntityStorageAccessCheck {
++        void checkAccess(String operation);
++    }
++
++    private void checkStorageAccess(String operation) {
++        this.storageAccessCheck.checkAccess(operation);
++    }
++
++    /**
++     * Neo: the per-level identity publication of this manager. The ledger is the only entity identity
++     * surface a future region worker may read; it is not a second identity ledger over the vanilla maps,
++     * and its records are published after the server thread wrote the maps that back them. Obtaining it
++     * is a server-owned storage read, so a native region worker is rejected before it receives the
++     * reference. Mutating the ledger is rejected for a native region worker as well, while
++     * {@link net.neoforged.neoforge.server.threading.region.EntityIdentityLedger#current(java.util.UUID)}
++     * stays readable from any thread.
++     */
++    public net.neoforged.neoforge.server.threading.region.EntityIdentityLedger identityLedger() {
++        this.checkStorageAccess("PersistentEntitySectionManager.identityLedger");
++        return this.identityLedger;
+     }
+ 
+     void removeSectionIfEmpty(long p_157510_, EntitySection<T> p_157511_) {
+@@ -71,14 +_,40 @@
          return this.addEntity(p_157534_, false);
      }
  
 +    public boolean addNewEntityWithoutEvent(T entity) {
++        this.checkStorageAccess("PersistentEntitySectionManager.addNewEntityWithoutEvent");
 +        return this.addEntityWithoutEvent(entity, false);
 +    }
 +
      private boolean addEntity(T p_157539_, boolean p_157540_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.addEntity");
 +        if (p_157539_ instanceof Entity entity && net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.entity.EntityJoinLevelEvent(entity, entity.level(), p_157540_)).isCanceled()) return false;
 +        return addEntityWithoutEvent(p_157539_, p_157540_);
 +    }
 +
 +    private boolean addEntityWithoutEvent(T p_157539_, boolean p_157540_) {
++        // Neo: the identity is reserved before any vanilla map is written, so a duplicate UUID or a
++        // duplicate int id is rejected instead of silently overwriting a live binding. The reservation is
++        // published as RESERVED; a reader retries until the admission is published as ADMITTED.
++        if (p_157539_ instanceof Entity realEntity
++                && this.identityLedger.admit(realEntity) != net.neoforged.neoforge.server.threading.region.EntityIdentityLedger.Admission.ADMITTED) {
++            return false;
++        }
          if (!this.addEntityUuid(p_157539_)) {
++            if (p_157539_ instanceof Entity realEntity) {
++                this.identityLedger.abandon(realEntity);
++            }
              return false;
          } else {
-@@ -101,11 +_,17 @@
+             long i = SectionPos.asLong(p_157539_.blockPosition());
+             EntitySection<T> entitysection = this.sectionStorage.getOrCreateSection(i);
+             entitysection.add(p_157539_);
+             p_157539_.setLevelCallback(new PersistentEntitySectionManager.Callback(p_157539_, i, entitysection));
++            // Neo: the vanilla UUID set and the section membership now contain the entity. Tracking, if any,
++            // publishes TRACKED from startTracking, which is sequenced after this publication.
++            if (p_157539_ instanceof Entity realEntity) {
++                this.identityLedger.publishAdmitted(realEntity);
++            }
+             if (!p_157540_) {
+                 this.callbacks.onCreated(p_157539_);
+             }
+@@ -101,11 +_,19 @@
      }
  
      public void addLegacyChunkEntities(Stream<T> p_157553_) {
 -        p_157553_.forEach(p_157607_ -> this.addEntity((T)p_157607_, true));
++        this.checkStorageAccess("PersistentEntitySectionManager.addLegacyChunkEntities");
 +        p_157553_.forEach(p_157607_ -> {
 +            this.addEntity(p_157607_, true);
 +            if (p_157607_ instanceof Entity entity) entity.onAddedToLevel();
@@ -30,6 +136,7 @@
  
      public void addWorldGenChunkEntities(Stream<T> p_157560_) {
 -        p_157560_.forEach(p_157605_ -> this.addEntity((T)p_157605_, false));
++        this.checkStorageAccess("PersistentEntitySectionManager.addWorldGenChunkEntities");
 +        p_157560_.forEach(p_157605_ -> {
 +            this.addEntity(p_157605_, false);
 +            if (p_157605_ instanceof Entity entity) entity.onAddedToLevel();
@@ -37,8 +144,47 @@
      }
  
      void startTicking(T p_157565_) {
-@@ -228,7 +_,10 @@
+@@ -118,12 +_,22 @@
+ 
+     void startTracking(T p_157576_) {
+         this.visibleEntityStorage.add(p_157576_);
++        // Neo: published after the visible lookup contains the entity, so a reader that observes TRACKED
++        // can rely on the vanilla by-uuid/by-id binding. Re-entrant callbacks run after this store.
++        if (p_157576_ instanceof Entity realEntity) {
++            this.identityLedger.publishTracked(realEntity);
++        }
+         this.callbacks.onTrackingStart(p_157576_);
+     }
+ 
+     void stopTracking(T p_157581_) {
+         this.callbacks.onTrackingEnd(p_157581_);
+         this.visibleEntityStorage.remove(p_157581_);
++        // Neo: published after the visible lookup no longer contains the entity, so ADMITTED never claims
++        // a binding that was just removed. A departure keeps DEPARTING and is not reopened here.
++        if (p_157581_ instanceof Entity realEntity) {
++            this.identityLedger.publishUntracked(realEntity);
++        }
+     }
+ 
+     public void updateChunkStatus(ChunkPos p_287590_, FullChunkStatus p_287623_) {
+@@ -132,6 +_,7 @@
+     }
+ 
+     public void updateChunkStatus(ChunkPos p_157528_, Visibility p_157529_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.updateChunkStatus");
+         long i = p_157528_.toLong();
+         if (p_157529_ == Visibility.HIDDEN) {
+             this.chunkVisibility.remove(i);
+@@ -222,13 +_,18 @@
+     }
+ 
+     private void processUnloads() {
++        this.checkStorageAccess("PersistentEntitySectionManager.processUnloads");
+         this.chunksToUnload.removeIf(p_157584_ -> this.chunkVisibility.get(p_157584_) != Visibility.HIDDEN ? true : this.processChunkUnload(p_157584_));
+     }
+ 
      private void processPendingLoads() {
++        this.checkStorageAccess("PersistentEntitySectionManager.processPendingLoads");
          ChunkEntities<T> chunkentities;
          while ((chunkentities = this.loadingInbox.poll()) != null) {
 -            chunkentities.getEntities().forEach(p_157593_ -> this.addEntity((T)p_157593_, true));
@@ -49,7 +195,104 @@
              this.chunkLoadStatuses.put(chunkentities.getPos().toLong(), PersistentEntitySectionManager.ChunkLoadStatus.LOADED);
          }
      }
-@@ -367,11 +_,13 @@
+@@ -251,6 +_,7 @@
+     }
+ 
+     public void autoSave() {
++        this.checkStorageAccess("PersistentEntitySectionManager.autoSave");
+         this.getAllChunksToSave().forEach(p_157579_ -> {
+             boolean flag = this.chunkVisibility.get(p_157579_) == Visibility.HIDDEN;
+             if (flag) {
+@@ -263,6 +_,7 @@
+     }
+ 
+     public void saveAll() {
++        this.checkStorageAccess("PersistentEntitySectionManager.saveAll");
+         LongSet longset = this.getAllChunksToSave();
+ 
+         while (!longset.isEmpty()) {
+@@ -280,31 +_,65 @@
+ 
+     @Override
+     public void close() throws IOException {
++        this.checkStorageAccess("PersistentEntitySectionManager.close");
+         this.saveAll();
++        // Neo: sealing is the close transition of the level. Every remaining identity is published as gone,
++        // and an admission that a load completion or another caller attempts afterwards is rejected instead
++        // of writing the maps of a closed manager.
++        this.identityLedger.seal();
+         this.permanentStorage.close();
+     }
+ 
+     public boolean isLoaded(UUID p_157551_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.isLoaded");
+         return this.knownUuids.contains(p_157551_);
+     }
+ 
+     public LevelEntityGetter<T> getEntityGetter() {
+-        return this.entityGetter;
++        this.checkStorageAccess("PersistentEntitySectionManager.getEntityGetter");
++        return this.guardedEntityGetter;
++    }
++
++    /**
++     * Neo: {@return the edge length in chunks of the physical section partitions, or {@code 0} when the
++     * level keeps the shared section storage}
++     * <p>
++     * This is the storage-policy probe of the region-scoped entity query. A non-zero value means the level
++     * was created with a fixed {@code RegionLayout}, so a leased worker query has physical per-region
++     * buckets to read. It exposes no storage and performs no storage access.
++     */
++    public int entitySectionRegionChunkSize() {
++        return this.sectionStorage.entitySectionRegionChunkSize();
++    }
++
++    /**
++     * Neo: iterates the sections of exactly one physical region bucket for the region-scoped entity query
++     * of a native worker that owns that region's lease.
++     * <p>
++     * The caller is the level, which validates the lease against the requested region before delegating
++     * here. This method never touches the global section map or a neighbouring region's bucket.
++     */
++    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, net.minecraft.world.phys.AABB box, net.minecraft.util.AbortableIterationConsumer<EntitySection<T>> consumer) {
++        this.sectionStorage.forEachAccessibleNonEmptySectionInRegion(regionX, regionZ, box, consumer);
+     }
+ 
+     public boolean canPositionTick(BlockPos p_202168_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.canPositionTick");
+         return this.chunkVisibility.get(ChunkPos.asLong(p_202168_)).isTicking();
+     }
+ 
+     public boolean canPositionTick(ChunkPos p_202166_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.canPositionTick");
+         return this.chunkVisibility.get(p_202166_.toLong()).isTicking();
+     }
+ 
+     public boolean areEntitiesLoaded(long p_157508_) {
++        this.checkStorageAccess("PersistentEntitySectionManager.areEntitiesLoaded");
+         return this.chunkLoadStatuses.get(p_157508_) == PersistentEntitySectionManager.ChunkLoadStatus.LOADED;
+     }
+ 
+     public void dumpSections(Writer p_157549_) throws IOException {
++        this.checkStorageAccess("PersistentEntitySectionManager.dumpSections");
+         CsvOutput csvoutput = CsvOutput.builder()
+             .addColumn("x")
+             .addColumn("y")
+@@ -345,6 +_,7 @@
+ 
+     @VisibleForDebug
+     public String gatherStats() {
++        this.checkStorageAccess("PersistentEntitySectionManager.gatherStats");
+         return this.knownUuids.size()
+             + ","
+             + this.visibleEntityStorage.count()
+@@ -362,22 +_,26 @@
+ 
+     @VisibleForDebug
+     public int count() {
++        this.checkStorageAccess("PersistentEntitySectionManager.count");
+         return this.visibleEntityStorage.count();
+     }
  
      class Callback implements EntityInLevelCallback {
          private final T entity;
@@ -63,6 +306,13 @@
              this.currentSectionKey = p_157615_;
              this.currentSection = p_157616_;
          }
+ 
+         @Override
+         public void onMove() {
++            PersistentEntitySectionManager.this.checkStorageAccess("PersistentEntitySectionManager.Callback.onMove");
+             BlockPos blockpos = this.entity.blockPosition();
+             long i = SectionPos.asLong(blockpos);
+             if (i != this.currentSectionKey) {
 @@ -390,9 +_,11 @@
                  PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
                  EntitySection<T> entitysection = PersistentEntitySectionManager.this.sectionStorage.getOrCreateSection(i);
@@ -74,4 +324,29 @@
 +                if (this.realEntity != null) net.neoforged.neoforge.common.CommonHooks.onEntityEnterSection(this.realEntity, oldSectionKey, i);
              }
          }
+ 
+@@ -428,6 +_,12 @@
+ 
+         @Override
+         public void onRemove(Entity.RemovalReason p_157619_) {
++            PersistentEntitySectionManager.this.checkStorageAccess("PersistentEntitySectionManager.Callback.onRemove");
++            // Neo: the departure is published before any map is written, so the identity stops being a
++            // valid admission target for the whole removal instead of only after the UUID is released.
++            if (this.realEntity != null) {
++                PersistentEntitySectionManager.this.identityLedger.publishDeparting(this.realEntity);
++            }
+             if (!this.currentSection.remove(this.entity)) {
+                 PersistentEntitySectionManager.LOGGER
+                     .warn("Entity {} wasn't found in section {} (destroying due to {})", this.entity, SectionPos.of(this.currentSectionKey), p_157619_);
+@@ -449,6 +_,11 @@
+             PersistentEntitySectionManager.this.knownUuids.remove(this.entity.getUUID());
+             this.entity.setLevelCallback(NULL);
+             PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
++            // Neo: the removal is complete: the UUID set, the section membership and every visibility
++            // callback ran. Only now is the identity published as gone.
++            if (this.realEntity != null) {
++                PersistentEntitySectionManager.this.identityLedger.publishGone(this.realEntity);
++            }
+         }
+     }
  

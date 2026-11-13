@@ -1,5 +1,23 @@
 --- a/net/minecraft/gametest/framework/GameTestServer.java
 +++ b/net/minecraft/gametest/framework/GameTestServer.java
+@@ -67,7 +_,7 @@
+         p_351714_.getRule(GameRules.RULE_RANDOMTICKING).set(0, null);
+         p_351714_.getRule(GameRules.RULE_DOFIRETICK).set(false, null);
+     });
+-    private static final WorldOptions WORLD_OPTIONS = new WorldOptions(0L, false, false);
++    private static final WorldOptions WORLD_OPTIONS = net.neoforged.neoforge.gametest.GameTestHooks.gameTestWorldOptions();
+     @Nullable
+     private MultipleTestTracker testTracker;
+ 
+@@ -97,7 +_,7 @@
+                                     Registry<LevelStem> registry = new MappedRegistry<>(Registries.LEVEL_STEM, Lifecycle.stable()).freeze();
+                                     WorldDimensions.Complete worlddimensions$complete = p_258205_.datapackWorldgen()
+                                         .registryOrThrow(Registries.WORLD_PRESET)
+-                                        .getHolderOrThrow(WorldPresets.FLAT)
++                                        .getHolderOrThrow(net.neoforged.neoforge.gametest.GameTestHooks.gameTestWorldPreset())
+                                         .value()
+                                         .createWorldDimensions()
+                                         .bake(registry);
 @@ -151,6 +_,7 @@
      public boolean initServer() {
          this.setPlayerList(new PlayerList(this, this.registries(), this.playerDataStorage, 1) {

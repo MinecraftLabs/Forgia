@@ -13,3 +13,15 @@
          FeatureFlagSet featureflagset = p_249615_.level().enabledFeatures();
          return p_252026_.isItemEnabled(featureflagset) && p_252026_.overrideStackedOnOther(p_249384_, p_250300_, p_249615_)
              ? true
+@@ -701,6 +_,11 @@
+     }
+ 
+     public static int getRedstoneSignalFromBlockEntity(@Nullable BlockEntity p_38919_) {
++        // Neo: a read-only stand-in is the published value of a border block entity of another region, so its
++        // signal is the recorded one; the owning region is never reached, and the stand-in is not a Container.
++        if (p_38919_ instanceof net.neoforged.neoforge.server.threading.region.RegionSnapshotBlockEntity snapshotBlockEntity) {
++            return net.neoforged.neoforge.server.threading.region.RegionBlockEntitySnapshots.answerSignal(snapshotBlockEntity);
++        }
+         return p_38919_ instanceof Container ? getRedstoneSignalFromContainer((Container)p_38919_) : 0;
+     }
+ 

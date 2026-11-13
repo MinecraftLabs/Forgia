@@ -989,6 +989,10 @@ public class EventHooks {
      */
     public static void fireLevelTickPre(Level level, BooleanSupplier haveTime) {
         if (level instanceof ServerLevel serverLevel) {
+            // The level tick opens in its global phase: no region batch may run while its global statements do,
+            // and the global messages a worker posted since the last global phase are delivered before the
+            // queued region work of this tick starts.
+            RegionThreadingHooks.beginLevelTick(serverLevel);
             RegionThreadingHooks.drainLevelRegionTasks(serverLevel);
             RegionThreadingHooks.runLevelTickTask(serverLevel, () -> NeoForge.EVENT_BUS.post(new LevelTickEvent.Pre(haveTime, level)));
         } else {
@@ -1005,6 +1009,7 @@ public class EventHooks {
     public static void fireLevelTickPost(Level level, BooleanSupplier haveTime) {
         if (level instanceof ServerLevel serverLevel) {
             RegionThreadingHooks.runLevelTickTask(serverLevel, () -> NeoForge.EVENT_BUS.post(new LevelTickEvent.Post(haveTime, level)));
+            RegionThreadingHooks.endLevelTick(serverLevel);
         } else {
             NeoForge.EVENT_BUS.post(new LevelTickEvent.Post(haveTime, level));
         }

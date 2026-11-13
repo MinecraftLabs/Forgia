@@ -1,0 +1,85 @@
+--- a/net/minecraft/world/level/levelgen/Heightmap.java
++++ b/net/minecraft/world/level/levelgen/Heightmap.java
+@@ -36,6 +_,9 @@
+     }
+ 
+     public static void primeHeightmaps(ChunkAccess p_64257_, Set<Heightmap.Types> p_64258_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(p_64257_)) {
++            return;
++        }
+         int i = p_64258_.size();
+         ObjectList<Heightmap> objectlist = new ObjectArrayList<>(i);
+         ObjectListIterator<Heightmap> objectlistiterator = objectlist.iterator();
+@@ -72,6 +_,9 @@
+     }
+ 
+     public boolean update(int p_64250_, int p_64251_, int p_64252_, BlockState p_64253_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this.chunk)) {
++            return false;
++        }
+         int i = this.getFirstAvailable(p_64250_, p_64252_);
+         if (p_64251_ <= i - 2) {
+             return false;
+@@ -109,22 +_,53 @@
+     }
+ 
+     private int getFirstAvailable(int p_64241_) {
++        if (this.chunk instanceof net.minecraft.world.level.chunk.LevelChunk live
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(live)) {
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.readStableForeignChunk(live,
++                    () -> this.data.get(p_64241_) + this.chunk.getMinBuildHeight());
++        }
+         return this.data.get(p_64241_) + this.chunk.getMinBuildHeight();
+     }
+ 
+     private void setHeight(int p_64246_, int p_64247_, int p_64248_) {
+-        this.data.set(getIndex(p_64246_, p_64247_), p_64248_ - this.chunk.getMinBuildHeight());
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this.chunk)) {
++            return;
++        }
++        net.minecraft.world.level.chunk.LevelChunk live = this.chunk instanceof net.minecraft.world.level.chunk.LevelChunk chunk ? chunk : null;
++        if (live != null) {
++            live.beginChunkMutation();
++        }
++        try {
++            this.data.set(getIndex(p_64246_, p_64247_), p_64248_ - this.chunk.getMinBuildHeight());
++        } finally {
++            if (live != null) {
++                live.endChunkMutation();
++            }
++        }
+     }
+ 
+     public void setRawData(ChunkAccess p_158365_, Heightmap.Types p_158366_, long[] p_158367_) {
+-        long[] along = this.data.getRaw();
+-        if (along.length == p_158367_.length) {
+-            System.arraycopy(p_158367_, 0, along, 0, p_158367_.length);
+-        } else {
+-            LOGGER.warn(
+-                "Ignoring heightmap data for chunk " + p_158365_.getPos() + ", size does not match; expected: " + along.length + ", got: " + p_158367_.length
+-            );
+-            primeHeightmaps(p_158365_, EnumSet.of(p_158366_));
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this.chunk)) {
++            return;
++        }
++        net.minecraft.world.level.chunk.LevelChunk live = this.chunk instanceof net.minecraft.world.level.chunk.LevelChunk chunk ? chunk : null;
++        if (live != null) {
++            live.beginChunkMutation();
++        }
++        try {
++            long[] along = this.data.getRaw();
++            if (along.length == p_158367_.length) {
++                System.arraycopy(p_158367_, 0, along, 0, p_158367_.length);
++            } else {
++                LOGGER.warn(
++                    "Ignoring heightmap data for chunk " + p_158365_.getPos() + ", size does not match; expected: " + along.length + ", got: " + p_158367_.length
++                );
++                primeHeightmaps(p_158365_, EnumSet.of(p_158366_));
++            }
++        } finally {
++            if (live != null) {
++                live.endChunkMutation();
++            }
+         }
+     }
+ 

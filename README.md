@@ -1,71 +1,135 @@
-# Forgia — Minecraft 1.21.1
+# Forgia
 
-A NeoForge fork porting [Folia](https://github.com/PaperMC/Folia)'s regionized multithreaded server model natively into the NeoForge modding ecosystem.
+**A regionized, multithreaded Minecraft server for NeoForge 1.21.1.**
 
-## What It Does
+Forgia ports [Folia](https://github.com/PaperMC/Folia)'s region model into NeoForge natively: the world is
+partitioned into regions, each region owns its chunks, entities, block entities and points of interest, and
+the regions tick in parallel on worker threads. It is a NeoForge fork, not a plugin platform — scheduling and
+ownership are exposed through native NeoForge API, and mods keep running as mods.
 
-Enables Minecraft servers running NeoForge mods to distribute world tick processing across multiple threads organized by region, instead of running all world logic on a single server thread. This can significantly improve server performance when many players are spread across a world.
+> **Project status: independent.** Forgia started as a fork of an earlier Forgia port. That upstream stopped
+> updating, so this repository is now the continuation: it tracks NeoForge 21.1.x as its base, but the
+> regionized runtime is developed here. See [region-threading/STATUS.md](region-threading/STATUS.md) for what works, what is
+> measured, and what is still missing.
 
-**This is not a Paper/Bukkit plugin.** The runtime stays NeoForge/FML — scheduling and ownership are exposed through native NeoForge API interfaces, not Bukkit or Paper APIs.
+---
 
-## Status
+## What works today
 
-Currently at **stage 1** of the port (region data primitives and tick scheduler internals). The `ThreadedRegionizer` is a minimal facade; Folia's adjacency, merge radius, section split/merge, and empty-section retirement logic still need to be ported. The active bridge drains scheduled tasks on the main server thread rather than delegating to independent region workers.
+Everything below is implemented, tested and measured on this repository. All region threading is **off by
+default** and every slice fails closed: work that cannot be proven safe runs on the server thread and is
+counted.
 
-## Requirements
+| Area | What it does | Measured |
+|---|---|---|
+| **Entity ticks** | Regions tick their own entities; the server thread no longer walks the entity list | **2.5–4.5×** on 1024 mobs (4 workers) |
+| **Chunk ticks** | Random ticks, ice/snow, thunder on the region that owns the chunk, including chunks on a region border | 1.24–1.27× (100 % of dispatched chunks on workers) |
+| **Natural spawning** | Per-region spawn bodies against the vanilla level-wide mob cap | spawn slice 4.6 → 2.8–3.9 ms |
+| **Points of interest** | Region-partitioned storage with published snapshots; queries identical to vanilla | villagers **2.1–2.4×**, zombies **3.4×** |
+| **Block entities** | Furnace/hopper family admitted on workers with a per-chunk admission cache | at parity; interior-only (a hopper reads its neighbour) |
+| **Redstone** | Cross-region updates converge in the **same tick** through a fixpoint | 98 layouts, 5 880 tick comparisons, identical to vanilla |
+| **Cross-region reads** | Seqlock chunk versions; a stale read re-runs the region that made it | 0 torn reads, 0 stale takes |
+| **Global state** | Explicit global phase + bounded cross-region mailbox | weather/time writes from a region fail closed |
+| **Failures** | A worker tick failure is reported by the server thread, never built on the worker | barrier wait 200 ms → **1.25 ms** |
 
-- **Java 21**
-- **Minecraft 1.21.1**
-- **NeoForm** 20240808.144430
+Correctness is the acceptance criterion throughout: the POI manager, the redstone components and the chunk
+random tick are compared against **real vanilla implementations**, tick by tick, not against expectations.
+
+## What is not done yet
+
+Forgia is not a finished Folia replacement. The honest list:
+
+- **Light loads do not win yet.** A 2048-hopper line runs at 3.7–4.0 ms against 3.3 ms inline and 4096
+  furnaces at 2.7–3.3 ms against 2.6 ms. The worker body itself costs about 2.5× the inline cost per ticker,
+  and the persistent-pool work that removes the submission cost is off by default because it costs the
+  entity slice its dynamic balancing; the fix is a work-stealing dispatcher, not a global switch.
+- **The production soak is at parity, not ahead.** With everything on it lands at or below the inline mspt
+  (median ratio 0.983, p50 5.60 ms against 6.22 ms), but a realistic world does not have enough parallel work
+  to gain more than that at 3-chunk regions.
+- **Block entities still require the interior rule**, so ~92 % of their ticks stay on the server thread: a
+  hopper reads the container one block away and a foreign block-entity read answers null.
+- **Structures are not region-aware.** A piston that moves blocks across a border, and Create-style
+  contraptions, still run on the server thread.
+- **Cross-region game events (sculk) are not regionized.**
+- **Players are not regionized.** Teleport, portals and player entities stay on the server thread.
+- **No long-run or multiplayer validation yet**, and **no mod-pack validation yet** — a 170-mod pack is
+  prepared for that stage.
+- **Region size is static.** Dynamic regions (split/merge by load) and continuous region ticking (a tick clock
+  instead of a per-tick barrier) are designed but not built.
+
+The full remaining plan is in [region-threading/STATUS.md](region-threading/STATUS.md#roadmap).
 
 ## Configuration
 
-Region threading is gated behind experimental server config options, **both defaulting to off**:
+All switches live in `config/neoforge-server.toml` and are **`false` by default**. A server that wants the
+full stack sets:
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enableRegionThreadingBridge` | boolean | `false` | Enables the single-thread bridge that exposes the scheduling API and drains global/region queues on the existing server tick loop |
-| `regionThreadingWorkerThreads` | int (0–512) | `0` | Number of native region worker threads; `0` means `max(1, availableProcessors - 1)` |
-
-## API Surface
-
-The public API lives in `net.neoforged.neoforge.server.threading`:
-
-| Interface | Purpose |
-|-----------|---------|
-| `RegionThreading` | Entry point: global/region/entity schedulers, ownership assertions, `executeOrSchedule` helpers |
-| `GlobalRegionScheduler` | Schedule work on the global region |
-| `RegionScheduler` | Schedule work on the region owning a block position |
-| `EntityRegionScheduler` | Schedule work on the region owning an entity |
-| `RegionThreadingContext` | Describes current execution context (`NONE`, `GLOBAL_REGION`, `REGION`, `ASYNC`) |
-| `ScheduledRegionTask` | Cancellable/completable handle for scheduled work |
-
-Internal implementation is in `net.neoforged.neoforge.server.threading.region`.
-
-## Diagnostics
-
-```
-/neoforge regionthreading status
+```toml
+enableRegionThreadingBridge = true
+enableRegionThreadingWorkers = true
+enableRegionThreadingEntityTicks = true            # selects region-owned entity storage
+enableRegionThreadingBlockEntityTicks = true
+enableRegionThreadingRandomTicks = true
+enableRegionThreadingSpawning = true
+enableRegionThreadingPoi = true                    # implied by entity ticks
+enableRegionThreadingBorderUpdates = true
+regionThreadingMode = "FIXED_3X3"
+regionThreadingFixedRegionChunks = 3
+regionThreadingWorkerThreads = 4
 ```
 
-Prints region count, running regions, sections, tracked entities, entity tasks, worker threads, global tick count, and last tick duration. Requires permission level 2.
+`regionThreadingWorkerThreads = 0` means "one less than the CPU count". Entity ticks, spawning and POI
+require the fixed layout; everything else degrades to the vanilla path when its requirement is missing.
 
-## Port Roadmap
-
-1. ~~Port Folia's region data primitives and tick scheduler internals without Bukkit/Paper API exposure~~ *(in progress)*
-2. Wire regionized server/global tick loops into `MinecraftServer` and `ServerLevel`
-3. Move entity and position scheduling behind the native NeoForge API skeleton
-4. Convert NeoForge tick and gameplay event dispatch to run on the owning context
-5. Add hard ownership checks for unsafe off-region access
-6. Add optional mod metadata declaring support for regionized execution
+Diagnostics: `/neoforge regionthreading status` prints the per-region MSPT/TPS, every slice's worker and
+fallback counters, the border-update and foreign-read counters, and the reason each refusal happened. Nothing
+is silently dropped.
 
 ## Building
 
-```bash
-./gradlew setup
-./gradlew build
+```
+./gradlew --offline :neoforge:setup          # apply patches into projects/
+./gradlew --offline build                    # build the loader
+./gradlew --offline :tests:junitTest         # 676 unit tests
+./gradlew --offline :tests:runGameTestServer # 166 in-game tests
 ```
 
-## License
+JDK 21 is required. The repository is a patched-source NeoForge tree: vanilla sources live in
+`projects/neoforge/src/main/java` (generated), the patch set in `patches/`, and the Forgia runtime in
+`src/main/java/net/neoforged/neoforge/server/threading`.
 
-LGPL v2.1 — see [LICENSE.txt](LICENSE.txt).
+Benchmarks and soaks:
+
+```
+./gradlew --offline :tests:runGameTestServer -PserverBenchmark=true \
+    -PgameTestFilter=benchmarkEntity -PserverBenchmarkZombies=1024
+./gradlew --offline :tests:runSoakGameTestServer        # 6000-tick production soak
+./gradlew --offline :tests:runSoakGameTestServerReference
+```
+
+Measure with a low-pause collector (`-XX:+UseZGC -XX:+ZGenerational`): the default G1 on a 2 GiB heap spends
+seconds in pauses on this workload and hides every effect.
+
+## Architecture in one page
+
+- **Regions** are a fixed, non-overlapping grid of N×N chunks (`regionThreadingFixedRegionChunks`). Each
+  region has a lease; only the lease holder may tick its chunks, entities, block entities, spawns and POIs.
+- **The server thread** builds the plan, leases every region, submits one task per region, waits at a barrier
+  and runs the handoff: deferred section updates, removals, admissions, block updates, portal transitions,
+  border updates and the propagation fixpoint.
+- **Workers** own their region for the duration of a task and enumerate their own entities, tickers, chunks
+  and POIs instead of receiving a per-unit list.
+- **Everything cross-region is deferred**, never raced: neighbour updates, block writes, reads, POI queries,
+  game events. Each has a bounded queue, a counter and a fallback.
+- **Fail closed**: any work that cannot be proven safe — an unknown modded callback, a level without
+  region-owned storage, a region that cannot be leased — runs on the server thread.
+
+Deeper notes live next to the code (`src/main/java/net/neoforged/neoforge/server/threading/region/*.java`)
+and in the task records under `.pi/tasks/`, which document the design and the evidence for each milestone.
+
+## Licence and lineage
+
+Forgia is a fork of NeoForge (LGPL-2.1) and of the earlier Forgia port; the regionized runtime added here is
+under the same licence. Upstream NeoForge attribution is kept in the source headers and in
+[NOTICE](NOTICE) where present. This repository no longer tracks the upstream Forgia project, which stopped
+updating.

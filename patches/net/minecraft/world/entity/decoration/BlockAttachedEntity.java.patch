@@ -1,0 +1,22 @@
+--- a/net/minecraft/world/entity/decoration/BlockAttachedEntity.java
++++ b/net/minecraft/world/entity/decoration/BlockAttachedEntity.java
+@@ -78,6 +_,9 @@
+ 
+     @Override
+     public void move(MoverType p_345778_, Vec3 p_345301_) {
++        // Neo: the virtual kill() below reaches ItemFrame.kill, which removes the framed map representation
++        // before the guarded Entity.remove rejects the call. The guard has to run before any of that.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "BlockAttachedEntity.move");
+         if (!this.level().isClientSide && !this.isRemoved() && p_345301_.lengthSqr() > 0.0) {
+             this.kill();
+             this.dropItem(null);
+@@ -119,6 +_,9 @@
+ 
+     @Override
+     public void setPos(double p_346360_, double p_344743_, double p_345636_) {
++        // Neo: the attachment anchor is written before recalculateBoundingBox reaches the guarded
++        // setPosRaw, so a rejected move would leave the anchor ahead of the real position and bounds.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "BlockAttachedEntity.setPos");
+         this.pos = BlockPos.containing(p_346360_, p_344743_, p_345636_);
+         this.recalculateBoundingBox();
+         this.hasImpulse = true;

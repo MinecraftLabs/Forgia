@@ -5,7 +5,6 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.neoforged.neoforge.server.threading.EntityRegionScheduler;
 import net.neoforged.neoforge.server.threading.ScheduledRegionTask;
@@ -19,24 +18,31 @@ final class EngineEntityRegionScheduler implements EntityRegionScheduler {
 
     @Override
     public void execute(Entity entity, Runnable task) {
-        if (entity.level() instanceof ServerLevel level) {
-            this.engine.enqueueRegion(level, entity.blockPosition(), task);
-        }
+        this.runDelayed(entity, task, 0L);
     }
 
     @Override
     public ScheduledRegionTask runDelayed(Entity entity, Runnable task, long delayTicks) {
-        if (entity.level() instanceof ServerLevel) {
-            return this.engine.scheduleEntity(entity, task, delayTicks);
+        if (delayTicks < 0L) {
+            throw new IllegalArgumentException("delayTicks must be >= 0");
         }
-        return RegionScheduledTask.cancelled(task);
+        if (entity.isRemoved()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.engine.scheduleEntity(entity, task, delayTicks);
     }
 
     @Override
     public ScheduledRegionTask runAtFixedRate(Entity entity, Runnable task, long initialDelayTicks, long periodTicks) {
-        if (entity.level() instanceof ServerLevel) {
-            return this.engine.scheduleEntityAtFixedRate(entity, task, initialDelayTicks, periodTicks);
+        if (initialDelayTicks < 0L) {
+            throw new IllegalArgumentException("initialDelayTicks must be >= 0");
         }
-        return RegionScheduledTask.cancelled(task);
+        if (periodTicks <= 0L) {
+            throw new IllegalArgumentException("periodTicks must be > 0");
+        }
+        if (entity.isRemoved()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.engine.scheduleEntityAtFixedRate(entity, task, initialDelayTicks, periodTicks);
     }
 }

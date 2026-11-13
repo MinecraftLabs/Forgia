@@ -11,8 +11,8 @@ import net.minecraft.server.level.ServerLevel;
  * Stable key for one chunk section tracked by the regionizer.
  */
 record RegionSectionCoordinate(ServerLevel level, int sectionX, int sectionZ) {
-    static RegionSectionCoordinate fromChunk(ServerLevel level, int chunkX, int chunkZ) {
-        return new RegionSectionCoordinate(level, chunkX >> RegionCoordinate.DEFAULT_REGION_CHUNK_SHIFT, chunkZ >> RegionCoordinate.DEFAULT_REGION_CHUNK_SHIFT);
+    static RegionSectionCoordinate fromChunk(ServerLevel level, int chunkX, int chunkZ, RegionLayout layout) {
+        return new RegionSectionCoordinate(level, layout.regionX(chunkX), layout.regionZ(chunkZ));
     }
 
     RegionCoordinate regionCoordinate() {

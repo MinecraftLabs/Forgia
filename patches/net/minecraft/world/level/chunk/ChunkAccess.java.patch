@@ -1,5 +1,25 @@
 --- a/net/minecraft/world/level/chunk/ChunkAccess.java
 +++ b/net/minecraft/world/level/chunk/ChunkAccess.java
+@@ -170,6 +_,9 @@
+     }
+ 
+     public void setHeightmap(Heightmap.Types p_62083_, long[] p_62084_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
+         this.getOrCreateHeightmapUnprimed(p_62083_).setRawData(this, p_62083_, p_62084_);
+     }
+ 
+@@ -302,6 +_,9 @@
+     }
+ 
+     public void setBlockEntityNbt(CompoundTag p_62091_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
+         this.pendingBlockEntities.put(BlockEntity.getPosFromTag(p_62091_), p_62091_);
+     }
+ 
 @@ -315,10 +_,19 @@
  
      @Override

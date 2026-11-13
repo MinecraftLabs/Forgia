@@ -31,11 +31,14 @@
 +    };
      private final Ingredient.Value[] values;
      @Nullable
-     private ItemStack[] itemStacks;
-     @Nullable
-     private IntList stackingIds;
+-    private ItemStack[] itemStacks;
+-    @Nullable
+-    private IntList stackingIds;
 -    public static final Codec<Ingredient> CODEC = codec(true);
 -    public static final Codec<Ingredient> CODEC_NONEMPTY = codec(false);
++    private volatile ItemStack[] itemStacks;
++    @Nullable
++    private volatile IntList stackingIds;
 +    @Nullable
 +    private net.neoforged.neoforge.common.crafting.ICustomIngredient customIngredient = null;
 +
@@ -59,7 +62,7 @@
  
      private Ingredient(Stream<? extends Ingredient.Value> p_43907_) {
          this.values = p_43907_.toArray(Ingredient.Value[]::new);
-@@ -47,9 +_,19 @@
+@@ -47,17 +_,39 @@
          this.values = p_301044_;
      }
  
@@ -68,19 +71,32 @@
 +        this.customIngredient = customIngredient;
 +    }
 +
++    // Neo: both lazy caches are initialized under this instance's monitor and published through volatile fields,
++    // so a concurrent reader never observes a partially built cache.
      public ItemStack[] getItems() {
-         if (this.itemStacks == null) {
+-        if (this.itemStacks == null) {
 -            this.itemStacks = Arrays.stream(this.values).flatMap(p_43916_ -> p_43916_.getItems().stream()).distinct().toArray(ItemStack[]::new);
-+            // Neo: vanilla used Stream.distinct() here which has basically no effect as ItemStack does not override hashCode() and equals().
-+            // Using ItemStackLinkedSet::createTypeAndComponentsSet instead for a real distinct result.
-+            final Stream<ItemStack> stream = this.customIngredient == null
-+                    ? Arrays.stream(this.values).flatMap(value -> value.getItems().stream())
-+                    : this.customIngredient.getItems();
-+            this.itemStacks = stream.collect(java.util.stream.Collectors.toCollection(net.minecraft.world.item.ItemStackLinkedSet::createTypeAndComponentsSet)).toArray(ItemStack[]::new);
++        ItemStack[] items = this.itemStacks;
++        if (items == null) {
++            synchronized (this) {
++                items = this.itemStacks;
++                if (items == null) {
++                    // Neo: build the whole array before publishing it, so concurrent readers never observe a partially built cache.
++                    // Neo: vanilla used Stream.distinct() here which has basically no effect as ItemStack does not override hashCode() and equals().
++                    // Using ItemStackLinkedSet::createTypeAndComponentsSet instead for a real distinct result.
++                    final Stream<ItemStack> stream = this.customIngredient == null
++                            ? Arrays.stream(this.values).flatMap(value -> value.getItems().stream())
++                            : this.customIngredient.getItems();
++                    items = stream.collect(java.util.stream.Collectors.toCollection(net.minecraft.world.item.ItemStackLinkedSet::createTypeAndComponentsSet)).toArray(ItemStack[]::new);
++                    this.itemStacks = items;
++                }
++            }
          }
  
-         return this.itemStacks;
-@@ -58,6 +_,8 @@
+-        return this.itemStacks;
++        return items;
+     }
+ 
      public boolean test(@Nullable ItemStack p_43914_) {
          if (p_43914_ == null) {
              return false;
@@ -89,8 +105,41 @@
          } else if (this.isEmpty()) {
              return p_43914_.isEmpty();
          } else {
-@@ -86,13 +_,65 @@
-         return this.stackingIds;
+@@ -72,27 +_,89 @@
+     }
+ 
+     public IntList getStackingIds() {
+-        if (this.stackingIds == null) {
+-            ItemStack[] aitemstack = this.getItems();
+-            this.stackingIds = new IntArrayList(aitemstack.length);
+-
+-            for (ItemStack itemstack : aitemstack) {
+-                this.stackingIds.add(StackedContents.getStackingIndex(itemstack));
++        IntList ids = this.stackingIds;
++        if (ids == null) {
++            synchronized (this) {
++                ids = this.stackingIds;
++                if (ids == null) {
++                    // Neo: build and sort a complete list locally, then publish it once. Concurrent callers
++                    // previously assigned the shared field before filling it and corrupted each other's list.
++                    ItemStack[] aitemstack = this.getItems();
++                    IntArrayList built = new IntArrayList(aitemstack.length);
++
++                    for (ItemStack itemstack : aitemstack) {
++                        built.add(StackedContents.getStackingIndex(itemstack));
++                    }
++
++                    built.sort(IntComparators.NATURAL_COMPARATOR);
++                    ids = built;
++                    this.stackingIds = ids;
++                }
+             }
+-
+-            this.stackingIds.sort(IntComparators.NATURAL_COMPARATOR);
+         }
+ 
+-        return this.stackingIds;
++        return ids;
      }
  
 +    /**

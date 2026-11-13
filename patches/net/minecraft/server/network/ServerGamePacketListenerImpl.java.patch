@@ -53,6 +53,16 @@
                                      && !this.player.hasEffect(MobEffects.LEVITATION)
                                      && !flag
                                      && !flag3
+@@ -1004,6 +_,9 @@
+     }
+ 
+     public void teleport(double p_9781_, double p_9782_, double p_9783_, float p_9784_, float p_9785_, Set<RelativeMovement> p_9786_) {
++        // Neo: the awaiting-teleport bookkeeping and the position packet below are server state changes.
++        // Rejecting here keeps a native region worker from recording a teleport that never completes.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess("ServerGamePacketListenerImpl.teleport");
+         double d0 = p_9786_.contains(RelativeMovement.X) ? this.player.getX() : 0.0;
+         double d1 = p_9786_.contains(RelativeMovement.Y) ? this.player.getY() : 0.0;
+         double d2 = p_9786_.contains(RelativeMovement.Z) ? this.player.getZ() : 0.0;
 @@ -1031,8 +_,10 @@
              case SWAP_ITEM_WITH_OFFHAND:
                  if (!this.player.isSpectator()) {

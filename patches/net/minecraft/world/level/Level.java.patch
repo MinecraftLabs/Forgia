@@ -9,10 +9,44 @@
      public static final Codec<ResourceKey<Level>> RESOURCE_KEY_CODEC = ResourceKey.codec(Registries.DIMENSION);
      public static final ResourceKey<Level> OVERWORLD = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("overworld"));
      public static final ResourceKey<Level> NETHER = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("the_nether"));
-@@ -114,6 +_,11 @@
+@@ -90,7 +_,22 @@
+     public static final int MIN_ENTITY_SPAWN_Y = -20000000;
+     protected final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
+     protected final NeighborUpdater neighborUpdater;
++    // Neo: the vanilla chained-neighbor-update limit of this level. The cross-region border fixpoint uses the
++    // same number as its bound, so a circuit that crosses a region border stops where a vanilla cascade stops.
++    private final int maxChainedNeighborUpdates;
+     private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
++    private final Object blockEntityTickerLock = new Object();
++    // Neo: the chunks that currently hold block-entity tickers, in registration order. The block-entity
++    // worker plan visits these chunks instead of the ticker list, so its server-thread cost is per chunk.
++    private final it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<LevelChunk> blockEntityTickerChunks = new it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap<>();
++    // Neo: block-entity tickers a caller added to the level instead of through a chunk. The chunk-indexed
++    // plan cannot see them, so the level keeps them itself and the plan ticks them on the server thread.
++    private final List<TickingBlockEntity> foreignBlockEntityTickers = Lists.newArrayList();
++    // Neo: creation sequence of the chunk-owned block-entity tickers, so a chunk's tickers can be ordered
++    // like the level's own ticker list without reading that list.
++    private final java.util.concurrent.atomic.AtomicLong blockEntityTickerSequence = new java.util.concurrent.atomic.AtomicLong();
++    // Neo: a ticker left its chunk while the plan iterates chunks, so the level's ticker list still holds it.
++    private boolean blockEntityTickerPrunePending;
+     private boolean tickingBlockEntities;
+     private final Thread thread;
+     private final boolean isDebug;
+@@ -101,7 +_,7 @@
+     public float rainLevel;
+     public float oThunderLevel;
+     public float thunderLevel;
+-    public final RandomSource random = RandomSource.create();
++    public final RandomSource random = net.neoforged.neoforge.server.threading.RegionThreadingHooks.wrapLevelRandom(RandomSource.create());
+     @Deprecated
+     private final RandomSource threadSafeRandom = RandomSource.createThreadSafe();
+     private final Holder<DimensionType> dimensionTypeRegistration;
+@@ -113,7 +_,12 @@
+     private final ResourceKey<Level> dimension;
      private final RegistryAccess registryAccess;
      private final DamageSources damageSources;
-     private long subTickCount;
+-    private long subTickCount;
++    private final java.util.concurrent.atomic.AtomicLong subTickCount = new java.util.concurrent.atomic.AtomicLong();
 +    public boolean restoringBlockSnapshots = false;
 +    public boolean captureBlockSnapshots = false;
 +    public java.util.ArrayList<net.neoforged.neoforge.common.util.BlockSnapshot> capturedBlockSnapshots = new java.util.ArrayList<>();
@@ -21,9 +55,46 @@
  
      protected Level(
          WritableLevelData p_270739_,
-@@ -216,11 +_,40 @@
+@@ -151,7 +_,8 @@
+         this.thread = Thread.currentThread();
+         this.biomeManager = new BiomeManager(this, p_270248_);
+         this.isDebug = p_270470_;
+-        this.neighborUpdater = new CollectingNeighborUpdater(this, p_270466_);
++        this.maxChainedNeighborUpdates = p_270466_;
++        this.neighborUpdater = new net.neoforged.neoforge.server.threading.region.RegionAwareNeighborUpdater(this, p_270466_);
+         this.registryAccess = p_270200_;
+         this.damageSources = new DamageSources(p_270200_);
+     }
+@@ -161,6 +_,16 @@
+         return this.isClientSide;
+     }
+ 
++    /**
++     * Neo: {@return the vanilla chained-neighbor-update limit of this level}
++     * <p>
++     * A negative value means unlimited in vanilla; the cross-region fixpoint maps it to
++     * {@code SharedConstants.MAX_CHAINED_NEIGHBOR_UPDATES} so it still has a finite bound.
++     */
++    public int maxChainedNeighborUpdates() {
++        return this.maxChainedNeighborUpdates;
++    }
++
+     @Nullable
+     @Override
+     public MinecraftServer getServer() {
+@@ -215,12 +_,50 @@
+             return false;
          } else {
              LevelChunk levelchunk = this.getChunkAt(p_46605_);
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderBlockWrite(this, p_46605_, p_46606_, p_46607_, p_46608_)) {
++                // Neo: the position belongs to another region. The write is recorded and the target region runs
++                // the vanilla setBlock on its own worker at the barrier of this tick; the accepted answer is the
++                // documented read-after-write approximation, because the write is not applied yet.
++                return true;
++            }
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(levelchunk)) {
++                return false;
++            }
              Block block = p_46606_.getBlock();
 +
 +            p_46605_ = p_46605_.immutable(); // Forge - prevent mutable BlockPos leaks
@@ -81,46 +152,232 @@
      }
  
      public void updateNeighborsAtExceptFromFacing(BlockPos p_46591_, Block p_46592_, Direction p_46593_) {
-@@ -489,10 +_,32 @@
-         (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(p_151526_);
+@@ -486,42 +_,217 @@
      }
  
-+    public void addFreshBlockEntities(java.util.Collection<BlockEntity> beList) {
-+        if (this.tickingBlockEntities) {
-+            this.pendingFreshBlockEntities.addAll(beList);
-+        } else {
-+            this.freshBlockEntities.addAll(beList);
+     public void addBlockEntityTicker(TickingBlockEntity p_151526_) {
+-        (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(p_151526_);
++        // Neo: region workers can add tickers while they tick their block entities, so the pending list
++        // that receives those additions is guarded like the server thread's own additions.
++        synchronized (this.blockEntityTickerLock) {
++            (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(p_151526_);
++            // Neo: a ticker that is not owned by a chunk is invisible to the chunk-indexed plan, so the
++            // level keeps it here and the plan ticks it on the server thread.
++            if (!LevelChunk.isChunkOwnedTicker(p_151526_)) {
++                this.foreignBlockEntityTickers.add(p_151526_);
++            }
 +        }
 +    }
 +
++    /**
++     * Neo: registers {@code chunk} as a chunk that currently holds block-entity tickers.
++     * <p>
++     * The block-entity worker plan visits the registered chunks instead of the level's ticker list, so the
++     * server thread decides per chunk and never walks the tickers. Registration is keyed by the chunk
++     * position and keeps the instance that registered, so a chunk that is replaced by a new instance of the
++     * same position replaces the entry instead of leaving the old instance behind.
++     */
++    public void registerBlockEntityTickerChunk(LevelChunk chunk) {
++        synchronized (this.blockEntityTickerLock) {
++            this.blockEntityTickerChunks.put(chunk.getPos().toLong(), chunk);
++        }
++    }
++
++    /** Neo: unregisters {@code chunk} once it holds no block-entity ticker. */
++    public void unregisterBlockEntityTickerChunk(LevelChunk chunk) {
++        synchronized (this.blockEntityTickerLock) {
++            final long key = chunk.getPos().toLong();
++            if (this.blockEntityTickerChunks.get(key) == chunk) {
++                this.blockEntityTickerChunks.remove(key);
++            }
++        }
++    }
++
++    /**
++     * Neo: copies the chunks that currently hold block-entity tickers into {@code into}, in registration
++     * order.
++     * <p>
++     * The copy is taken under the ticker lock because a region worker can add a ticker to its chunk while the
++     * server thread collects the plan; the plan then visits the chunk on its next tick.
++     */
++    public void collectBlockEntityTickerChunks(List<LevelChunk> into) {
++        synchronized (this.blockEntityTickerLock) {
++            into.addAll(this.blockEntityTickerChunks.values());
++        }
++    }
++
++    /**
++     * Neo: copies the tickers a caller added to the level instead of through a chunk into {@code into}.
++     * <p>
++     * Removed ones are dropped here, so the list cannot grow with tickers that are already gone; they are
++     * skipped by the plan otherwise. A ticker that is still in the level's own ticker list is skipped the
++     * same way: the plan ticks these on the server thread, not on a worker.
++     */
++    public void collectForeignBlockEntityTickers(List<TickingBlockEntity> into) {
++        synchronized (this.blockEntityTickerLock) {
++            final int size = this.foreignBlockEntityTickers.size();
++            this.foreignBlockEntityTickers.removeIf(TickingBlockEntity::isRemoved);
++            if (this.foreignBlockEntityTickers.size() != size) {
++                // A removed foreign ticker is still in the level's own ticker list, which this plan path
++                // does not walk; the prune below drops it in the same tick.
++                this.blockEntityTickerPrunePending = true;
++            }
++            into.addAll(this.foreignBlockEntityTickers);
++        }
++    }
++
++    /** Neo: the next creation sequence of a chunk-owned block-entity ticker of this level. */
++    public long nextBlockEntityTickerSequence() {
++        return this.blockEntityTickerSequence.getAndIncrement();
++    }
++
++    /**
++     * Neo: records that a ticker left its chunk while the block-entity worker plan iterates chunks.
++     * <p>
++     * The plan does not walk the level's ticker list, so it cannot drop the removed ticker the way the
++     * vanilla loop does. The flag makes the plan prune the list once on a tick that removed a ticker, which
++     * bounds the list without a per-ticker pass on every tick.
++     */
++    public void markBlockEntityTickerRemoved() {
++        synchronized (this.blockEntityTickerLock) {
++            this.blockEntityTickerPrunePending = true;
++        }
++    }
++
++    /**
++     * Neo: drops the tickers that left their chunk from the level's own ticker list.
++     * <p>
++     * Only runs on a tick whose plan is chunk-indexed and that removed a ticker since the last prune, so a
++     * level whose tickers do not change pays nothing here. A ticker that is still live is never removed, so
++     * the list keeps exactly the tickers the vanilla loop would see.
++     */
++    private void pruneRemovedBlockEntityTickers() {
++        synchronized (this.blockEntityTickerLock) {
++            if (!this.blockEntityTickerPrunePending) {
++                return;
++            }
++            this.blockEntityTickerPrunePending = false;
++            this.blockEntityTickers.removeIf(TickingBlockEntity::isRemoved);
++        }
++    }
++
++    public void addFreshBlockEntities(java.util.Collection<BlockEntity> beList) {
++        synchronized (this.blockEntityTickerLock) {
++            if (this.tickingBlockEntities) {
++                this.pendingFreshBlockEntities.addAll(beList);
++            } else {
++                this.freshBlockEntities.addAll(beList);
++            }
++        }
+     }
+ 
      protected void tickBlockEntities() {
          ProfilerFiller profilerfiller = this.getProfiler();
          profilerfiller.push("blockEntities");
-+        if (!this.pendingFreshBlockEntities.isEmpty()) {
-+            this.freshBlockEntities.addAll(this.pendingFreshBlockEntities);
-+            this.pendingFreshBlockEntities.clear();
+-        this.tickingBlockEntities = true;
+-        if (!this.pendingBlockEntityTickers.isEmpty()) {
+-            this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
+-            this.pendingBlockEntityTickers.clear();
+-        }
+-
+-        Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
+-        boolean flag = this.tickRateManager().runsNormally();
+-
+-        while (iterator.hasNext()) {
+-            TickingBlockEntity tickingblockentity = iterator.next();
+-            if (tickingblockentity.isRemoved()) {
+-                iterator.remove();
+-            } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
+-                tickingblockentity.tick();
+-            }
+-        }
+-
+-        this.tickingBlockEntities = false;
+-        profilerfiller.pop();
++        // Neo: preparation stays on the server thread. The pending lists may be filled by region workers
++        // from the previous tick, so the merge and the ticking flag are published under the same lock.
++        synchronized (this.blockEntityTickerLock) {
++            if (!this.pendingFreshBlockEntities.isEmpty()) {
++                this.freshBlockEntities.addAll(this.pendingFreshBlockEntities);
++                this.pendingFreshBlockEntities.clear();
++            }
++            this.tickingBlockEntities = true;
++            if (!this.pendingBlockEntityTickers.isEmpty()) {
++                this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
++                this.pendingBlockEntityTickers.clear();
++            }
 +        }
-         this.tickingBlockEntities = true;
-+        if (!this.freshBlockEntities.isEmpty()) {
-+            this.freshBlockEntities.forEach(blockEntity -> {
-+                // Only call onLoad() on BEs which have been fully added to the level, prevents crashes with BEs that
-+                // were discarded due to incompatibility with the BlockState at their position
-+                if (!blockEntity.isRemoved() && blockEntity.hasLevel()) {
-+                    blockEntity.onLoad();
++        try {
++            if (!this.freshBlockEntities.isEmpty()) {
++                final Iterator<BlockEntity> freshIterator = this.freshBlockEntities.iterator();
++                while (freshIterator.hasNext()) {
++                    final BlockEntity blockEntity = freshIterator.next();
++                    try {
++                        // Only call onLoad() on BEs which have been fully added to the level, prevents crashes with BEs that
++                        // were discarded due to incompatibility with the BlockState at their position
++                        if (!blockEntity.isRemoved() && blockEntity.hasLevel()) {
++                            blockEntity.onLoad();
++                        }
++                    } finally {
++                        // Neo: drop the attempted entry even when onLoad() throws, so a failing fresh entity is not
++                        // loaded again on the next tick. Entries that were not attempted yet stay queued.
++                        freshIterator.remove();
++                    }
 +                }
-+            });
-+            this.freshBlockEntities.clear();
++            }
++
++            // Neo: experimental region block-entity tick slice. The plan decides per chunk which of its
++            // tickers tick on their owning region worker, and the workers iterate the chunks and tickers
++            // themselves; a ticker that cannot be leased safely is ticked on the server thread after the
++            // batch instead.
++            final net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickPlan blockEntityTickPlan = this instanceof net.minecraft.server.level.ServerLevel serverLevel
++                    ? net.neoforged.neoforge.server.threading.RegionThreadingHooks.beginBlockEntityTickPlan(serverLevel, serverLevel.getChunkSource()::managedBlockOnMainThread)
++                    : null;
++            if (blockEntityTickPlan == null) {
++                Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
++                boolean flag = this.tickRateManager().runsNormally();
++
++                while (iterator.hasNext()) {
++                    TickingBlockEntity tickingblockentity = iterator.next();
++                    if (tickingblockentity.isRemoved()) {
++                        iterator.remove();
++                    } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
++                        tickingblockentity.tick();
++                    }
++                }
++            } else {
++                // Neo: the plan iterates the chunks that hold tickers, so the server thread does no
++                // per-ticker work. The tickers a chunk no longer holds are pruned from the list here,
++                // because this path does not walk it.
++                blockEntityTickPlan.collect();
++                this.pruneRemovedBlockEntityTickers();
++            }
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockEntityTickPlan(blockEntityTickPlan);
++        } finally {
++            // Neo: finalization must run even when an inline ticker, a fresh onLoad() or the region batch throws.
++            // Resetting the flag and publishing the tickers added while ticking keeps the next tick consistent
++            // instead of leaving them stranded behind a flag that never resets.
++            synchronized (this.blockEntityTickerLock) {
++                this.tickingBlockEntities = false;
++                if (!this.pendingBlockEntityTickers.isEmpty()) {
++                    this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
++                    this.pendingBlockEntityTickers.clear();
++                }
++            }
++            profilerfiller.pop();
 +        }
-         if (!this.pendingBlockEntityTickers.isEmpty()) {
-             this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
-             this.pendingBlockEntityTickers.clear();
-@@ -516,12 +_,19 @@
+     }
  
      public <T extends Entity> void guardEntityTick(Consumer<T> p_46654_, T p_46655_) {
          try {
 +            net.neoforged.neoforge.server.timings.TimeTracker.ENTITY_UPDATE.trackStart(p_46655_);
              p_46654_.accept(p_46655_);
          } catch (Throwable throwable) {
++            // Neo: a refused chunk request of a region worker is a handoff to the server-thread fallback, not
++            // a crash. It is rethrown unwrapped so no crash report is built and the entity is never discarded
++            // by removeErroringEntities; the entity tick group ticks it on the server thread instead.
++            if (net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.isChunkUnavailable(throwable))
++                throw throwable;
              CrashReport crashreport = CrashReport.forThrowable(throwable, "Ticking entity");
              CrashReportCategory crashreportcategory = crashreport.addCategory("Entity being ticked");
              p_46655_.fillCrashReportCategory(crashreportcategory);
@@ -151,6 +408,20 @@
          explosion.explode();
          explosion.finalizeExplosion(p_312145_);
          return explosion;
+@@ -708,8 +_,12 @@
+         if (this.isOutsideBuildHeight(p_46716_)) {
+             return null;
+         } else {
++            // Neo: a caller that is not the server thread and does not own the region of the position is answered
++            // the value the server thread published for a border block entity of another region, instead of null.
++            // The publication is immutable and at most one tick old; a level without one keeps the null answer.
+             return !this.isClientSide && Thread.currentThread() != this.thread
+-                ? null
++                    && !net.neoforged.neoforge.server.threading.RegionThreadingHooks.isRegionTickOwnedByCurrentThread(this, p_46716_)
++                ? net.neoforged.neoforge.server.threading.RegionThreadingHooks.snapshotBlockEntity(this, p_46716_)
+                 : this.getChunkAt(p_46716_).getBlockEntity(p_46716_, LevelChunk.EntityCreationType.IMMEDIATE);
+         }
+     }
 @@ -725,6 +_,7 @@
          if (!this.isOutsideBuildHeight(p_46748_)) {
              this.getChunkAt(p_46748_).removeBlockEntity(p_46748_);
@@ -159,6 +430,39 @@
      }
  
      public boolean isLoaded(BlockPos p_46750_) {
+@@ -796,6 +_,32 @@
+ 
+     @Override
+     public List<Entity> getEntities(@Nullable Entity p_46536_, AABB p_46537_, Predicate<? super Entity> p_46538_) {
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel) {
++            // Neo: a native worker that owns the entity tick lease of a region queries only that region's
++            // physical section bucket. A box that extends outside the lease is clamped and counted, never
++            // silently truncated and never served from another region's storage.
++            final List<Entity> leased = net.neoforged.neoforge.server.threading.RegionThreadingHooks.queryEntitiesInLeasedRegion(serverLevel, p_46536_, p_46537_, p_46538_);
++            if (leased != null) {
++                return leased;
++            }
++        }
++        if (this instanceof net.minecraft.server.level.ServerLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
++            // Neo: production region workers never receive live entity storage or run the caller predicate.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(Entity, AABB, Predicate)",
++                    net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters.Operation.GET_IN_BOX);
++        }
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldHandOffEntityQuery()) {
++            // Neo: a region worker must not iterate the live section storage. The complete query runs on
++            // the server thread, which is waiting for the batch and services this handoff.
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.runEntityQueryOnServerThread(serverLevel,
++                    () -> this.getEntitiesVanilla(p_46536_, p_46537_, p_46538_));
++        }
++        return this.getEntitiesVanilla(p_46536_, p_46537_, p_46538_);
++    }
++
++    private List<Entity> getEntitiesVanilla(@Nullable Entity p_46536_, AABB p_46537_, Predicate<? super Entity> p_46538_) {
+         this.getProfiler().incrementCounter("getEntities");
+         List<Entity> list = Lists.newArrayList();
+         this.getEntities().get(p_46537_, p_151522_ -> {
 @@ -803,6 +_,7 @@
                  list.add(p_151522_);
              }
@@ -179,6 +483,42 @@
          return list;
      }
  
+@@ -828,6 +_,35 @@
+     public <T extends Entity> void getEntities(
+         EntityTypeTest<Entity, T> p_261885_, AABB p_262086_, Predicate<? super T> p_261688_, List<? super T> p_262071_, int p_261858_
+     ) {
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.queryEntitiesInLeasedRegion(
++                        serverLevel, p_261885_, p_262086_, p_261688_, p_262071_, p_261858_)) {
++            // Neo: region-scoped entity query of a leased native worker; the caller's list receives the
++            // entities of the leased region only, with the same predicate/abort semantics.
++            return;
++        }
++        if (this instanceof net.minecraft.server.level.ServerLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldRejectLegacyEntityQuery()) {
++            // Neo: production region workers never receive live entity storage or run the caller predicate.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.rejectLegacyEntityQuery("Level.getEntities(EntityTypeTest, AABB, Predicate, List, int)",
++                    net.neoforged.neoforge.server.threading.region.RegionEntityQueryCounters.Operation.GET_BY_TYPE_IN_BOX);
++        }
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel
++                && net.neoforged.neoforge.server.threading.RegionThreadingHooks.shouldHandOffEntityQuery()) {
++            // Neo: see getEntities(Entity, AABB, Predicate). The query and the consumer that fills the
++            // caller's list run on the server thread; the worker only receives the finished list.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.runEntityQueryOnServerThread(serverLevel, () -> {
++                this.getEntitiesVanilla(p_261885_, p_262086_, p_261688_, p_262071_, p_261858_);
++                return null;
++            });
++            return;
++        }
++        this.getEntitiesVanilla(p_261885_, p_262086_, p_261688_, p_262071_, p_261858_);
++    }
++
++    private <T extends Entity> void getEntitiesVanilla(
++        EntityTypeTest<Entity, T> p_261885_, AABB p_262086_, Predicate<? super T> p_261688_, List<? super T> p_262071_, int p_261858_
++    ) {
+         this.getProfiler().incrementCounter("getEntities");
+         this.getEntities().get(p_261885_, p_262086_, p_261454_ -> {
+             if (p_261688_.test(p_261454_)) {
 @@ -837,6 +_,8 @@
                  }
              }
@@ -204,7 +544,19 @@
      }
  
      @Nullable
-@@ -979,16 +_,15 @@
+@@ -858,6 +_,11 @@
+ 
+     public void blockEntityChanged(BlockPos p_151544_) {
+         if (this.hasChunkAt(p_151544_)) {
++            // Neo: a region worker may not mark a chunk it does not lease; the target region's propagation
++            // pass runs the vanilla mark in the same tick.
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderBlockEntityChange(this, p_151544_)) {
++                return;
++            }
+             this.getChunkAt(p_151544_).setUnsaved(true);
+         }
+     }
+@@ -979,16 +_,20 @@
      public abstract Scoreboard getScoreboard();
  
      public void updateNeighbourForOutputSignal(BlockPos p_46718_, Block p_46719_) {
@@ -212,6 +564,11 @@
 +        for(Direction direction : Direction.values()) {
              BlockPos blockpos = p_46718_.relative(direction);
              if (this.hasChunkAt(blockpos)) {
++                // Neo: one direction of the comparator update can target another region. The target region's
++                // propagation pass runs the exact vanilla body of that direction in the same tick.
++                if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferBorderComparatorUpdate(this, blockpos, p_46718_, p_46719_, direction)) {
++                    continue;
++                }
                  BlockState blockstate = this.getBlockState(blockpos);
 -                if (blockstate.is(Blocks.COMPARATOR)) {
 -                    this.neighborChanged(blockstate, blockpos, p_46719_, p_46718_, false);
@@ -225,6 +582,21 @@
                          this.neighborChanged(blockstate, blockpos, p_46719_, p_46718_, false);
                      }
                  }
+@@ -1056,6 +_,14 @@
+     public abstract RecipeManager getRecipeManager();
+ 
+     public BlockPos getBlockRandomPos(int p_46497_, int p_46498_, int p_46499_, int p_46500_) {
++        // Neo: a region chunk tick selects its positions from the random source of the chunk it ticks instead
++        // of the level-wide randValue sequence, which one worker cannot share with another. The bit layout of
++        // the selected offsets is the vanilla one.
++        final net.minecraft.util.RandomSource chunkTickPositionRandom = net.neoforged.neoforge.server.threading.RegionThreadingHooks.chunkTickPositionRandom();
++        if (chunkTickPositionRandom != null) {
++            int i = chunkTickPositionRandom.nextInt() >> 2;
++            return new BlockPos(p_46497_ + (i & 15), p_46498_ + (i >> 16 & p_46500_), p_46499_ + (i >> 8 & 15));
++        }
+         this.randValue = this.randValue * 3 + 1013904223;
+         int i = this.randValue >> 2;
+         return new BlockPos(p_46497_ + (i & 15), p_46498_ + (i >> 16 & p_46500_), p_46499_ + (i >> 8 & 15));
 @@ -1078,6 +_,18 @@
          return this.biomeManager;
      }
@@ -244,6 +616,16 @@
      public final boolean isDebug() {
          return this.isDebug;
      }
+@@ -1086,7 +_,8 @@
+ 
+     @Override
+     public long nextSubTickCount() {
+-        return this.subTickCount++;
++        // Neo: region workers can schedule ticks concurrently; the sub tick order has to stay unique.
++        return this.subTickCount.getAndIncrement();
+     }
+ 
+     @Override
 @@ -1118,5 +_,38 @@
          public String getSerializedName() {
              return this.id;

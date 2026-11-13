@@ -13,12 +13,24 @@ import net.minecraft.server.level.ServerLevel;
  */
 public record RegionCoordinate(ServerLevel level, int regionX, int regionZ) {
 
-    public static final int DEFAULT_REGION_CHUNK_SHIFT = 4;
+    public static final int DEFAULT_REGION_CHUNK_SHIFT = RegionLayout.DYNAMIC_REGION_CHUNK_SHIFT;
+    /**
+     * {@return the legacy {@link RegionPolicy#DYNAMIC} region containing {@code pos}
+     *
+     * @deprecated use the {@link RegionLayout} of the active engine instead
+     */
+    @Deprecated
     public static RegionCoordinate fromBlock(ServerLevel level, BlockPos pos) {
-        return fromChunk(level, pos.getX() >> 4, pos.getZ() >> 4);
+        return RegionLayout.DYNAMIC.regionAt(level, pos);
     }
 
+    /**
+     * {@return the legacy {@link RegionPolicy#DYNAMIC} region containing the chunk
+     *
+     * @deprecated use the {@link RegionLayout} of the active engine instead
+     */
+    @Deprecated
     public static RegionCoordinate fromChunk(ServerLevel level, int chunkX, int chunkZ) {
-        return new RegionCoordinate(level, chunkX >> DEFAULT_REGION_CHUNK_SHIFT, chunkZ >> DEFAULT_REGION_CHUNK_SHIFT);
+        return RegionLayout.DYNAMIC.regionAt(level, chunkX, chunkZ);
     }
 }

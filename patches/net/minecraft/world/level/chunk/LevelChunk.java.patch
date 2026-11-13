@@ -1,5 +1,31 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -73,6 +_,25 @@
+         }
+     };
+     private final Map<BlockPos, LevelChunk.RebindableTickingBlockEntityWrapper> tickersInLevel = Maps.newHashMap();
++    // Neo: cached block-entity worker admission of this chunk; exactly one snapshot per loaded chunk, released
++    // with the chunk. See net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache.
++    private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache blockEntityTickAdmissionCache;
++    /**
++     * Neo: revision of the block-entity ticker set of this chunk. Every add, remove and rebind of a ticker
++     * bumps it, so a cached admission snapshot of the chunk is never reused across a change of its ticker set.
++     * It is volatile because a worker revalidates the snapshot it was handed against it.
++     */
++    private volatile long blockEntityTickerRevision;
++    /**
++     * Neo: monotonic version of the mutable content of this chunk. Every block state write, every heightmap
++     * update that write performs and every block entity add or removal bumps it once, at the end of the
++     * mutation, so a reader that observes version {@code v} saw every mutation that completed before its read
++     * and the border fixpoint can tell that the chunk changed under a read that observed an older version.
++     * The bump is one volatile store on an object the mutation already dirties, and it is the only cost of the
++     * version when nothing reads it.
++     */
++    private volatile long chunkVersion;
++    private int chunkMutationDepth;
+     private boolean loaded;
+     final Level level;
+     @Nullable
 @@ -139,6 +_,7 @@
          this.setAllStarts(p_196851_.getAllStarts());
          this.setAllReferences(p_196851_.getAllReferences());
@@ -8,18 +34,233 @@
          for (Entry<Heightmap.Types, Heightmap> entry : p_196851_.getHeightmaps()) {
              if (ChunkStatus.FULL.heightmapsAfter().contains(entry.getKey())) {
                  this.setHeightmap(entry.getKey(), entry.getValue().getRawData());
-@@ -278,7 +_,7 @@
-                 if (!levelchunksection.getBlockState(j, k, l).is(block)) {
+@@ -175,6 +_,17 @@
+ 
+     @Override
+     public BlockState getBlockState(BlockPos p_62923_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            // Neo: the read is of another region's chunk, where a deferred border block write of this region is
++            // applied at the barrier. The read returns the state before the write and the count makes that
++            // documented read-after-write approximation observable.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.observeReadAfterDeferredBlockWrite(p_62923_);
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.readStableForeignChunk(this, () -> this.getBlockStateUnchecked(p_62923_));
++        }
++        return this.getBlockStateUnchecked(p_62923_);
++    }
++
++    private BlockState getBlockStateUnchecked(BlockPos p_62923_) {
+         int i = p_62923_.getX();
+         int j = p_62923_.getY();
+         int k = p_62923_.getZ();
+@@ -215,6 +_,16 @@
+     }
+ 
+     public FluidState getFluidState(int p_62815_, int p_62816_, int p_62817_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            // Neo: see getBlockState; a fluid read of another region's chunk after a deferred border block write
++            // of this region observes the state before the write and is counted.
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.observeReadAfterDeferredBlockWrite(p_62815_, p_62816_, p_62817_);
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.readStableForeignChunk(this, () -> this.getFluidStateUnchecked(p_62815_, p_62816_, p_62817_));
++        }
++        return this.getFluidStateUnchecked(p_62815_, p_62816_, p_62817_);
++    }
++
++    private FluidState getFluidStateUnchecked(int p_62815_, int p_62816_, int p_62817_) {
+         try {
+             int i = this.getSectionIndex(p_62816_);
+             if (i >= 0 && i < this.sections.length) {
+@@ -236,74 +_,94 @@
+     @Nullable
+     @Override
+     public BlockState setBlockState(BlockPos p_62865_, BlockState p_62866_, boolean p_62867_) {
+-        int i = p_62865_.getY();
+-        LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
+-        boolean flag = levelchunksection.hasOnlyAir();
+-        if (flag && p_62866_.isAir()) {
+-            return null;
+-        } else {
+-            int j = p_62865_.getX() & 15;
+-            int k = i & 15;
+-            int l = p_62865_.getZ() & 15;
+-            BlockState blockstate = levelchunksection.setBlockState(j, k, l, p_62866_);
+-            if (blockstate == p_62866_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return null;
++        }
++        if (this.getBlockState(p_62865_) == p_62866_) {
++            return null;
++        }
++        this.beginChunkMutation();
++        try {
++            int i = p_62865_.getY();
++            LevelChunkSection levelchunksection = this.getSection(this.getSectionIndex(i));
++            boolean flag = levelchunksection.hasOnlyAir();
++            if (flag && p_62866_.isAir()) {
+                 return null;
+             } else {
+-                Block block = p_62866_.getBlock();
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(j, i, l, p_62866_);
+-                this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
+-                boolean flag1 = levelchunksection.hasOnlyAir();
+-                if (flag != flag1) {
+-                    this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
+-                }
+-
+-                if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
+-                    ProfilerFiller profilerfiller = this.level.getProfiler();
+-                    profilerfiller.push("updateSkyLightSources");
+-                    this.skyLightSources.update(this, j, i, l);
+-                    profilerfiller.popPush("queueCheckLight");
+-                    this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
+-                    profilerfiller.pop();
+-                }
+-
+-                boolean flag2 = blockstate.hasBlockEntity();
+-                if (!this.level.isClientSide) {
+-                    blockstate.onRemove(this.level, p_62865_, p_62866_, p_62867_);
+-                } else if (!blockstate.is(block) && flag2) {
+-                    this.removeBlockEntity(p_62865_);
+-                }
+-
+-                if (!levelchunksection.getBlockState(j, k, l).is(block)) {
++                int j = p_62865_.getX() & 15;
++                int k = i & 15;
++                int l = p_62865_.getZ() & 15;
++                BlockState blockstate = levelchunksection.setBlockState(j, k, l, p_62866_);
++                if (blockstate == p_62866_) {
                      return null;
                  } else {
--                    if (!this.level.isClientSide) {
-+                    if (!this.level.isClientSide && !this.level.captureBlockSnapshots) {
-                         p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
-                     }
++                    Block block = p_62866_.getBlock();
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(j, i, l, p_62866_);
++                    this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(j, i, l, p_62866_);
++                    boolean flag1 = levelchunksection.hasOnlyAir();
++                    if (flag != flag1) {
++                        // Neo: a region worker may not drive the light engine of the level itself. It records the
++                        // section status change and the server thread applies it at the batch barrier.
++                        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightSectionStatus(p_62865_, flag1)) {
++                            this.level.getChunkSource().getLightEngine().updateSectionStatus(p_62865_, flag1);
++                        }
++                    }
++
++                    if (LightEngine.hasDifferentLightProperties(this, p_62865_, blockstate, p_62866_)) {
++                        ProfilerFiller profilerfiller = this.level.getProfiler();
++                        profilerfiller.push("updateSkyLightSources");
++                        this.skyLightSources.update(this, j, i, l);
++                        profilerfiller.popPush("queueCheckLight");
++                        // Neo: same for the recheck of one position; the sky light sources above are per chunk and stay
++                        // on the worker.
++                        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferLightCheck(p_62865_)) {
++                            this.level.getChunkSource().getLightEngine().checkBlock(p_62865_);
++                        }
++                        profilerfiller.pop();
++                    }
++
++                    boolean flag2 = blockstate.hasBlockEntity();
+                     if (!this.level.isClientSide) {
+-                        p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
+-                    }
+-
+-                    if (p_62866_.hasBlockEntity()) {
+-                        BlockEntity blockentity = this.getBlockEntity(p_62865_, LevelChunk.EntityCreationType.CHECK);
+-                        if (blockentity != null && !blockentity.isValidBlockState(p_62866_)) {
+-                            this.removeBlockEntity(p_62865_);
+-                            blockentity = null;
+-                        }
+-
+-                        if (blockentity == null) {
+-                            blockentity = ((EntityBlock)block).newBlockEntity(p_62865_, p_62866_);
+-                            if (blockentity != null) {
+-                                this.addAndRegisterBlockEntity(blockentity);
+-                            }
+-                        } else {
+-                            blockentity.setBlockState(p_62866_);
+-                            this.updateBlockEntityTicker(blockentity);
+-                        }
+-                    }
+-
+-                    this.unsaved = true;
+-                    return blockstate;
++                        blockstate.onRemove(this.level, p_62865_, p_62866_, p_62867_);
++                    } else if (!blockstate.is(block) && flag2) {
++                        this.removeBlockEntity(p_62865_);
++                    }
++
++                    if (!levelchunksection.getBlockState(j, k, l).is(block)) {
++                        return null;
++                    } else {
++                        if (!this.level.isClientSide && !this.level.captureBlockSnapshots) {
++                            p_62866_.onPlace(this.level, p_62865_, blockstate, p_62867_);
++                        }
++
++                        if (p_62866_.hasBlockEntity()) {
++                            BlockEntity blockentity = this.getBlockEntity(p_62865_, LevelChunk.EntityCreationType.CHECK);
++                            if (blockentity != null && !blockentity.isValidBlockState(p_62866_)) {
++                                this.removeBlockEntity(p_62865_);
++                                blockentity = null;
++                            }
++
++                            if (blockentity == null) {
++                                blockentity = ((EntityBlock)block).newBlockEntity(p_62865_, p_62866_);
++                                if (blockentity != null) {
++                                    this.addAndRegisterBlockEntity(blockentity);
++                                }
++                            } else {
++                                blockentity.setBlockState(p_62866_);
++                                this.updateBlockEntityTicker(blockentity);
++                            }
++                        }
++
++                        this.unsaved = true;
++                        return blockstate;
++                    }
+                 }
+             }
++
++        } finally {
++            this.endChunkMutation();
+         }
+     }
  
-@@ -327,6 +_,10 @@
+@@ -324,9 +_,43 @@
+         return this.getBlockEntity(p_62912_, LevelChunk.EntityCreationType.CHECK);
+     }
+ 
++    /**
++     * Neo: answers a block-entity lookup issued by a region worker for a chunk of another region.
++     * <p>
++     * It lives in its own method so that {@link #getBlockEntity(BlockPos, LevelChunk.EntityCreationType)}
++     * keeps the instruction neighbourhood vanilla has: mods inject there with instruction-level offsets, and a
++     * foreign branch inlined into that method moved the anchors they rely on. It never promotes pending NBT,
++     * creates a block entity, or removes a stale entry, because a foreign worker must not mutate this chunk.
++     * <p>
++     * A readable live block entity is returned as it always was. A read that the gate refuses is answered with
++     * the value the server thread published for that border block entity at the head of the tick - an immutable
++     * read-only stand-in, never the live block entity of the owning region - or with {@code null} when the
++     * position is not a published border block entity or the level has no publication.
++     */
++    @Nullable
++    private BlockEntity foreignBlockEntityOrNull(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
++        if (!net.neoforged.neoforge.server.threading.RegionThreadingHooks.isForeignRegionBlockEntityReadable(this.level, p_62868_)) {
++            return net.neoforged.neoforge.server.threading.RegionThreadingHooks.snapshotBlockEntity(this.level, p_62868_);
++        }
++        BlockEntity existing = this.blockEntities.get(p_62868_);
++        if ((existing != null && existing.isRemoved()) || this.pendingBlockEntities.containsKey(p_62868_)
++                || (existing == null && p_62869_ == LevelChunk.EntityCreationType.IMMEDIATE)) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this);
++            return null;
++        }
++        return existing;
++    }
++
      @Nullable
      public BlockEntity getBlockEntity(BlockPos p_62868_, LevelChunk.EntityCreationType p_62869_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.requiresStableForeignRead(this)) {
++            return this.foreignBlockEntityOrNull(p_62868_, p_62869_);
++        }
          BlockEntity blockentity = this.blockEntities.get(p_62868_);
 +        if (blockentity != null && blockentity.isRemoved()) {
 +            blockEntities.remove(p_62868_);
@@ -28,7 +269,7 @@
          if (blockentity == null) {
              CompoundTag compoundtag = this.pendingBlockEntities.remove(p_62868_);
              if (compoundtag != null) {
-@@ -344,9 +_,6 @@
+@@ -344,15 +_,15 @@
                      this.addAndRegisterBlockEntity(blockentity);
                  }
              }
@@ -38,6 +279,15 @@
          }
  
          return blockentity;
+     }
+ 
+     public void addAndRegisterBlockEntity(BlockEntity p_156391_) {
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
+         this.setBlockEntity(p_156391_);
+         if (this.isInLevel()) {
+             if (this.level instanceof ServerLevel serverlevel) {
 @@ -360,6 +_,7 @@
              }
  
@@ -46,14 +296,99 @@
          }
      }
  
-@@ -403,6 +_,7 @@
-             BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
-             if (blockentity != null && blockentity != p_156374_) {
-                 blockentity.setRemoved();
-+                auxLightManager.removeLightAt(blockpos);
-             }
+@@ -368,42 +_,66 @@
+     }
+ 
+     boolean isTicking(BlockPos p_156411_) {
++        return this.isTicking(p_156411_, null);
++    }
++
++    private boolean isTicking(BlockPos p_156411_, @Nullable TickingBlockEntity ticker) {
+         if (!this.level.getWorldBorder().isWithinBounds(p_156411_)) {
+             return false;
+         } else {
+             return !(this.level instanceof ServerLevel serverlevel)
+                 ? true
+-                : this.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING) && serverlevel.areEntitiesLoaded(ChunkPos.asLong(p_156411_));
++                : this.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING)
++                    // Neo: the entity section status is server-owned storage and a native worker read of it
++                    // is rejected. The server thread evaluated the entity-load eligibility of this exact
++                    // ticker before it admitted the ticker to the worker batch, so only that admitted
++                    // ticker in its owned region skips the read; every other worker caller keeps it.
++                    && (net.neoforged.neoforge.server.threading.RegionThreadingHooks.isAdmittedBlockEntityTick(serverlevel, ticker, p_156411_)
++                        || serverlevel.areEntitiesLoaded(ChunkPos.asLong(p_156411_)));
          }
      }
+ 
+     @Override
+     public void setBlockEntity(BlockEntity p_156374_) {
+-        BlockPos blockpos = p_156374_.getBlockPos();
+-        BlockState blockstate = this.getBlockState(blockpos);
+-        if (!blockstate.hasBlockEntity()) {
+-            LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
+-        } else {
+-            BlockState blockstate1 = p_156374_.getBlockState();
+-            if (blockstate != blockstate1) {
+-                if (!p_156374_.getType().isValid(blockstate)) {
+-                    LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
+-                    return;
+-                }
+-
+-                if (blockstate.getBlock() != blockstate1.getBlock()) {
+-                    LOGGER.warn("Block state mismatch on block entity {} in position {}, {} != {}, updating", p_156374_, blockpos, blockstate, blockstate1);
+-                }
+-
+-                p_156374_.setBlockState(blockstate);
+-            }
+-
+-            p_156374_.setLevel(this.level);
+-            p_156374_.clearRemoved();
+-            BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
+-            if (blockentity != null && blockentity != p_156374_) {
+-                blockentity.setRemoved();
+-            }
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            BlockPos blockpos = p_156374_.getBlockPos();
++            BlockState blockstate = this.getBlockState(blockpos);
++            if (!blockstate.hasBlockEntity()) {
++                LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
++            } else {
++                BlockState blockstate1 = p_156374_.getBlockState();
++                if (blockstate != blockstate1) {
++                    if (!p_156374_.getType().isValid(blockstate)) {
++                        LOGGER.warn("Trying to set block entity {} at position {}, but state {} does not allow it", p_156374_, blockpos, blockstate);
++                        return;
++                    }
++
++                    if (blockstate.getBlock() != blockstate1.getBlock()) {
++                        LOGGER.warn("Block state mismatch on block entity {} in position {}, {} != {}, updating", p_156374_, blockpos, blockstate, blockstate1);
++                    }
++
++                    p_156374_.setBlockState(blockstate);
++                }
++
++                p_156374_.setLevel(this.level);
++                p_156374_.clearRemoved();
++                // Neo: the light of a replaced block entity is cleared before the map write, so the instructions
++                // after Map.put stay exactly the ones vanilla has (mods inject there with instruction offsets).
++                BlockEntity previousBlockEntity = this.blockEntities.get(blockpos);
++                if (previousBlockEntity != null && previousBlockEntity != p_156374_) {
++                    auxLightManager.removeLightAt(blockpos);
++                }
++                BlockEntity blockentity = this.blockEntities.put(blockpos.immutable(), p_156374_);
++                if (blockentity != null && blockentity != p_156374_) {
++                    blockentity.setRemoved();
++                }
++            }
++        } finally {
++            this.endChunkMutation();
+         }
+     }
+ 
 @@ -412,9 +_,14 @@
      public CompoundTag getBlockEntityNbtForSaving(BlockPos p_62932_, HolderLookup.Provider p_323699_) {
          BlockEntity blockentity = this.getBlockEntity(p_62932_);
@@ -69,13 +404,63 @@
          } else {
              CompoundTag compoundtag = this.pendingBlockEntities.get(p_62932_);
              if (compoundtag != null) {
-@@ -436,6 +_,7 @@
-                 }
+@@ -428,18 +_,31 @@
  
-                 blockentity.setRemoved();
-+                auxLightManager.removeLightAt(p_62919_);
+     @Override
+     public void removeBlockEntity(BlockPos p_62919_) {
+-        if (this.isInLevel()) {
+-            BlockEntity blockentity = this.blockEntities.remove(p_62919_);
+-            if (blockentity != null) {
+-                if (this.level instanceof ServerLevel serverlevel) {
+-                    this.removeGameEventListener(blockentity, serverlevel);
+-                }
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            if (this.isInLevel()) {
++                BlockEntity blockentity = this.blockEntities.remove(p_62919_);
++                if (blockentity != null) {
++                    if (this.level instanceof ServerLevel serverlevel) {
++                        this.removeGameEventListener(blockentity, serverlevel);
++                    }
+ 
+-                blockentity.setRemoved();
++                    blockentity.setRemoved();
++                    auxLightManager.removeLightAt(p_62919_);
++                    }
              }
++
++            // Neo: the ticker removal stays inside the mutation scope on purpose. It bumps the chunk's
++            // ticker revision and rebinds the removed wrapper, so the chunk mutation covers both, and a
++            // worker cannot leave a stale ticker behind after the block entity is gone.
++            this.removeBlockEntityTicker(p_62919_);
++
++        } finally {
++            this.endChunkMutation();
          }
+-
+-        this.removeBlockEntityTicker(p_62919_);
+     }
+ 
+     private <T extends BlockEntity> void removeGameEventListener(T p_223413_, ServerLevel p_223414_) {
+@@ -459,9 +_,16 @@
+     }
+ 
+     private void removeBlockEntityTicker(BlockPos p_156413_) {
++        ++this.blockEntityTickerRevision; // Neo: a ticker of this chunk is gone, so its cached admission is stale
+         LevelChunk.RebindableTickingBlockEntityWrapper levelchunk$rebindabletickingblockentitywrapper = this.tickersInLevel.remove(p_156413_);
+         if (levelchunk$rebindabletickingblockentitywrapper != null) {
+             levelchunk$rebindabletickingblockentitywrapper.rebind(NULL_TICKER);
++            // Neo: the removed wrapper stays in the level's own ticker list until it is pruned, and a chunk
++            // without tickers leaves the plan's chunk index.
++            this.level.markBlockEntityTickerRemoved();
++        }
++        if (this.tickersInLevel.isEmpty()) {
++            this.level.unregisterBlockEntityTickerChunk(this);
+         }
+     }
  
 @@ -496,7 +_,7 @@
          p_187974_.accept((p_338077_, p_338078_, p_338079_) -> {
@@ -86,15 +471,35 @@
              }
          });
      }
-@@ -604,6 +_,7 @@
+@@ -604,13 +_,31 @@
      }
  
      public void clearAllBlockEntities() {
-+        this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
-         this.blockEntities.values().forEach(BlockEntity::setRemoved);
-         this.blockEntities.clear();
-         this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
-@@ -611,6 +_,7 @@
+-        this.blockEntities.values().forEach(BlockEntity::setRemoved);
+-        this.blockEntities.clear();
+-        this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
+-        this.tickersInLevel.clear();
++        if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.refuseForeignChunkMutation(this)) {
++            return;
++        }
++        this.beginChunkMutation();
++        try {
++            ++this.blockEntityTickerRevision; // Neo: every ticker of this chunk is gone
++            // Neo: the chunk loses its block entities on unload or replacement, so its admission snapshot goes
++            // with them instead of being kept by a chunk that no longer ticks anything, and it leaves the
++            // plan's chunk index.
++            this.setBlockEntityTickAdmissionCache(null);
++            this.level.unregisterBlockEntityTickerChunk(this);
++            this.level.markBlockEntityTickerRemoved();
++            this.blockEntities.values().forEach(BlockEntity::onChunkUnloaded);
++            this.blockEntities.values().forEach(BlockEntity::setRemoved);
++            this.blockEntities.clear();
++            this.tickersInLevel.values().forEach(p_187966_ -> p_187966_.rebind(NULL_TICKER));
++            this.tickersInLevel.clear();
++
++        } finally {
++            this.endChunkMutation();
++        }
      }
  
      public void registerAllBlockEntitiesAfterLevelLoad() {
@@ -102,7 +507,26 @@
          this.blockEntities.values().forEach(p_187988_ -> {
              if (this.level instanceof ServerLevel serverlevel) {
                  this.addGameEventListener(p_187988_, serverlevel);
-@@ -662,6 +_,19 @@
+@@ -631,6 +_,7 @@
+     }
+ 
+     private <T extends BlockEntity> void updateBlockEntityTicker(T p_156407_) {
++        ++this.blockEntityTickerRevision; // Neo: a ticker of this chunk is added or rebound
+         BlockState blockstate = p_156407_.getBlockState();
+         BlockEntityTicker<T> blockentityticker = blockstate.getTicker(this.level, (BlockEntityType<T>)p_156407_.getType());
+         if (blockentityticker == null) {
+@@ -656,33 +_,175 @@
+                     }
+                 );
+         }
++        // Neo: a chunk that holds tickers joins the level's chunk index, so the block-entity worker plan can
++        // visit chunks instead of tickers. A chunk outside the level registers no ticker at all.
++        if (!this.tickersInLevel.isEmpty()) {
++            this.level.registerBlockEntityTickerChunk(this);
++        }
+     }
+ 
+     private <T extends BlockEntity> TickingBlockEntity createTicker(T p_156376_, BlockEntityTicker<T> p_156377_) {
          return new LevelChunk.BoundTickingBlockEntity<>(p_156376_, p_156377_);
      }
  
@@ -119,11 +543,141 @@
 +        net.neoforged.neoforge.attachment.AttachmentSync.syncChunkUpdate(this, getAttachmentHolder(), type);
 +    }
 +
++    // Capture the exact wrapper/delegate relationship on the server thread, including a rebind version.
++    public static net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBlockEntityTickBinding(TickingBlockEntity ticker, ServerLevel level) {
++        if (ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper wrapper) {
++            return wrapper.captureBinding(level);
++        }
++        if (ticker instanceof LevelChunk.BoundTickingBlockEntity<?> bound) {
++            return bound.captureBinding(level);
++        }
++        return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(ticker, () -> true);
++    }
++
++    /**
++     * Neo: the cached block-entity worker admission snapshot of this chunk, or {@code null} when none was
++     * built yet.
++     */
++    @Nullable
++    public net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache blockEntityTickAdmissionCache() {
++        return this.blockEntityTickAdmissionCache;
++    }
++
++    /**
++     * Neo: replaces the cached admission snapshot of this chunk. The snapshot it replaces is released here, so
++     * a chunk never holds more than one and the memory bound of the snapshot set stays observable.
++     */
++    public void setBlockEntityTickAdmissionCache(@Nullable net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache cache) {
++        final net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickChunkCache previous = this.blockEntityTickAdmissionCache;
++        this.blockEntityTickAdmissionCache = cache;
++        if (previous != null && previous != cache) {
++            previous.release();
++        }
++    }
++
++    /**
++     * Neo: the revision of the block-entity ticker set of this chunk. A cached admission snapshot is only
++     * reused while this value is unchanged.
++     */
++    public long blockEntityTickerRevision() {
++        return this.blockEntityTickerRevision;
++    }
++
++    /**
++     * Neo: a seqlock sequence: odd throughout block state, heightmap and block-entity membership mutations,
++     * even after completion. Nested writes keep the outer mutation odd. Mutable block-entity internals are
++     * not covered; foreign block-entity access still requires a quiescent owner.
++     * <p>
++     * A region worker that reads a chunk of another region records this value. The border fixpoint compares it
++     * after the read and re-runs the propagation of the reader if the chunk changed under the read, so a torn
++     * or stale cross-region read is repaired in the same tick without a lock on the read path and without a
++     * copy of the chunk.
++     */
++    public long chunkVersion() {
++        return this.chunkVersion;
++    }
++
++    /** Neo: paired by mutation entry points, including nested heightmap and block-entity writes. */
++    public void beginChunkMutation() {
++        if (this.chunkMutationDepth++ == 0) {
++            ++this.chunkVersion;
++            java.lang.invoke.VarHandle.storeStoreFence();
++        }
++    }
++
++    public void endChunkMutation() {
++        if (--this.chunkMutationDepth == 0) {
++            ++this.chunkVersion;
++        }
++    }
++
++    /** Neo: whether this chunk is currently loaded in its level. */
++    public boolean isLoaded() {
++        return this.loaded;
++    }
++
++    /**
++     * Neo: bumps the ticker revision of this chunk without changing its tickers.
++     * <p>
++     * The stale-snapshot test uses it to put the chunk into the state a chunk that changed its ticker set
++     * between the plan and the worker tick is in, so the worker has to refuse the snapshot the plan handed
++     * over and tick the chunk on the server thread instead.
++     */
++    @org.jetbrains.annotations.VisibleForTesting
++    public void bumpBlockEntityTickerRevision() {
++        ++this.blockEntityTickerRevision;
++    }
++
++    /**
++     * Neo: the block-entity tickers this chunk currently holds, in no particular order.
++     * <p>
++     * The chunk's admission snapshot is built from this view, so the block-entity worker plan can decide for
++     * a whole chunk without walking the level's ticker list. Only the server thread reads it, and only while
++     * no worker ticks.
++     */
++    public java.util.Collection<TickingBlockEntity> blockEntityTickers() {
++        return java.util.Collections.unmodifiableCollection(this.tickersInLevel.values());
++    }
++
++    /** Neo: whether {@code ticker} is owned by a chunk instead of added to the level directly. */
++    public static boolean isChunkOwnedTicker(TickingBlockEntity ticker) {
++        return ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper;
++    }
++
++    /**
++     * Neo: the creation sequence of {@code ticker}, which orders it exactly like the level's own ticker list
++     * orders the tickers it was appended to.
++     *
++     * @return the sequence of a chunk-owned ticker wrapper, or {@link Long#MAX_VALUE} for a ticker the level
++     *         owns itself
++     */
++    public static long blockEntityTickerSequence(TickingBlockEntity ticker) {
++        return ticker instanceof LevelChunk.RebindableTickingBlockEntityWrapper wrapper ? wrapper.tickerSequence() : Long.MAX_VALUE;
++    }
++
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {
          private final T blockEntity;
          private final BlockEntityTicker<T> ticker;
-@@ -679,10 +_,15 @@
-                 if (LevelChunk.this.isTicking(blockpos)) {
+         private boolean loggedInvalidBlockState;
++        /** Cached {@link #getType()}; the type of a block entity instance never changes. */
++        private String typeName;
+ 
+         BoundTickingBlockEntity(T p_156433_, BlockEntityTicker<T> p_156434_) {
+             this.blockEntity = p_156433_;
+             this.ticker = p_156434_;
+         }
+ 
++        private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBinding(ServerLevel level) {
++            return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(
++                this, () -> LevelChunk.this.level == level && this.blockEntity.getLevel() == level);
++        }
++
+         @Override
+         public void tick() {
+             if (!this.blockEntity.isRemoved() && this.blockEntity.hasLevel()) {
+                 BlockPos blockpos = this.blockEntity.getBlockPos();
+-                if (LevelChunk.this.isTicking(blockpos)) {
++                if (LevelChunk.this.isTicking(blockpos, this)) {
                      try {
                          ProfilerFiller profilerfiller = LevelChunk.this.level.getProfiler();
 +                        net.neoforged.neoforge.server.timings.TimeTracker.BLOCK_ENTITY_UPDATE.trackStart(blockEntity);
@@ -139,7 +693,15 @@
                              this.loggedInvalidBlockState = false;
                          } else if (!this.loggedInvalidBlockState) {
                              this.loggedInvalidBlockState = true;
-@@ -700,7 +_,15 @@
+@@ -697,10 +_,23 @@
+ 
+                         profilerfiller.pop();
+                     } catch (Throwable throwable) {
++                        // A bounded read refusal abandons this tick without replay or removal, regardless
++                        // of the removeErroringBlockEntities configuration.
++                        if (net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.mustNotReplay(throwable)) {
++                            throw throwable;
++                        }
                          CrashReport crashreport = CrashReport.forThrowable(throwable, "Ticking block entity");
                          CrashReportCategory crashreportcategory = crashreport.addCategory("Block entity being ticked");
                          this.blockEntity.fillCrashReportCategory(crashreportcategory);
@@ -155,3 +717,52 @@
                      }
                  }
              }
+@@ -718,7 +_,17 @@
+ 
+         @Override
+         public String getType() {
+-            return BlockEntityType.getKey(this.blockEntity.getType()).toString();
++            // The registry key of a block entity type is immutable, so the name is derived once instead of on
++            // every call. The per-tick staleness check of the region block-entity tick scope compares the
++            // captured type name twice per ticker, and deriving it there took the registry lookup and
++            // allocated the name String on every block entity tick. Racing derivations compute the same
++            // content, and the check compares content, not identity.
++            String name = this.typeName;
++            if (name == null) {
++                name = BlockEntityType.getKey(this.blockEntity.getType()).toString();
++                this.typeName = name;
++            }
++            return name;
+         }
+ 
+         @Override
+@@ -740,13 +_,29 @@
+ 
+     class RebindableTickingBlockEntityWrapper implements TickingBlockEntity {
+         private TickingBlockEntity ticker;
++        private long bindingVersion;
++        /** Neo: creation order of this wrapper, so the plan can order a chunk's tickers like the level does. */
++        private final long tickerSequence;
+ 
+         RebindableTickingBlockEntityWrapper(TickingBlockEntity p_156447_) {
+             this.ticker = p_156447_;
++            this.tickerSequence = LevelChunk.this.level.nextBlockEntityTickerSequence();
++        }
++
++        long tickerSequence() {
++            return this.tickerSequence;
+         }
+ 
+         void rebind(TickingBlockEntity p_156450_) {
+             this.ticker = p_156450_;
++            ++this.bindingVersion;
++        }
++
++        private net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding captureBinding(ServerLevel level) {
++            final long version = this.bindingVersion;
++            final var binding = captureBlockEntityTickBinding(this.ticker, level);
++            return new net.neoforged.neoforge.server.threading.region.RegionBlockEntityTickAdmission.Binding(
++                binding.delegate(), () -> LevelChunk.this.level == level && this.bindingVersion == version && binding.isCurrent().getAsBoolean());
+         }
+ 
+         @Override

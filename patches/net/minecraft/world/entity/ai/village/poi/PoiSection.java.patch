@@ -1,0 +1,20 @@
+--- a/net/minecraft/world/entity/ai/village/poi/PoiSection.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiSection.java
+@@ -128,6 +_,17 @@
+         return Optional.ofNullable(this.records.get(SectionPos.sectionRelativePos(p_148685_)));
+     }
+ 
++    /**
++     * Neo: resolves the live record this section holds at {@code pos}.
++     * <p>
++     * The regionized POI storage acquires and releases tickets on the record the owning region actually holds,
++     * so it has to tell a record a query returned from a published view apart from the live one: a published
++     * record that was removed or replaced since the publish must not be booked.
++     */
++    public Optional<PoiRecord> getRecord(BlockPos p_pos) {
++        return this.getPoiRecord(p_pos);
++    }
++
+     public void refresh(Consumer<BiConsumer<BlockPos, Holder<PoiType>>> p_27303_) {
+         if (!this.isValid) {
+             Short2ObjectMap<PoiRecord> short2objectmap = new Short2ObjectOpenHashMap<>(this.records);

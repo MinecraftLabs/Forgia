@@ -23,7 +23,8 @@ final class RegionTickTimer {
             throw new IllegalArgumentException("intervalNanos must be > 0");
         }
         this.intervalNanos = intervalNanos;
-        this.schedule = new RegionSchedule(firstTickNanos);
+        // The first tick is due immediately; subsequent ticks are spaced by the interval.
+        this.schedule = new RegionSchedule(firstTickNanos - intervalNanos);
     }
 
     long nextDeadline() {
