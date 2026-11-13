@@ -1,0 +1,84 @@
+--- a/net/minecraft/world/level/gameevent/GameEventDispatcher.java
++++ b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+@@ -19,6 +_,7 @@
+     }
+ 
+     public void post(Holder<GameEvent> p_316151_, Vec3 p_250613_, GameEvent.Context p_251777_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.recordGameEventPost(this.level);
+         int i = p_316151_.value().notificationRadius();
+         BlockPos blockpos = BlockPos.containing(p_250613_);
+         int j = SectionPos.blockToSectionCoord(blockpos.getX() - i);
+@@ -39,12 +_,22 @@
+ 
+         for (int l1 = j; l1 <= i1; l1++) {
+             for (int i2 = l; i2 <= k1; i2++) {
+-                ChunkAccess chunkaccess = this.level.getChunkSource().getChunkNow(l1, i2);
+-                if (chunkaccess != null) {
+-                    for (int j2 = k; j2 <= j1; j2++) {
+-                        flag |= chunkaccess.getListenerRegistry(j2)
+-                            .visitInRangeListeners(p_316151_, p_250613_, p_251777_, gameeventlistenerregistry$listenervisitor);
+-                    }
++                // Neo: a column of another region is captured for the region that owns it instead of being
++                // visited here, before the column is read at all. The listener registry of a foreign section is
++                // state of the region that owns it, and a listener writes its own block entity, so neither the
++                // read nor the write may happen on this worker. The owning region replays the column in the same
++                // tick, in recording order.
++                if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.captureCrossRegionGameEvent(this.level, p_316151_, p_250613_, p_251777_, l1, i2, k, j1)) {
++                    continue;
++                }
++                ChunkAccess chunkaccess = net.neoforged.neoforge.server.threading.RegionThreadingHooks.gameEventChunk(this.level, l1, i2);
++                if (chunkaccess == null) {
++                    // A column without a loaded chunk has no listener to visit, exactly like vanilla.
++                    continue;
++                }
++                for (int j2 = k; j2 <= j1; j2++) {
++                    flag |= chunkaccess.getListenerRegistry(j2)
++                        .visitInRangeListeners(p_316151_, p_250613_, p_251777_, gameeventlistenerregistry$listenervisitor);
+                 }
+             }
+         }
+@@ -56,6 +_,44 @@
+         if (flag) {
+             DebugPackets.sendGameEventInfo(this.level, p_316151_, p_250613_);
+         }
++    }
++
++    /**
++     * Neo: replays the section column of one game event that a region worker captured for the region that owns
++     * it.
++     * <p>
++     * Runs on the target region's worker, which holds the lease of the column, so the listeners are visited by
++     * the thread that owns their block entities and the candidate a vibration listener records carries the
++     * source position, and with it the distance, of the inline run. The section range, the delivery mode and the
++     * distance filter are the ones {@link #post} uses, so a replayed column visits exactly the listeners the
++     * inline dispatch would have visited, in the vanilla order.
++     *
++     * @return {@code true} when the column's chunk was still loaded, i.e. when the replay asked its registries
++     */
++    public boolean postCaptured(Holder<GameEvent> event, Vec3 source, GameEvent.Context context, int chunkX, int chunkZ, int minSectionY, int maxSectionY) {
++        ChunkAccess chunkaccess = net.neoforged.neoforge.server.threading.RegionThreadingHooks.gameEventChunk(this.level, chunkX, chunkZ);
++        if (chunkaccess == null) {
++            return false;
++        }
++        List<GameEvent.ListenerInfo> list = new ArrayList<>();
++        GameEventListenerRegistry.ListenerVisitor gameeventlistenerregistry$listenervisitor = (p_316091_, p_316092_) -> {
++            if (p_316091_.getDeliveryMode() == GameEventListener.DeliveryMode.BY_DISTANCE) {
++                list.add(new GameEvent.ListenerInfo(event, source, context, p_316091_, p_316092_));
++            } else {
++                p_316091_.handleGameEvent(this.level, event, context, source);
++            }
++        };
++        boolean flag = false;
++        for (int i = minSectionY; i <= maxSectionY; i++) {
++            flag |= chunkaccess.getListenerRegistry(i).visitInRangeListeners(event, source, context, gameeventlistenerregistry$listenervisitor);
++        }
++        if (!list.isEmpty()) {
++            this.handleGameEventMessagesInQueue(list);
++        }
++        if (flag) {
++            DebugPackets.sendGameEventInfo(this.level, event, source);
++        }
++        return true;
+     }
+ 
+     private void handleGameEventMessagesInQueue(List<GameEvent.ListenerInfo> p_251433_) {

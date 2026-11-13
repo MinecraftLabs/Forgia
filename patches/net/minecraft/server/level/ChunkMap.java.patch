@@ -1,5 +1,15 @@
 --- a/net/minecraft/server/level/ChunkMap.java
 +++ b/net/minecraft/server/level/ChunkMap.java
+@@ -200,6 +_,9 @@
+             p_214836_.getServer(),
+             p_214836_
+         );
++        // Neo: attach the region-partitioned POI storage when the switch is on. This runs before any chunk or
++        // POI data of the level is loaded, so every column the level loads is distributed to its owning region.
++        this.poiManager.attachRegionPoiStorage(p_214836_);
+         this.setServerViewDistance(p_214847_);
+         this.worldGenContext = new WorldGenContext(p_214836_, p_214843_, p_214839_, this.lightEngine, this.mainThreadMailbox);
+     }
 @@ -395,6 +_,7 @@
                  this.modified = true;
              }

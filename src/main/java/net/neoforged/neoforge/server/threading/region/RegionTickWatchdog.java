@@ -5,7 +5,6 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
-import net.neoforged.neoforge.common.NeoForgeConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -15,7 +14,7 @@ final class RegionTickWatchdog {
     private RegionTickWatchdog() {}
 
     static void warnIfLongTick(String name, long durationNanos) {
-        final long threshold = NeoForgeConfig.SERVER.regionThreadingLongTickWarningNanos.get();
+        final long threshold = RegionThreadingConfig.longTickWarningNanos();
         if (threshold > 0L && durationNanos > threshold) {
             LOGGER.warn("Region threading {} drain took {} ns", name, durationNanos);
         }

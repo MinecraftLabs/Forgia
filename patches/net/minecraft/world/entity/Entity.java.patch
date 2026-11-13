@@ -39,6 +39,38 @@
      }
  
      public boolean isColliding(BlockPos p_20040_, BlockState p_20041_) {
+@@ -309,6 +_,11 @@
+     }
+ 
+     public void setId(int p_20235_) {
++        // Neo: the int id is part of the published identity. A re-id of an admitted entity (player respawn)
++        // rebinds the published record on the server thread; an entity that is not admitted is a no-op.
++        if (level() instanceof ServerLevel serverLevel) {
++            serverLevel.entityIdentityLedger().rebindId(this, this.id, p_20235_);
++        }
+         this.id = p_20235_;
+     }
+ 
+@@ -330,6 +_,9 @@
+     }
+ 
+     public final void discard() {
++        // Neo: the guard has to run before the virtual remove(), because a living entity override runs
++        // removal effect callbacks before it reaches the guarded removal entry point.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.discard");
+         this.remove(Entity.RemovalReason.DISCARDED);
+     }
+ 
+@@ -350,6 +_,9 @@
+     }
+ 
+     public void remove(Entity.RemovalReason p_146834_) {
++        // Neo: removal is the named mutation seam. Every vanilla override that runs work before super.remove
++        // carries the same guard, so no removal side effect can precede the rejection.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.remove");
+         this.setRemoved(p_146834_);
+     }
+ 
 @@ -467,7 +_,7 @@
  
          if (this.isInLava()) {
@@ -48,6 +80,14 @@
          }
  
          this.checkBelowWorld();
+@@ -599,6 +_,7 @@
+     }
+ 
+     public void move(MoverType p_19973_, Vec3 p_19974_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.move");
+         if (this.noPhysics) {
+             this.setPos(this.getX() + p_19974_.x, this.getY() + p_19974_.y, this.getZ() + p_19974_.z);
+         } else {
 @@ -673,7 +_,7 @@
                      double d1 = vec3.x;
                      double d2 = vec3.y;
@@ -197,6 +237,22 @@
      }
  
      public void moveRelative(float p_19921_, Vec3 p_19922_) {
+@@ -1401,6 +_,7 @@
+     }
+ 
+     public void absMoveTo(double p_20249_, double p_20250_, double p_20251_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.absMoveTo");
+         double d0 = Mth.clamp(p_20249_, -3.0E7, 3.0E7);
+         double d1 = Mth.clamp(p_20251_, -3.0E7, 3.0E7);
+         this.xo = d0;
+@@ -1426,6 +_,7 @@
+     }
+ 
+     public void moveTo(double p_20108_, double p_20109_, double p_20110_, float p_20111_, float p_20112_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.moveTo");
+         this.setPosRaw(p_20108_, p_20109_, p_20110_);
+         this.setYRot(p_20111_);
+         this.setXRot(p_20112_);
 @@ -1704,6 +_,10 @@
                  p_20241_.put("Tags", listtag);
              }
@@ -264,6 +320,61 @@
      protected boolean couldAcceptPassenger() {
          return true;
      }
+@@ -2150,18 +_,13 @@
+             this.processPortalCooldown();
+             if (this.portalProcess != null) {
+                 if (this.portalProcess.processPortalTeleportation(serverlevel, this, this.canUsePortal(false))) {
+-                    serverlevel.getProfiler().push("portal");
+-                    this.setPortalCooldown();
+-                    DimensionTransition dimensiontransition = this.portalProcess.getPortalDestination(serverlevel, this);
+-                    if (dimensiontransition != null) {
+-                        ServerLevel serverlevel1 = dimensiontransition.newLevel();
+-                        if (serverlevel.getServer().isLevelEnabled(serverlevel1)
+-                            && (serverlevel1.dimension() == serverlevel.dimension() || this.canChangeDimensions(serverlevel, serverlevel1))) {
+-                            this.changeDimension(dimensiontransition);
+-                        }
++                    // Neo: the destination search of a portal transition reads the PoiManager of the destination
++                    // level, and every entity type reaches it here, so a native region worker records the
++                    // transition for its batch barrier instead and the server thread applies it in this tick.
++                    if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferPortalTransition(serverlevel, this)) {
++                        return;
+                     }
+-
+-                    serverlevel.getProfiler().pop();
++                    this.completePortalTransition(serverlevel);
+                 } else if (this.portalProcess.hasExpired()) {
+                     this.portalProcess = null;
+                 }
+@@ -2169,6 +_,29 @@
+         }
+     }
+ 
++    // Neo: resolves and applies the portal transition of this entity, exactly the vanilla body of handlePortal.
++    // A region worker defers the call to its batch barrier, which runs it on the server thread, so the
++    // destination search never reaches the PoiManager of the destination level from a worker.
++    public void completePortalTransition(ServerLevel serverlevel) {
++        if (this.portalProcess == null) {
++            // The portal state was already dropped; the vanilla body would resolve nothing either.
++            return;
++        }
++
++        serverlevel.getProfiler().push("portal");
++        this.setPortalCooldown();
++        DimensionTransition dimensiontransition = this.portalProcess.getPortalDestination(serverlevel, this);
++        if (dimensiontransition != null) {
++            ServerLevel serverlevel1 = dimensiontransition.newLevel();
++            if (serverlevel.getServer().isLevelEnabled(serverlevel1)
++                && (serverlevel1.dimension() == serverlevel.dimension() || this.canChangeDimensions(serverlevel, serverlevel1))) {
++                this.changeDimension(dimensiontransition);
++            }
++        }
++
++        serverlevel.getProfiler().pop();
++    }
++
+     public int getDimensionChangingDelay() {
+         Entity entity = this.getFirstPassenger();
+         return entity instanceof ServerPlayer ? entity.getDimensionChangingDelay() : 300;
 @@ -2257,7 +_,7 @@
      }
  
@@ -312,6 +423,18 @@
          if (this.level() instanceof ServerLevel serverlevel && !this.isRemoved()) {
              ServerLevel serverlevel1 = p_350951_.newLevel();
              List<Entity> list = this.getPassengers();
+@@ -2649,6 +_,11 @@
+     }
+ 
+     public void setUUID(UUID p_20085_) {
++        // Neo: the UUID is part of the published identity. Changing it on an admitted entity rebinds the
++        // published record on the server thread instead of leaving the ledger keyed by the old UUID.
++        if (level() instanceof ServerLevel serverLevel) {
++            serverLevel.entityIdentityLedger().rebindUuid(this, this.uuid, p_20085_);
++        }
+         this.uuid = p_20085_;
+         this.stringUUID = this.uuid.toString();
+     }
 @@ -2667,6 +_,7 @@
          return this.stringUUID;
      }
@@ -320,6 +443,14 @@
      public boolean isPushedByFluid() {
          return true;
      }
+@@ -2711,6 +_,7 @@
+     public boolean teleportTo(
+         ServerLevel p_265257_, double p_265407_, double p_265727_, double p_265410_, Set<RelativeMovement> p_265083_, float p_265573_, float p_265094_
+     ) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.teleportTo");
+         float f = Mth.clamp(p_265094_, -90.0F, 90.0F);
+         if (p_265257_ == this.level()) {
+             this.moveTo(p_265407_, p_265727_, p_265410_, p_265573_, f);
 @@ -2783,6 +_,8 @@
          EntityDimensions entitydimensions = this.dimensions;
          Pose pose = this.getPose();
@@ -444,14 +575,73 @@
          return this.fluidHeight.getDouble(p_204037_);
      }
  
-@@ -3323,6 +_,7 @@
+@@ -3308,6 +_,12 @@
+     }
  
-             this.levelCallback.onMove();
+     public final void setPosRaw(double p_20344_, double p_20345_, double p_20346_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setPosRaw");
++        // Neo: a region worker defers the two server-owned level effects of this move - the section publication
++        // and the target chunk acquisition - to the barrier of its entity batch, which applies them on the
++        // server thread from the final position. The worker must run neither, so both inline effects are skipped.
++        final boolean deferredSectionUpdate = net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferEntitySectionUpdate(this, this.levelCallback, p_20344_, p_20345_, p_20346_)
++                || net.neoforged.neoforge.server.threading.RegionThreadingHooks.skipsSectionUpdateOfRemovedEntity(this);
+         if (this.position.x != p_20344_ || this.position.y != p_20345_ || this.position.z != p_20346_) {
+             this.position = new Vec3(p_20344_, p_20345_, p_20346_);
+             int i = Mth.floor(p_20344_);
+@@ -3321,8 +_,9 @@
+                 }
+             }
+ 
+-            this.levelCallback.onMove();
++            if (!deferredSectionUpdate) this.levelCallback.onMove();
          }
-+        if (this.isAddedToLevel() && !this.level.isClientSide && !this.isRemoved()) this.level.getChunk((int) Math.floor(p_20344_) >> 4, (int) Math.floor(p_20346_) >> 4); // Forge - ensure target chunk is loaded.
++        if (!deferredSectionUpdate && this.isAddedToLevel() && !this.level.isClientSide && !this.isRemoved()) this.level.getChunk((int) Math.floor(p_20344_) >> 4, (int) Math.floor(p_20346_) >> 4); // Forge - ensure target chunk is loaded.
      }
  
      public void checkDespawn() {
+@@ -3412,6 +_,12 @@
+ 
+     @Override
+     public final void setRemoved(Entity.RemovalReason p_146876_) {
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Entity.setRemoved");
++        // Neo: a leased worker may only remove an entity it owns, and only by recording the removal. The
++        // level callback is the server-owned storage effect of the removal (section membership, tracking,
++        // identity ledger, region index), so the batch barrier runs it on the server thread. The record is
++        // taken before the entity's own state changes, so a refused deferral leaves the entity unremoved.
++        final boolean deferred = net.neoforged.neoforge.server.threading.RegionThreadingHooks.deferEntityRemoval(this, this.levelCallback, p_146876_);
+         if (this.removalReason == null) {
+             this.removalReason = p_146876_;
+         }
+@@ -3421,7 +_,9 @@
+         }
+ 
+         this.getPassengers().forEach(Entity::stopRiding);
+-        this.levelCallback.onRemove(p_146876_);
++        if (!deferred) {
++            this.levelCallback.onRemove(p_146876_);
++        }
+     }
+ 
+     protected void unsetRemoved() {
+@@ -3433,6 +_,18 @@
+         this.levelCallback = p_146849_;
+     }
+ 
++    /**
++     * Neo: the level callback of this entity.
++     * <p>
++     * The section manager replaces the callback with {@link EntityInLevelCallback#NULL} when its removal
++     * completed, so the entity batch barrier compares the callback a worker recorded for a deferred removal
++     * with this one to tell a pending removal from one the server thread already applied. The read is a field
++     * read of the entity itself, not a storage access.
++     */
++    public final EntityInLevelCallback getLevelCallback() {
++        return this.levelCallback;
++    }
++
+     @Override
+     public boolean shouldBeSaved() {
+         if (this.removalReason != null && !this.removalReason.shouldSave()) {
 @@ -3449,6 +_,133 @@
  
      public boolean mayInteract(Level p_146843_, BlockPos p_146844_) {

@@ -5,25 +5,122 @@
 
 package net.neoforged.neoforge.server.threading.region;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import net.minecraft.world.entity.Entity;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Mutable runtime state for one region coordinate.
+ * <p>
+ * The state carries the region's entity tick index: the entities whose authoritative region mapping names this
+ * region, in the order they entered the level's entity tick list. The index is the region's share of the
+ * entity tick, so a worker that leases the region can enumerate the entities it may tick without reading the
+ * level's server-owned tick list, and the server thread can decide per region whether the tick has any work.
  */
 final class RegionState {
     private final RegionCoordinate coordinate;
     private final Map<RegionSectionCoordinate, RegionSectionState> sections = new ConcurrentHashMap<>();
+    /**
+     * The chunk-area cells this region owns, i.e. the region coordinates whose fixed chunk rectangle belongs
+     * to it: one cell for an unmerged region and every member cell of a merged dynamic region.
+     * <p>
+     * The cell set is the region's extent, and it is maintained by the regionizer when it resolves or merges
+     * regions, not by the level's chunk loads, so it is also complete for a region that was created after the
+     * level's chunks were already loaded. The self-driven entity tick activation builds its chunk rectangle
+     * from it on the server thread; a region without cells has no rectangle and keeps its entities on the
+     * server thread.
+     */
+    private final java.util.Set<RegionSectionCoordinate> cells = ConcurrentHashMap.newKeySet();
     private final RegionTaskQueue taskQueue = new RegionTaskQueue();
     private final RegionTickTimer tickTimer = new RegionTickTimer(System.nanoTime());
     private final RegionTickMetrics tickMetrics = new RegionTickMetrics();
     private final AtomicReference<RegionLifecycleState> lifecycleState = new AtomicReference<>(RegionLifecycleState.READY);
     private final AtomicBoolean pendingRecalculation = new AtomicBoolean();
     private final AtomicBoolean workerSubmitted = new AtomicBoolean();
+    /**
+     * The region's entity tick index, ordered by {@link RegionEntityTickEntry#sequence()}.
+     * <p>
+     * Every mutation happens under the regionizer write lock, so the index and the regionizer's entity mapping
+     * change together. The structures themselves are concurrent, so a worker that owns the region lease can
+     * enumerate a snapshot of the index while the server thread keeps serving chunk source tasks: a worker may
+     * observe an entry of a tick that is being published, never a torn entry.
+     */
+    private final ConcurrentSkipListSet<RegionEntityTickEntry> entityTickOrder = new ConcurrentSkipListSet<>(RegionEntityTickEntry.BY_SEQUENCE);
+    private final ConcurrentHashMap<Entity, RegionEntityTickEntry> entityTickEntries = new ConcurrentHashMap<>();
+    /**
+     * The entities of this region by UUID and by network id.
+     * <p>
+     * A modded entity resolves its owner every tick ({@code Projectile.getOwner()} asks the level for a UUID),
+     * and the legacy level lookup is server-owned storage. A worker answers such a lookup from the region it
+     * leases instead, so the index is maintained exactly where the region's entity membership changes.
+     */
+    private final ConcurrentHashMap<java.util.UUID, Entity> entitiesByUuid = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Entity> entitiesById = new ConcurrentHashMap<>();
+    /** Number of indexed entities the level's entity tick list currently contains. */
+    private final AtomicInteger tickingEntityCount = new AtomicInteger();
+    /** Number of ticking entities only the server thread may tick, i.e. always-ticking entities such as players. */
+    private final AtomicInteger serverThreadOnlyEntityCount = new AtomicInteger();
     private volatile Thread ownerThread;
+    /**
+     * Upper bound of the foreign chunk keys this region records between two version checks.
+     * <p>
+     * A region reads a handful of chunks of its neighbours at most, so the bound only has to keep a region that
+     * scans far outside its own area from growing the set without limit. A key past the bound is not recorded,
+     * so a change of that chunk is not detected by this region's check.
+     */
+    static final int MAX_FOREIGN_READ_CHUNKS = 256;
+    /**
+     * Upper bound of the written positions this region keeps for a re-run of its propagation.
+     * <p>
+     * The seeds of one pass are the blocks the pass wrote; a pass writes at most the deferred block-update
+     * budget of its batch. A position past the bound is dropped and counted, so a re-run of a region that wrote
+     * an extreme number of blocks only re-evaluates the positions that fit.
+     */
+    static final int MAX_RERUN_SEEDS = 1024;
+    /**
+     * The version of every foreign chunk this region read since its last check, by
+     * {@link net.minecraft.world.level.ChunkPos#asLong(int, int)} key.
+     * <p>
+     * Written by the region's own worker only: a region holds one lease at a time, so the recording worker is
+     * the only writer. The border fixpoint reads and clears the map on the server thread after the barrier of
+     * the batch, when no worker of the region runs, so no lock is needed on either side.
+     */
+    private final it.unimi.dsi.fastutil.longs.Long2LongMap foreignChunkReads = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
+    /**
+     * The positions this region wrote since its last check, as packed block positions. A changed foreign chunk
+     * makes the border fixpoint re-evaluate these positions on the region's own worker, which is the propagation
+     * a re-run of the region repeats. Recorded and read under the same rule as {@link #foreignChunkReads}.
+     */
+    private final it.unimi.dsi.fastutil.longs.LongArrayList rerunSeeds = new it.unimi.dsi.fastutil.longs.LongArrayList();
+    /** Seeds the {@link #MAX_RERUN_SEEDS} bound refused since the last check. */
+    private int droppedRerunSeeds;
+    /**
+     * Upper bound of the positions this region wrote outside its lease and keeps for the read-after-write
+     * observation.
+     * <p>
+     * One lease writes a handful of blocks outside its region at most - a random tick that grows a crop across
+     * the border, a block entity that lights a neighbour - so the bound only has to keep a modded callback that
+     * writes far outside its lease from growing the set without limit. A position past the bound is still
+     * applied by its target region; only the observation of a read of it is not counted.
+     */
+    static final int MAX_DEFERRED_WRITE_POSITIONS = 4096;
+    /**
+     * The positions this region wrote outside its lease during the current lease, as packed block positions.
+     * <p>
+     * The write is applied by the target region at the barrier, so a callback that reads one of these positions
+     * back in the same lease observes the state before the write. Recording the positions is what makes that
+     * approximation observable instead of silent. Written by the region's own worker only, exactly like
+     * {@link #foreignChunkReads}.
+     */
+    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet deferredWritePositions = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
 
     RegionState(RegionCoordinate coordinate) {
         this.coordinate = coordinate;
@@ -35,6 +132,35 @@ final class RegionState {
 
     void addSection(RegionSectionState section) {
         this.sections.put(section.coordinate(), section);
+    }
+
+    /**
+     * Records one chunk-area cell of this region.
+     */
+    void addCell(RegionSectionCoordinate cell) {
+        this.cells.add(cell);
+    }
+
+    /**
+     * {@return the chunk-area cells of this region}
+     */
+    Collection<RegionSectionCoordinate> cells() {
+        return this.cells;
+    }
+
+    /**
+     * Takes over every cell of {@code source}, used when two regions merge.
+     */
+    void absorbCellsFrom(RegionState source) {
+        this.cells.addAll(source.cells());
+        source.cells().clear();
+    }
+
+    /**
+     * Drops every cell of this region, used when its level is cleared.
+     */
+    void clearCells() {
+        this.cells.clear();
     }
 
     Collection<RegionSectionState> sections() {
@@ -61,20 +187,288 @@ final class RegionState {
         return count;
     }
 
+    /**
+     * {@return the loaded chunks of this region as {@link net.minecraft.world.level.ChunkPos#asLong(int, int)}
+     * keys}
+     * <p>
+     * The set is assembled from the sections of this region and is a snapshot: the natural spawning plan counts
+     * the spawnable chunks of the region from it on the server thread, before its workers run.
+     */
+    java.util.Set<Long> loadedChunkKeys() {
+        final java.util.Set<Long> chunks = new java.util.HashSet<>(this.chunkCount());
+        for (final RegionSectionState section : this.sections.values()) {
+            chunks.addAll(section.chunkKeys());
+        }
+        return chunks;
+    }
+
+    /**
+     * Indexes {@code entity} as a member of this region, behind the entities it already holds.
+     * <p>
+     * Called by the regionizer under its write lock when it publishes the entity's region mapping. The entry
+     * is not ticking yet: only the level's entity tick list decides that.
+     */
+    void indexEntityTickEntry(Entity entity, long sequence) {
+        final RegionEntityTickEntry entry = new RegionEntityTickEntry(entity, sequence, entity.isAlwaysTicking(), false);
+        if (this.entityTickEntries.putIfAbsent(entity, entry) != null) {
+            return;
+        }
+        indexEntityLookups(entity);
+        this.entityTickOrder.add(entry);
+    }
+
+    /**
+     * Indexes an entry that already exists, e.g. the entry of an entity whose mapping moved into this region.
+     * <p>
+     * The entry keeps its identity, so its sequence - and with it its position in the tick order - survives the
+     * move. A region that already knows the entity keeps its current entry.
+     */
+    void indexExistingEntityTickEntry(RegionEntityTickEntry entry) {
+        if (this.entityTickEntries.putIfAbsent(entry.entity(), entry) != null) {
+            return;
+        }
+        indexEntityLookups(entry.entity());
+        this.entityTickOrder.add(entry);
+        if (entry.ticking()) {
+            this.tickingEntityCount.incrementAndGet();
+            if (entry.serverThreadOnly()) {
+                this.serverThreadOnlyEntityCount.incrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * Removes the index entry of {@code entity}.
+     *
+     * @return the removed entry, or {@code null} when this region did not index the entity
+     */
+    @Nullable
+    RegionEntityTickEntry removeEntityTickEntry(Entity entity) {
+        final RegionEntityTickEntry removed = this.entityTickEntries.remove(entity);
+        if (removed == null) {
+            return null;
+        }
+        this.entityTickOrder.remove(removed);
+        removeEntityLookups(entity);
+        if (removed.ticking()) {
+            this.tickingEntityCount.decrementAndGet();
+            if (removed.serverThreadOnly()) {
+                this.serverThreadOnlyEntityCount.decrementAndGet();
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * Marks the entry of {@code entity} as part of the level's entity tick list.
+     * <p>
+     * An entity that was already ticking keeps its position: the vanilla tick list keeps the position of an
+     * entry it already contains. A re-insertion after the entity stopped ticking appends the entry, exactly
+     * like the vanilla tick list appends it, so the index order stays the tick order.
+     *
+     * @param sequence the sequence to assign to a re-inserted entry
+     */
+    void markEntityTickEntryTicking(Entity entity, long sequence) {
+        final RegionEntityTickEntry entry = this.entityTickEntries.get(entity);
+        if (entry == null || entry.ticking()) {
+            return;
+        }
+        final RegionEntityTickEntry ticking = entry.withTicking(sequence);
+        // Replace, so the order follows the new sequence while the entity keeps one entry only.
+        this.entityTickOrder.remove(entry);
+        this.entityTickEntries.put(entity, ticking);
+        this.entityTickOrder.add(ticking);
+        this.tickingEntityCount.incrementAndGet();
+        if (ticking.serverThreadOnly()) {
+            this.serverThreadOnlyEntityCount.incrementAndGet();
+        }
+    }
+
+    /**
+     * Marks the entry of {@code entity} as no longer part of the level's entity tick list.
+     * <p>
+     * The entry stays indexed: the region keeps owning the entity's mapping, and a tick-list re-insertion has
+     * to append it to the order again.
+     */
+    void markEntityTickEntryNotTicking(Entity entity) {
+        final RegionEntityTickEntry entry = this.entityTickEntries.get(entity);
+        if (entry == null || !entry.ticking()) {
+            return;
+        }
+        final RegionEntityTickEntry idle = entry.withoutTicking();
+        this.entityTickOrder.remove(entry);
+        this.entityTickEntries.put(entity, idle);
+        this.entityTickOrder.add(idle);
+        this.tickingEntityCount.decrementAndGet();
+        if (idle.serverThreadOnly()) {
+            this.serverThreadOnlyEntityCount.decrementAndGet();
+        }
+    }
+
+    /**
+     * {@return the indexed entry of {@code entity}, or {@code null} when this region does not index it}
+     */
+    @Nullable
+    RegionEntityTickEntry entityTickEntry(Entity entity) {
+        return this.entityTickEntries.get(entity);
+    }
+
+    /**
+     * {@return the region's entities in tick order}
+     * <p>
+     * The returned list is a snapshot, so a worker can iterate it while the server thread publishes the next
+     * tick list change. It is the unit the region worker enumerates: the entities it may tick are the entries
+     * whose {@link RegionEntityTickEntry#ticking()} is set.
+     */
+    /**
+     * Adds the lookup keys of {@code entity}, tolerating a null UUID.
+     * <p>
+     * A mock or a partially constructed entity can answer a null UUID; the maps must not see a null key, and an
+     * entity without one is simply not reachable by UUID.
+     */
+    private void indexEntityLookups(Entity entity) {
+        final java.util.UUID uuid = entity.getUUID();
+        if (uuid != null) {
+            this.entitiesByUuid.put(uuid, entity);
+        }
+        this.entitiesById.put(entity.getId(), entity);
+    }
+
+    /** Removes the lookup keys of {@code entity} again. */
+    private void removeEntityLookups(Entity entity) {
+        final java.util.UUID uuid = entity.getUUID();
+        if (uuid != null) {
+            this.entitiesByUuid.remove(uuid, entity);
+        }
+        this.entitiesById.remove(entity.getId(), entity);
+    }
+
+    /** {@return the entity of this region with {@code uuid}, or {@code null} when this region does not hold it} */
+    @Nullable
+    Entity entityByUuid(java.util.UUID uuid) {
+        return this.entitiesByUuid.get(uuid);
+    }
+
+    /** {@return the entity of this region with network id {@code id}, or {@code null} when it does not hold it} */
+    @Nullable
+    Entity entityById(int id) {
+        return this.entitiesById.get(id);
+    }
+
+    /**
+     * {@return the region's by-uuid index, for the per-tick publication of the entity ownership of the level}
+     * <p>
+     * The map is the live concurrent one and is only read, by the server thread at the head of the level tick
+     * while every region is quiescent: {@link RegionEntityIdentitySnapshots} copies it so that a region worker
+     * can name the owner of an entity of another region without reading this index.
+     */
+    java.util.Map<java.util.UUID, Entity> entitiesByUuid() {
+        return this.entitiesByUuid;
+    }
+
+    List<RegionEntityTickEntry> entityTickEntries() {
+        return new ArrayList<>(this.entityTickOrder);
+    }
+
+    /**
+     * {@return a snapshot of the entities this region's index holds}
+     * <p>
+     * The unit of the region-scoped {@code getAll()} and type-filtered queries: the entities whose region
+     * mapping names this region, ticking or not, exactly as the level's own entity view would list the
+     * entities of this region. The list is a copy, so a worker iterates it while the server thread keeps
+     * publishing index changes.
+     */
+    List<Entity> indexedEntities() {
+        final List<Entity> entities = new ArrayList<>(this.entityTickOrder.size());
+        for (final RegionEntityTickEntry entry : this.entityTickOrder) {
+            entities.add(entry.entity());
+        }
+        return entities;
+    }
+
+    /** {@return the number of entities indexed for this region} */
+    int entityTickEntryCount() {
+        return this.entityTickEntries.size();
+    }
+
+    /** {@return the number of indexed entities the level's entity tick list currently contains} */
+    int tickingEntityCount() {
+        return this.tickingEntityCount.get();
+    }
+
+    /** {@return the number of ticking entities only the server thread may tick} */
+    int serverThreadOnlyEntityCount() {
+        return this.serverThreadOnlyEntityCount.get();
+    }
+
+    /**
+     * Takes over every entry of {@code source}, used when the regionizer merges two regions.
+     */
+    void absorbEntityTickEntriesFrom(RegionState source) {
+        if (source == this) {
+            return;
+        }
+        for (final RegionEntityTickEntry entry : source.entityTickEntries()) {
+            this.indexExistingEntityTickEntry(entry);
+        }
+        source.clearEntityTickEntries();
+    }
+
+    /**
+     * Drops every index entry of this region, used when the region is retired or its level is cleared.
+     */
+    void clearEntityTickEntries() {
+        this.entityTickOrder.clear();
+        this.entityTickEntries.clear();
+        this.tickingEntityCount.set(0);
+        this.serverThreadOnlyEntityCount.set(0);
+    }
+
     RegionTaskQueue taskQueue() {
         return this.taskQueue;
+    }
+
+    /**
+     * Inserts work atomically with empty-region retirement. A task can therefore never be left in the
+     * queue of a region that has already been removed from the regionizer.
+     */
+    synchronized boolean enqueueTask(Runnable task) {
+        if (this.isDead()) {
+            return false;
+        }
+        this.taskQueue.enqueue(task);
+        return true;
+    }
+
+    synchronized RegionScheduledTask scheduleTask(Runnable task, long delayTicks) {
+        if (this.isDead()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.taskQueue.schedule(task, delayTicks);
+    }
+
+    synchronized RegionScheduledTask scheduleTaskAtFixedRate(Runnable task, long initialDelayTicks, long periodTicks) {
+        if (this.isDead()) {
+            return RegionScheduledTask.cancelled(task);
+        }
+        return this.taskQueue.scheduleAtFixedRate(task, initialDelayTicks, periodTicks);
     }
 
     boolean hasQueuedTasks() {
         return !this.taskQueue.isEmpty();
     }
 
-    void clearTasks() {
+    synchronized void clearTasks() {
         this.taskQueue.clearAndCancel();
+        this.notifyAll();
     }
 
     RegionTickTimer tickTimer() {
         return this.tickTimer;
+    }
+
+    void makeDueForTesting() {
+        this.tickTimer.advanceBy(1);
     }
 
     RegionTickMetrics tickMetrics() {
@@ -87,6 +481,10 @@ final class RegionState {
 
     void beginOwnership() {
         this.ownerThread = Thread.currentThread();
+        // A lease starts with no position of its own written outside it: the approximation of the read after
+        // such a write is bounded by one lease, because the fixpoint applies the writes before the region's
+        // next lease starts.
+        this.deferredWritePositions.clear();
     }
 
     void endOwnership() {
@@ -97,12 +495,93 @@ final class RegionState {
         return this.ownerThread == Thread.currentThread();
     }
 
+    /**
+     * Records the version of one chunk of another region this region read.
+     * <p>
+     * The first version a region observes for a chunk is the one it keeps: a chunk that changes after that first
+     * read differs from the recorded version, so the region is invalidated either way.
+     *
+     * @return {@code true} when the key was recorded, {@code false} when the same chunk was already recorded or
+     *         the {@link #MAX_FOREIGN_READ_CHUNKS} bound refused it
+     */
+    boolean recordForeignChunkRead(long chunkKey, long version) {
+        if (this.foreignChunkReads.containsKey(chunkKey)) {
+            return false;
+        }
+        if (this.foreignChunkReads.size() >= MAX_FOREIGN_READ_CHUNKS) {
+            return false;
+        }
+        this.foreignChunkReads.put(chunkKey, version);
+        return true;
+    }
+
+    /** {@return the version of every foreign chunk this region read since its last check, by chunk key} */
+    it.unimi.dsi.fastutil.longs.Long2LongMap foreignChunkReads() {
+        return this.foreignChunkReads;
+    }
+
+    /** Forgets the foreign chunks this region read, so the next check only sees the reads that follow. */
+    void clearForeignChunkReads() {
+        this.foreignChunkReads.clear();
+    }
+
+    /**
+     * Records one position this region wrote, which a re-run of the region has to re-evaluate.
+     *
+     * @return {@code true} when the position was kept, {@code false} when the {@link #MAX_RERUN_SEEDS} bound
+     *         dropped it
+     */
+    boolean recordRerunSeed(long packedPos) {
+        if (this.rerunSeeds.size() >= MAX_RERUN_SEEDS) {
+            this.droppedRerunSeeds++;
+            return false;
+        }
+        this.rerunSeeds.add(packedPos);
+        return true;
+    }
+
+    /** {@return the positions this region wrote since its last check, as packed block positions} */
+    it.unimi.dsi.fastutil.longs.LongArrayList rerunSeeds() {
+        return this.rerunSeeds;
+    }
+
+    /**
+     * Forgets the written positions of this region.
+     *
+     * @return the number of positions the {@link #MAX_RERUN_SEEDS} bound dropped since the last check
+     */
+    int clearRerunSeeds() {
+        this.rerunSeeds.clear();
+        final int dropped = this.droppedRerunSeeds;
+        this.droppedRerunSeeds = 0;
+        return dropped;
+    }
+
+    /**
+     * Records one position this region wrote outside its lease during the current lease.
+     *
+     * @return {@code false} when the {@link #MAX_DEFERRED_WRITE_POSITIONS} bound refused it
+     */
+    boolean recordDeferredWrite(long packedPos) {
+        if (this.deferredWritePositions.size() >= MAX_DEFERRED_WRITE_POSITIONS) {
+            return false;
+        }
+        this.deferredWritePositions.add(packedPos);
+        return true;
+    }
+
+    /** {@return true when this region wrote {@code packedPos} outside its lease during the current lease} */
+    boolean wroteDeferred(long packedPos) {
+        return this.deferredWritePositions.contains(packedPos);
+    }
+
     boolean tryMarkRunning() {
         return this.lifecycleState.compareAndSet(RegionLifecycleState.READY, RegionLifecycleState.TICKING);
     }
 
-    void clearRunning() {
+    synchronized void clearRunning() {
         this.lifecycleState.compareAndSet(RegionLifecycleState.TICKING, RegionLifecycleState.READY);
+        this.notifyAll();
     }
 
     boolean isRunning() {
@@ -113,8 +592,9 @@ final class RegionState {
         return this.workerSubmitted.compareAndSet(false, true);
     }
 
-    void clearWorkerSubmitted() {
+    synchronized void clearWorkerSubmitted() {
         this.workerSubmitted.set(false);
+        this.notifyAll();
     }
 
     boolean isWorkerSubmitted() {
@@ -143,9 +623,41 @@ final class RegionState {
 
     void markDead() {
         this.lifecycleState.set(RegionLifecycleState.DEAD);
+        this.tickMetrics.release();
     }
 
     boolean isEmpty() {
         return !this.isDead() && !this.isRunning() && !this.isWorkerSubmitted() && !this.hasSections() && this.taskQueue.isEmpty();
+    }
+
+    /**
+     * Retires an empty region and closes its queue while excluding concurrent producers.
+     */
+    synchronized void awaitQuiescent() {
+        boolean interrupted = false;
+        while (this.isWorkerSubmitted() || this.isRunning()) {
+            try {
+                this.wait();
+            } catch (InterruptedException exception) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    synchronized boolean retireIfEmpty() {
+        if (!this.isEmpty() || !this.tryMarkDead()) {
+            return false;
+        }
+        this.clearTasks();
+        // A retired region owns no mapping anymore, so its index is empty by the time it retires; clear it
+        // anyway so a retired region can never keep an entity entry - or the entity - alive.
+        this.clearEntityTickEntries();
+        // A retired region is dropped from the regionizer, so its metric window is released here instead of
+        // waiting for the last reference to the dead region state to disappear.
+        this.tickMetrics.release();
+        return true;
     }
 }

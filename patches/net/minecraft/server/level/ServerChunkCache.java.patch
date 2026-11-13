@@ -1,9 +1,19 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -135,6 +_,9 @@
+     @Override
+     public ChunkAccess getChunk(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
+         if (Thread.currentThread() != this.mainThread) {
++            if (net.neoforged.neoforge.server.threading.RegionThreadingHooks.isNativeRegionWorkerThread()) {
++                return this.getChunkForRegionWorker(p_8360_, p_8361_, p_330876_, p_8363_);
++            }
+             return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
+         } else {
+             ProfilerFiller profilerfiller = this.level.getProfiler();
 @@ -150,6 +_,10 @@
                  }
              }
-
+ 
 +            ChunkHolder chunkholder = this.getVisibleChunkIfPresent(i);
 +            if (chunkholder != null && chunkholder.currentlyLoading != null)
 +                return chunkholder.currentlyLoading; // Neo: If the requested chunk is loading, bypass the future chain to prevent a deadlock.
@@ -11,6 +21,50 @@
              profilerfiller.incrementCounter("getChunkCacheMiss");
              CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
              this.mainThreadProcessor.managedBlock(completablefuture::isDone);
+@@ -164,6 +_,43 @@
+         }
+     }
+ 
++    /**
++     * Neo: serves a chunk request of a native region worker without ever blocking on the server thread.
++     * <p>
++     * An off-thread request is dispatched to the main-thread processor and waited for, but the server thread
++     * is inside the region tick batch barrier while its workers run, so a worker that waited would stall the
++     * tick until the chunk finished loading, or deadlock it. The worker therefore only receives a chunk that
++     * is already available: the visible chunk holder answers the request without a load, exactly like the
++     * main-thread path does after the cache lookup. A request that would have to load, generate or await a
++     * chunk is refused with {@link net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException},
++     * which the tick groups turn into a server-thread fallback for the affected entity or ticker.
++     * <p>
++     * A request that does not require the chunk answers {@code null} like the vanilla main-thread path, so
++     * callers that probe a chunk without loading it (for example {@code RemoveBlockGoal}) keep their exact
++     * semantics and simply lose the cross-thread round trip.
++     * <p>
++     * The result cache of the main-thread path is not read or written here: it is a plain array owned by the
++     * server thread. The visible holder and its futures are thread-safe.
++     * <p>
++     * The version of the chunk this worker is about to read is handed to the engine, which records it for the
++     * region of the caller. A chunk of another region can be mutated by its own worker while this one reads it,
++     * so the border fixpoint re-runs the propagation of the caller when the version of a recorded chunk changed.
++     * A chunk of the caller's own region is filtered out by the engine and costs one thread-local read.
++     */
++    @Nullable
++    private ChunkAccess getChunkForRegionWorker(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
++        ChunkHolder chunkholder = this.getVisibleChunkIfPresent(ChunkPos.asLong(p_8360_, p_8361_));
++        ChunkAccess chunkaccess = chunkholder == null ? null : chunkholder.getChunkIfPresent(p_330876_);
++        if (chunkaccess != null) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.recordForeignChunkRead(this.level, p_8360_, p_8361_, chunkaccess);
++            return chunkaccess;
++        }
++        if (!p_8363_) {
++            return null;
++        }
++        throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forChunk(p_8360_, p_8361_, p_330876_);
++    }
++
+     @Nullable
+     @Override
+     public LevelChunk getChunkNow(int p_8357_, int p_8358_) {
 @@ -184,6 +_,7 @@
              if (chunkholder == null) {
                  return null;
@@ -19,35 +73,141 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -356,15 +_,17 @@
+@@ -205,6 +_,11 @@
+ 
+     public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {
+         boolean flag = Thread.currentThread() == this.mainThread;
++        if (!flag && net.neoforged.neoforge.server.threading.RegionThreadingHooks.isNativeRegionWorkerThread()) {
++            // Neo: the returned future is completed by the server thread, which is inside the batch barrier
++            // waiting for this worker, so the worker must not obtain it at all.
++            throw net.neoforged.neoforge.server.threading.region.RegionWorkerChunkUnavailableException.forChunkFuture(p_8432_, p_8433_, p_330326_);
++        }
+         CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
+         if (flag) {
+             completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
+@@ -270,6 +_,12 @@
+         return this.mainThreadProcessor.pollTask();
+     }
+ 
++    // Neo: lets the region entity tick barrier service chunk source tasks while region workers tick entities.
++    // Off thread chunk requests are dispatched to this queue, so the server thread has to keep draining it.
++    public void managedBlockOnMainThread(java.util.function.BooleanSupplier condition) {
++        this.mainThreadProcessor.managedBlock(condition);
++    }
++
+     boolean runDistanceManagerUpdates() {
+         boolean flag = this.distanceManager.runAllUpdates(this.chunkMap);
+         boolean flag1 = this.chunkMap.promoteChunkMap();
+@@ -343,30 +_,71 @@
+             if (this.level.tickRateManager().runsNormally()) {
+                 profilerfiller.popPush("naturalSpawnCount");
+                 int l = this.distanceManager.getNaturalSpawnChunkCount();
+-                NaturalSpawner.SpawnState naturalspawner$spawnstate = NaturalSpawner.createState(
+-                    l, this.level.getAllEntities(), this::getFullChunk, new LocalMobCapCalculator(this.chunkMap)
+-                );
+-                this.lastSpawnState = naturalspawner$spawnstate;
+-                profilerfiller.popPush("spawnAndTick");
+                 boolean flag1 = this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING);
++                boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++                // Neo: the region spawn plan decides per chunk whether the spawn body may run on the region
++                // worker of its region. When the slice is off the plan is null and the vanilla body below runs
++                // unchanged. When it is on, the level-wide spawn state is only built for the chunks that stay
++                // on the server thread, on demand, so a tick that hands every chunk over never scans the
++                // level's entities; the plan is executed after the loop, before the chunk tick plan and the
++                // level broadcast.
++                final net.neoforged.neoforge.server.threading.region.RegionSpawnPlan spawnPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
++                    .beginSpawnPlan(this.level, this.spawnSource(l), this.spawnFriendlies, this.spawnEnemies, flag, this::managedBlockOnMainThread);
++                final NaturalSpawner.SpawnState naturalspawner$spawnstate = spawnPlan == null
++                    ? NaturalSpawner.createState(l, this.level.getAllEntities(), this::getFullChunk, new LocalMobCapCalculator(this.chunkMap))
++                    : null;
++                if (spawnPlan == null) {
++                    this.lastSpawnState = naturalspawner$spawnstate;
++                }
++                profilerfiller.popPush("spawnAndTick");
+                 Util.shuffle(list, this.level.random);
+                 int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
+-                boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++
++                // Neo: the region chunk tick plan decides per chunk whether the chunk body may run on the
++                // region worker of its region. The inhabited time update and the level random stay in this
++                // body; the plan is executed after the spawn plan, before the level broadcast, so every block
++                // change of a worker is published by the broadcast below.
++                final net.neoforged.neoforge.server.threading.region.RegionChunkTickPlan chunkTickPlan = net.neoforged.neoforge.server.threading.RegionThreadingHooks
++                    .beginChunkTickPlan(this.level, k, this::managedBlockOnMainThread);
+ 
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
                      ChunkPos chunkpos = levelchunk1.getPos();
 -                    if (this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) {
--                        levelchunk1.incrementInhabitedTime(j);
++                    if ((this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) || this.distanceManager.shouldForceTicks(chunkpos.toLong())) {
++                        // Neo: the per-chunk decisions and the spawn gate stay on the server thread. The chunk
++                        // body itself is handed to the plans, which run it inline on the server thread
++                        // (counted) when the chunk may not leave it.
+                         levelchunk1.incrementInhabitedTime(j);
 -                        if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
 -                            NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
--                        }
-+                    if ((this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) || this.distanceManager.shouldForceTicks(chunkpos.toLong())) {
-+                        net.neoforged.neoforge.server.threading.RegionThreadingHooks.runBlockTickTask(this.level, chunkpos.getMiddleBlockPosition(0), () -> {
-+                            levelchunk1.incrementInhabitedTime(j);
++                        if (spawnPlan == null) {
 +                            if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
 +                                NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
 +                            }
-
--                        if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
++                        } else {
++                            // The inner spawn gate is evaluated here, exactly where vanilla evaluates it, and the
++                            // plan counts the chunks it refuses.
++                            spawnPlan.accept(levelchunk1, flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos));
+                         }
+ 
+                         if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
 -                            this.level.tickChunk(levelchunk1, k);
--                        }
-+                            if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
++                            if (chunkTickPlan == null) {
 +                                this.level.tickChunk(levelchunk1, k);
++                            } else {
++                                chunkTickPlan.accept(levelchunk1);
 +                            }
-+                        });
+                         }
                      }
                  }
-
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runSpawnPlan(spawnPlan);
++                if (spawnPlan != null) {
++                    // The debug view reports the last spawn state; with the slice on, that is the state the
++                    // server-thread fallback chunks spawned from, and null when no chunk stayed on the server
++                    // thread this tick.
++                    final NaturalSpawner.SpawnState inlineState = spawnPlan.inlineState();
++                    if (inlineState != null) {
++                        this.lastSpawnState = inlineState;
++                    }
++                }
++                net.neoforged.neoforge.server.threading.RegionThreadingHooks.runChunkTickPlan(chunkTickPlan);
+ 
+                 profilerfiller.popPush("customSpawners");
+                 if (flag1) {
+@@ -388,6 +_,24 @@
+         }
+     }
+ 
++    /**
++     * Neo: the server-owned reads the region spawn plan needs.
++     * <p>
++     * They are created here, where the chunk cache owns the structures, and the plan only calls them on the
++     * server thread: the full-chunk getter decides which mobs count for the cap, the chunk map names the players
++     * close enough for spawning, and the distance manager decides which chunks count into the natural spawn chunk
++     * count. The count is passed as a constant because {@code getNaturalSpawnChunkCount} runs the pending player
++     * distance updates, which vanilla does once per tick.
++     */
++    private net.neoforged.neoforge.server.threading.region.RegionSpawnSource spawnSource(int naturalSpawnChunkCount) {
++        return new net.neoforged.neoforge.server.threading.region.RegionSpawnSource(
++                this::getFullChunk,
++                chunkKey -> this.chunkMap.getPlayersCloseForSpawning(new ChunkPos(chunkKey)),
++                this.distanceManager::hasPlayersNearby,
++                () -> naturalSpawnChunkCount
++        );
++    }
++
+     @Override
+     public String gatherStats() {
+         return Integer.toString(this.getLoadedChunksCount());
 @@ -435,11 +_,17 @@
      }
-
+ 
      public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_) {
 -        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_);
 +        addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, false);
@@ -55,7 +215,7 @@
 +    public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_, boolean forceTicks) {
 +        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, forceTicks);
      }
-
+ 
      public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_) {
 -        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_);
 +        removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, false);
@@ -63,5 +223,5 @@
 +    public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_, boolean forceTicks) {
 +        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, forceTicks);
      }
-
+ 
      @Override

@@ -1,0 +1,133 @@
+--- a/net/minecraft/world/level/entity/EntitySectionStorage.java
++++ b/net/minecraft/world/level/entity/EntitySectionStorage.java
+@@ -24,10 +_,20 @@
+ public class EntitySectionStorage<T extends EntityAccess> {
+     private final Class<T> entityClass;
+     private final Long2ObjectFunction<Visibility> intialSectionVisibility;
+-    private final Long2ObjectMap<EntitySection<T>> sections = new Long2ObjectOpenHashMap<>();
+-    private final LongSortedSet sectionIds = new LongAVLTreeSet();
++    private final Long2ObjectMap<EntitySection<T>> sections;
++    private final LongSortedSet sectionIds;
++    @Nullable
++    private final net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions<T> partitions;
+ 
+     public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_) {
++        this(p_156855_, p_156856_, net.neoforged.neoforge.server.threading.region.RegionLayout.DYNAMIC);
++    }
++
++    public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_, net.neoforged.neoforge.server.threading.region.RegionLayout layout) {
++        this.partitions = layout.isFixed()
++                ? new net.neoforged.neoforge.server.threading.region.FixedEntitySectionPartitions<>(layout) : null;
++        this.sections = this.partitions == null ? new Long2ObjectOpenHashMap<>() : null;
++        this.sectionIds = this.partitions == null ? new LongAVLTreeSet() : null;
+         this.entityClass = p_156855_;
+         this.intialSectionVisibility = p_156856_;
+     }
+@@ -44,14 +_,14 @@
+         for (int l1 = j; l1 <= i1; l1++) {
+             long i2 = SectionPos.asLong(l1, 0, 0);
+             long j2 = SectionPos.asLong(l1, -1, -1);
+-            LongIterator longiterator = this.sectionIds.subSet(i2, j2 + 1L).iterator();
++            LongIterator longiterator = this.sectionIdsInRange(i2, j2 + 1L).iterator();
+ 
+             while (longiterator.hasNext()) {
+                 long k2 = longiterator.nextLong();
+                 int l2 = SectionPos.y(k2);
+                 int i3 = SectionPos.z(k2);
+                 if (l2 >= k && l2 <= j1 && i3 >= l && i3 <= k1) {
+-                    EntitySection<T> entitysection = this.sections.get(k2);
++                    EntitySection<T> entitysection = this.getSection(k2);
+                     if (entitysection != null
+                         && !entitysection.isEmpty()
+                         && entitysection.getStatus().isAccessible()
+@@ -78,11 +_,15 @@
+     private LongSortedSet getChunkSections(int p_156859_, int p_156860_) {
+         long i = SectionPos.asLong(p_156859_, 0, p_156860_);
+         long j = SectionPos.asLong(p_156859_, -1, p_156860_);
+-        return this.sectionIds.subSet(i, j + 1L);
++        return this.sectionIdsInRange(i, j + 1L);
++    }
++
++    private LongSortedSet sectionIdsInRange(long from, long to) {
++        return this.partitions == null ? this.sectionIds.subSet(from, to) : this.partitions.sectionIdsInRange(from, to);
+     }
+ 
+     public Stream<EntitySection<T>> getExistingSectionsInChunk(long p_156889_) {
+-        return this.getExistingSectionPositionsInChunk(p_156889_).mapToObj(this.sections::get).filter(Objects::nonNull);
++        return this.getExistingSectionPositionsInChunk(p_156889_).mapToObj(this::getSection).filter(Objects::nonNull);
+     }
+ 
+     private static long getChunkKeyFromSectionKey(long p_156900_) {
+@@ -90,22 +_,24 @@
+     }
+ 
+     public EntitySection<T> getOrCreateSection(long p_156894_) {
+-        return this.sections.computeIfAbsent(p_156894_, this::createSection);
++        return this.partitions == null ? this.sections.computeIfAbsent(p_156894_, this::createSection)
++                : this.partitions.getOrCreate(p_156894_, this::createSection);
+     }
+ 
+     @Nullable
+     public EntitySection<T> getSection(long p_156896_) {
+-        return this.sections.get(p_156896_);
++        return this.partitions == null ? this.sections.get(p_156896_) : this.partitions.get(p_156896_);
+     }
+ 
+     private EntitySection<T> createSection(long p_156902_) {
+         long i = getChunkKeyFromSectionKey(p_156902_);
+         Visibility visibility = this.intialSectionVisibility.get(i);
+-        this.sectionIds.add(p_156902_);
++        if (this.partitions == null) this.sectionIds.add(p_156902_);
+         return new EntitySection<>(this.entityClass, visibility);
+     }
+ 
+     public LongSet getAllChunksWithExistingSections() {
++        if (this.partitions != null) return this.partitions.chunks();
+         LongSet longset = new LongOpenHashSet();
+         this.sections.keySet().forEach(p_156886_ -> longset.add(getChunkKeyFromSectionKey(p_156886_)));
+         return longset;
+@@ -115,17 +_,43 @@
+         this.forEachAccessibleNonEmptySection(p_261820_, p_261459_ -> p_261459_.getEntities(p_261820_, p_261992_));
+     }
+ 
++    /**
++     * Neo: {@return the edge length in chunks of the physical section partitions, or {@code 0} when this
++     * storage is not partitioned}
++     */
++    public int entitySectionRegionChunkSize() {
++        return this.partitions == null ? 0 : this.partitions.regionChunkSize();
++    }
++
++    /**
++     * Neo: iterates the accessible, non-empty sections of exactly one physical region bucket.
++     * <p>
++     * The caller is the region-scoped entity query of a native worker that owns the region lease. The
++     * physical partition accessor reads only that region's bucket; it never falls back to the global
++     * section map, which is {@code null} for a partitioned storage.
++     */
++    public void forEachAccessibleNonEmptySectionInRegion(int regionX, int regionZ, AABB box, AbortableIterationConsumer<EntitySection<T>> consumer) {
++        if (this.partitions == null) {
++            throw new IllegalStateException("Entity section storage is not partitioned");
++        }
++        this.partitions.forEachAccessibleNonEmptySectionInRegion(regionX, regionZ, box, consumer);
++    }
++
+     public <U extends T> void getEntities(EntityTypeTest<T, U> p_261630_, AABB p_261843_, AbortableIterationConsumer<U> p_261742_) {
+         this.forEachAccessibleNonEmptySection(p_261843_, p_261463_ -> p_261463_.getEntities(p_261630_, p_261843_, p_261742_));
+     }
+ 
+     public void remove(long p_156898_) {
++        if (this.partitions != null) {
++            this.partitions.remove(p_156898_);
++            return;
++        }
+         this.sections.remove(p_156898_);
+         this.sectionIds.remove(p_156898_);
+     }
+ 
+     @VisibleForDebug
+     public int count() {
+-        return this.sectionIds.size();
++        return this.partitions == null ? this.sectionIds.size() : this.partitions.count();
+     }
+ }

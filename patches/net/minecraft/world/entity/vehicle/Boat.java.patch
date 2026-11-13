@@ -55,6 +55,15 @@
                          && d0 < (double)((float)blockpos$mutableblockpos.getY() + fluidstate.getHeight(this.level(), blockpos$mutableblockpos))) {
                          if (!fluidstate.isSource()) {
                              return Boat.Status.UNDER_FLOWING_WATER;
+@@ -805,6 +_,8 @@
+ 
+     @Override
+     public void remove(Entity.RemovalReason p_352927_) {
++        // Neo: the leash drop below runs before super.remove.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "Boat.remove");
+         if (!this.level().isClientSide && p_352927_.shouldDestroy() && this.isLeashed()) {
+             this.dropLeash(true, true);
+         }
 @@ -832,14 +_,15 @@
                              }
  

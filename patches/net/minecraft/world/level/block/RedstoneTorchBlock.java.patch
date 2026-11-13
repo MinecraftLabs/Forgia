@@ -1,0 +1,58 @@
+--- a/net/minecraft/world/level/block/RedstoneTorchBlock.java
++++ b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+@@ -21,7 +_,9 @@
+ public class RedstoneTorchBlock extends BaseTorchBlock {
+     public static final MapCodec<RedstoneTorchBlock> CODEC = simpleCodec(RedstoneTorchBlock::new);
+     public static final BooleanProperty LIT = BlockStateProperties.LIT;
+-    private static final Map<BlockGetter, List<RedstoneTorchBlock.Toggle>> RECENT_TOGGLES = new WeakHashMap<>();
++    // Neo: the toggle history is one list per level and region workers of different regions toggle torches
++    // concurrently. The map is synchronized and every list mutation is guarded by the list itself.
++    private static final Map<BlockGetter, List<RedstoneTorchBlock.Toggle>> RECENT_TOGGLES = java.util.Collections.synchronizedMap(new WeakHashMap<>());
+     public static final int RECENT_TOGGLE_TIMER = 60;
+     public static final int MAX_RECENT_TOGGLES = 8;
+     public static final int RESTART_DELAY = 160;
+@@ -66,9 +_,12 @@
+     protected void tick(BlockState p_221949_, ServerLevel p_221950_, BlockPos p_221951_, RandomSource p_221952_) {
+         boolean flag = this.hasNeighborSignal(p_221950_, p_221951_, p_221949_);
+         List<RedstoneTorchBlock.Toggle> list = RECENT_TOGGLES.get(p_221950_);
+-
+-        while (list != null && !list.isEmpty() && p_221950_.getGameTime() - list.get(0).when > 60L) {
+-            list.remove(0);
++        if (list != null) {
++            synchronized (list) {
++                while (!list.isEmpty() && p_221950_.getGameTime() - list.get(0).when > 60L) {
++                    list.remove(0);
++                }
++            }
+         }
+ 
+         if (p_221949_.getValue(LIT)) {
+@@ -118,16 +_,18 @@
+ 
+     private static boolean isToggledTooFrequently(Level p_55685_, BlockPos p_55686_, boolean p_55687_) {
+         List<RedstoneTorchBlock.Toggle> list = RECENT_TOGGLES.computeIfAbsent(p_55685_, p_55680_ -> Lists.newArrayList());
+-        if (p_55687_) {
+-            list.add(new RedstoneTorchBlock.Toggle(p_55686_.immutable(), p_55685_.getGameTime()));
+-        }
+-
+-        int i = 0;
+-
+-        for (RedstoneTorchBlock.Toggle redstonetorchblock$toggle : list) {
+-            if (redstonetorchblock$toggle.pos.equals(p_55686_)) {
+-                if (++i >= 8) {
+-                    return true;
++        synchronized (list) {
++            if (p_55687_) {
++                list.add(new RedstoneTorchBlock.Toggle(p_55686_.immutable(), p_55685_.getGameTime()));
++            }
++
++            int i = 0;
++
++            for (RedstoneTorchBlock.Toggle redstonetorchblock$toggle : list) {
++                if (redstonetorchblock$toggle.pos.equals(p_55686_)) {
++                    if (++i >= 8) {
++                        return true;
++                    }
+                 }
+             }
+         }

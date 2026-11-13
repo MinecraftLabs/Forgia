@@ -63,6 +63,16 @@
              this.extinguishFire();
          }
  
+@@ -666,6 +_,9 @@
+ 
+     @Override
+     public void remove(Entity.RemovalReason p_276115_) {
++        // Neo: the removal effect callbacks and the active effect clear run before super.remove, so the
++        // storage guard has to reject a native region worker here instead of in Entity.remove.
++        net.neoforged.neoforge.server.threading.RegionThreadingHooks.assertServerEntityStorageAccess(this, "LivingEntity.remove");
+         if (p_276115_ == Entity.RemovalReason.KILLED || p_276115_ == Entity.RemovalReason.DISCARDED) {
+             this.triggerOnDeathMobEffects(p_276115_);
+         }
 @@ -772,7 +_,7 @@
                  Holder<MobEffect> holder = iterator.next();
                  MobEffectInstance mobeffectinstance = this.activeEffects.get(holder);

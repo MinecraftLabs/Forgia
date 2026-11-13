@@ -1,0 +1,58 @@
+--- a/net/minecraft/world/level/entity/EntityTickList.java
++++ b/net/minecraft/world/level/entity/EntityTickList.java
+@@ -13,6 +_,19 @@
+     private Int2ObjectMap<Entity> passive = new Int2ObjectLinkedOpenHashMap<>();
+     @Nullable
+     private Int2ObjectMap<Entity> iterated;
++    // Neo: the level this tick list belongs to. The region threading bridge uses it to publish the tick list
++    // membership of every entity to its region index, so a region worker can enumerate the entities of its
++    // region instead of the server thread walking this list. The client level has no level to publish to.
++    @Nullable
++    private final net.minecraft.server.level.ServerLevel level;
++
++    public EntityTickList() {
++        this(null);
++    }
++
++    public EntityTickList(@Nullable net.minecraft.server.level.ServerLevel level) {
++        this.level = level;
++    }
+ 
+     private void ensureActiveIsNotIterated() {
+         if (this.iterated == this.active) {
+@@ -28,21 +_,31 @@
+         }
+     }
+ 
+-    public void add(Entity p_156909_) {
++    // Neo: region workers may start and stop ticking entities while the server thread waits for its entity
++    // tick batch, so every access to the active/passive maps is serialized on this instance.
++    public synchronized void add(Entity p_156909_) {
+         this.ensureActiveIsNotIterated();
+         this.active.put(p_156909_.getId(), p_156909_);
++        // Neo: publish the membership to the region index of the entity, so the region's worker ticks exactly
++        // the entities this list holds. The hook is a no-op without an installed region threading engine.
++        if (this.level != null) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.entityTickStarted(this.level, p_156909_);
++        }
+     }
+ 
+-    public void remove(Entity p_156913_) {
++    public synchronized void remove(Entity p_156913_) {
+         this.ensureActiveIsNotIterated();
+         this.active.remove(p_156913_.getId());
++        if (this.level != null) {
++            net.neoforged.neoforge.server.threading.RegionThreadingHooks.entityTickEnded(this.level, p_156913_);
++        }
+     }
+ 
+-    public boolean contains(Entity p_156915_) {
++    public synchronized boolean contains(Entity p_156915_) {
+         return this.active.containsKey(p_156915_.getId());
+     }
+ 
+-    public void forEach(Consumer<Entity> p_156911_) {
++    public synchronized void forEach(Consumer<Entity> p_156911_) {
+         if (this.iterated != null) {
+             throw new UnsupportedOperationException("Only one concurrent iteration supported");
+         } else {
